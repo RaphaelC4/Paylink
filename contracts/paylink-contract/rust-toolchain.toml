@@ -1,0 +1,6 @@
+[toolchain]
+# gnu host variant: this machine has no Visual Studio / Windows SDK, so the
+# MSVC variant cannot link. Same channel, different host triple.
+channel = "stable-x86_64-pc-windows-gnu"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

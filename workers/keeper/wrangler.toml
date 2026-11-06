@@ -1,0 +1,27 @@
+# Paylink claim keeper — Cloudflare Worker.
+#
+# Scans the contract's state for links stuck in PAID and releases them by
+# calling `claim`. The contract makes `claim` callable by anyone, so this
+# Worker needs no cooperation from either side: it pays gas from its own
+# testnet account and the payout always lands on the link's creator.
+name = "paylink-keeper"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# Release anything paid more than a minute ago. The frontend also tries to
+# release right after payment; this is the backstop for the times that fails
+# (wallet reject, closed tab, dead network).
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+ALLOWED_ORIGIN = "*"
+# FastNEAR, not rpc.testnet.near.org: the old endpoint is deprecated and
+# measured 3.6-6.1s here vs 0.6-1.3s. Same reasoning as frontend/config.js.
+RPC_URL = "https://test.rpc.fastnear.com"
+CONTRACT_ID = "paylink-v2.testnet"
+KEEPER_ACCOUNT = "paylink-keeper.testnet"
+
+# Secrets — never vars, never committed:
+#   npx wrangler secret put KEEPER_KEY      (ed25519 secret key of KEEPER_ACCOUNT)
+#   npx wrangler secret put TICK_SECRET     (header x-tick-secret for POST /tick)

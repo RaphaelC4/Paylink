@@ -1,0 +1,41 @@
+# keys — never commit these
+.env
+.env.local
+.dev.vars
+*.key
+*.pem
+
+# rust / cargo
+target/
+**/*.rs.bk
+
+# node
+node_modules/
+package-lock.json
+.wrangler/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# contract artifacts
+*.wasm
+neardev/
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# agent scaffolding — tooling for the author, not part of the product
+.agents/
+skills-lock.json
+
+# test output
+test-results/
+
+# local submission notes — operator only, never public
+SUBMISSION.local.md

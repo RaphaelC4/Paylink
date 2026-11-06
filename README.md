@@ -1,0 +1,456 @@
+# Paylink
+
+**Send someone a link. Get paid from whatever they already hold.**
+
+Paylink turns an invoice into a URL. A freelancer in Lagos sends a client in
+Berlin a link. The client pays with the tokens already in their wallet. The
+freelancer receives them on NEAR and never had to explain what a seed phrase
+is.
+
+Built for **NEAR HACKATHON**, track **`realworld` — Real-World Money**.
+
+**Live demo:** <https://paylink-near.vercel.app/> ·
+**Contract:** [`paylink-v2.testnet`](https://testnet.nearblocks.io/address/paylink-v2.testnet)
+on NEAR testnet explorer
+
+---
+
+## The problem
+
+Getting paid across borders still costs money and time.
+
+| Route | What it costs |
+| --- | --- |
+| Bank wire | $25–45 in fees, 3–5 days, bank details shared with a stranger |
+| PayPal / Wise | Poor support from many countries, freeze risk, still not instant |
+| "Just send me crypto" | Both sides must pick the same chain, avoid a wrong-network send, and understand gas |
+
+Every route asks one side to learn the other side's world.
+
+Paylink removes that requirement. The payer uses what they have. The payee
+does not have to claim, sweep, or hold gas: the frontend releases a paid
+invoice to them the moment it is settled, and a keeper Worker repeats that
+release every minute so nothing waits on a browser staying open.
+
+---
+
+## What's proven
+
+[Security](#security) below states the threat model. This is the other side:
+what the build actually demonstrates, and the test that demonstrates it. All 37
+tests are pure host tests — `cargo test --lib`.
+
+| Behaviour | Proof |
+| --- | --- |
+| **Micro-invoices pay out.** A 100-unit link has a fee that rounds to zero, so `claim` skips the fee leg instead of failing on a zero-amount NEP-141 transfer, and the split never overflows or loses a unit. | `a_tiny_invoice_skips_the_fee_leg_instead_of_failing`, `split_fee_never_overflows_or_loses_a_unit` |
+| **Nobody needs gas to get paid.** `claim` is callable by anyone, so the frontend releases a paid invoice for the payee and the keeper repeats it every minute — the payee holds no NEAR and signs nothing after payment. | `a_stranger_can_trigger_claim_but_only_the_payee_is_paid`, `claim_pays_the_payee_less_the_fee_in_one_batch` |
+| **Overpayment is never lost.** What arrived is what's credited, and the fee applies to the credited amount rather than the invoiced one. | `an_overpayment_is_credited_in_full`, `claim_applies_the_fee_to_an_overpayment` |
+| **Paying twice never double-credits.** A link leaves `OPEN` once; a second payment is returned. | `paying_twice_does_not_double_credit` |
+| **Expiry needs no background job.** `Expired` is derived on read from `expires_at`, never stored, so an aged link reports itself honestly and refuses payment. | `an_expired_invoice_cannot_be_paid`, `an_expired_invoice_is_reported_as_expired_even_unpaid` |
+| **Sharing survives a dead RPC.** The QR code and Copy button are built from the link id alone — a vendored MIT encoder, no image request, no chain round trip. | `frontend/vendor/qrcode.js`, `qrMarkup()` in `frontend/app.js` |
+| **The keeper needs no registry.** One `view_state` call with prefix `l` lists every link; it signs with the runtime's Ed25519 WebCrypto, so it is a single file with no dependencies. | `workers/keeper/src/index.js` |
+| **Storage is funded up front.** `create_link` requires a 0.01 NEAR stake that covers its own storage and registers the payee on the token. | `create_link_requires_a_storage_stake`, `the_stake_really_is_ten_millinear` |
+| **Settings are public getters.** The allowlist and both fee settings are readable by anyone, not admin-only views. | `the_allowlist_is_visible_to_callers`, `the_fee_settings_are_visible_to_callers` |
+
+---
+
+## How it works
+
+### The contract
+
+`contracts/` holds a NEAR contract with exactly three jobs:
+
+1. **Record a request.** `create_link` stores who is owed, how much, in which
+   token, by when.
+2. **Recognise payment.** The contract implements NEP-141 `ft_on_transfer`.
+   When tokens arrive, the token contract itself calls the contract and passes
+   the link id in `msg`. The contract checks it and marks the link paid.
+3. **Release the money.** `claim` sends the credited amount to the payee, minus
+   a fixed 0.5% fee. **Anyone can call it** — the money can only go to the
+   invoice's payee and the fee account, never to the caller — so the frontend
+   releases a paid invoice for the payee instead of asking them to come back
+   and sign something, and `workers/keeper/` repeats the release from a cron
+   every minute as the backstop.
+
+**There is no `mark_paid` function.** Nothing in the public interface lets
+anyone assert that a link was paid. The only code path that marks a link paid
+is `ft_on_transfer`, and it is invoked by the token contract, not by a user.
+A caller cannot forge it without actually sending the tokens.
+
+**The payee cannot pay their own link.** `ft_on_transfer` compares `sender_id`
+with `link.creator` and returns the full amount when they match, so a creator's
+payment is refunded and the link stays unpaid until somebody else pays it. The
+pay page shows the creator a waiting state with the share tools instead of a
+Pay button.
+
+**The contract holds funds only between payment and claim, and `claim` is the
+only way out.** It can pay exactly two destinations: the invoice's payee and
+the fee account. Nothing else in the interface can move a balance. See
+[Security](#security) for why the transfer is a separate call rather than
+happening inline.
+
+### The token
+
+The contract is **token-agnostic but not token-blind**. It keeps an allowlist
+of accepted token contracts and rejects anything else by returning the full
+amount, which the token contract refunds to the sender automatically.
+
+The allowlist is set once in `new()` and has no setter, so **widening it
+requires a code upgrade signed by the deployer's key** rather than a quiet
+call. That is the point: even the deployer cannot add an acceptance path
+without the deploy showing up in the transaction history.
+
+### The payer's path
+
+- **Already on NEAR (the path the demo exercises):** send `ft_transfer_call`
+  with `msg = <link id>`.
+- **Arriving empty, or holding something else:** the pay page carries a
+  Tidepool rail under **No test USDC?**. *Get test tokens* drips 100 test
+  USDC (plus USDT, wNEAR and dust) into the connected wallet in one keyless
+  call; the swap row quotes a deposit of wNEAR, USDT or ETH that settles into
+  exactly this link's amount (native NEAR is not a source — it pays gas and
+  nothing else). Both are free, both are testnet-only, and if Tidepool is
+  unreachable the rail shows the error while the normal pay flow is
+  untouched. The faucet itself is site-wide: the Account panel carries the
+  same *Get test tokens* card at every size, and on phones a **Faucet** chip
+  beside the floating bar opens it as a bottom sheet.
+
+The on-chain path ends in `ft_on_transfer` called by the token contract, and
+that call — not any user call — is what marks an invoice paid.
+
+### Reading the chain
+
+The one thing the share page exists to hand over is the link, so it never
+waits on the chain. The QR code and the Copy button are built from the link id
+alone: the QR comes from a vendored MIT encoder (`frontend/vendor/qrcode.js`)
+that renders in the browser with no image request and no third-party service,
+and the copy field needs only the URL. Only the WhatsApp / Telegram row reads
+the chain, because those messages embed the amount.
+
+Every other read has a 12 s timeout and a retry, so a slow or rate-limited
+public endpoint surfaces as *Could not read the chain* with a **Try again**
+button rather than a spinner that never resolves. The endpoint itself is
+`test.rpc.fastnear.com`, set in `frontend/config.js`. The previously used
+`rpc.testnet.near.org` is deprecated: it answers `429` with **no CORS
+headers**, so a browser only ever sees `Failed to fetch` and cannot tell a
+rate limit from an outage.
+
+### Invoice parsing (optional)
+
+Pasting an invoice is a convenience, not a trust boundary. `workers/parse/` is a
+~150-line Cloudflare Worker that sends pasted text or one PDF/image to Gemini
+and returns exactly five fields. The API key is a Worker secret; the browser
+never sees it. The model's answer is treated as a proposal:
+
+- amount must be a plain decimal, finite, positive, and at most 1,000,000 in
+  base units — no exponent, no separators, no rounding surprises;
+- the token must pass `is_token_allowed` **read from the chain**, or match the
+  one token this deployment accepts by contract id or known alias;
+- the payee is compared with the connected wallet and surfaced, never used —
+  `create_link` issues to `predecessor_account_id` and ignores any payee field;
+- the description is stripped of control characters and cut to 200 characters;
+- the expiry is clamped to an integer number of hours between now and 365 days.
+
+If any check fails the form is left untouched and the reason is shown. Nothing
+the model returns can reach the contract without the user pressing **Create
+link**. Leave `parseEndpoint` empty in `frontend/config.js` and the block does
+not render at all.
+
+### The release keeper
+
+`workers/keeper/` is a small Cloudflare Worker, with no dependencies, that
+releases paid links from a cron every minute. It exists because the frontend's
+release can fail: the wallet prompt can be rejected, the tab can close, the
+network can drop. Discovery needs no registry — one `view_state` call with
+prefix `l` lists every link the contract stores, and anything sitting in `PAID`
+gets claimed, up to 10 per sweep.
+
+It signs with the runtime's own Ed25519 WebCrypto, so the Worker is a single
+file deployable from the dashboard. It pays gas from its own testnet account
+(`paylink-keeper.testnet`); the payout still lands only on the link's payee
+and the fee account, because that is all `claim` can pay. `POST /tick` runs the
+same sweep on demand behind a secret, for tests and demos.
+`workers/keeper/README.md` has the deploy steps.
+
+
+---
+
+## Where the money moves
+
+This is the part a bookkeeper cares about.
+
+```
+Payer's wallet
+      │  ft_transfer_call(msg = link id)
+      ▼
+Paylink contract            ← credits the link, returns 0 (all tokens used)
+      │  ft_transfer(99.5% → payee)  ┐ one batch, so they
+      │  ft_transfer(0.5%  → fee)    ┘ succeed or fail together
+      ▼
+Payee's wallet
+```
+
+At no point does a company, an operator, or a server hold the money. The
+contract has **no owner, no admin function, and no withdrawal path in its
+code**: the fee account is fixed in `new()` with no setter, and the 0.5% rate
+is a constant. Changing either requires a code upgrade signed by the
+deployer's key — and that key is real. Whoever holds it can redeploy
+`paylink-v2.testnet` with different code, which is the one power retained
+outside the contract. That is how NEAR deployments work rather than a
+backdoor in this code, and it is stated here rather than left for a reviewer
+to discover.
+
+If any check fails — unknown link, expired, underpayment, token not
+allowlisted — the contract returns the full amount and the token contract
+refunds the payer automatically. **A failed payment costs the payer nothing.**
+Overpayment is not a failure: what arrived is credited in full, so the payee
+keeps the excess and the fee is taken from the credited amount rather than the
+invoiced one.
+
+---
+
+## How to use
+
+> These steps are the acceptance criteria for this build. They are written as
+> `do X, see Y` so a reviewer can follow them without asking anyone.
+
+**Network:** NEAR testnet · **Cost:** free (faucet-funded)
+
+1. **Get two funded accounts.** Create a payee and a payer in a wallet the app
+   lists (Meteor gives each new testnet account 10 NEAR). Then give the payer
+   test USDC — either in the app (open any link, expand **No test USDC?**,
+   press **Get test tokens**) or ahead of time with one call:
+
+   ```bash
+   curl -X POST https://www.usetidepool.tech/v0/faucet \
+     -H "Content-Type: application/json" \
+     -d '{"accountId":"<payer>.testnet","mode":"wallet"}'
+   ```
+
+   See `ft_balance_of(<payer>)` return `"100000000"` (100 USDC, 6 decimals).
+   The wallet must hold the key for these accounts, because only the wallet can
+   sign the app's transactions. If you created them with
+   `near account create-account sponsor-by-faucet-service`, import the generated
+   key into the wallet first.
+2. **Create a link.** Open the app, connect a wallet, enter an amount and an
+   optional note, press *Create link*. The button reads *Creating link…* while
+   the wallet prompt is open; the app then lands on the share page with a
+   copy field, a QR code, WhatsApp / Telegram / Email buttons and the status
+   pill *UNPAID*.
+3. **Copy the link.** Press *Copy* — the button flips to *Link copied!* — and
+   open it in a second browser profile or a second wallet.
+   See the link rendered with *Pay* available and *Expired* or *Paid*
+   correctly reflected once the state changes.
+4. **Pay it.** Switch the wallet to a payer account, press *Pay*, approve the
+   transaction. See the timeline move `Open → Paid` and the payer's token
+   balance decrease by exactly the link amount. If the payer holds no USDC,
+   expand **No test USDC?** first: *Get test tokens* funds them for free, and
+   the swap row covers the exact amount from wNEAR, USDT or ETH instead.
+5. **Watch it release.** About two seconds after the payment the app asks for a
+   second approval. It is signed by the wallet still connected — the payer from
+   step 4, **not** the payee — because `claim` is callable by anyone, so the
+   payee never signs anything. Approve it. See the timeline move
+   `Paid → Claimed`, the payee's token balance increase by 99.5% of the invoice,
+   and the fee account increase by 0.5%. If you reject the second approval, the
+   link stays `PAID` with a *Release* button that anyone can press — and the
+   keeper Worker releases it within a minute anyway, from its own gas account.
+   A second release attempt fails with `link is not paid`.
+6. **Check My links.** Enter the creator account in *My links* and press *Load*.
+   See the link listed with its id, amount, status and the payer that
+   settled it — read straight from `get_links_by_creator`, unsigned. The stats
+   row shows total received and awaiting payment; the filters narrow the list
+   to All / Unpaid / Paid / Expired. The **Activity** panel works the other
+   way round: a payee sees their created links from the chain, while a payer
+   sees only the links this browser paid for — those ids are written to
+   `localStorage` at payment time, because the contract indexes by creator,
+   not by payer. Clearing site data clears that local history and nothing
+   else.
+7. **Export it.** Press *Export CSV*. See a file an accountant can open that
+   contains the same rows with no jargon columns — no gas, no contract
+   addresses, no yoctoNEAR.
+8. **See a payment rejected.** Call `ft_transfer_call` on the token with an
+   `amount` below the invoice and `msg` set to the link id. See the call
+   succeed, the token contract refund the payer in full, and the link still
+   `OPEN`.
+9. **See a forgery rejected.** Call any method you can find that would mark a
+   link paid without paying. See that no such method exists, and that
+   `ft_on_transfer` from a token contract that is not on the allowlist returns
+   the amount instead of crediting anything.
+
+---
+
+## Security
+
+The design choices here are the product. They are listed because a reviewer
+will look for them.
+
+| Risk | Handling |
+| --- | --- |
+| Forging a "paid" status | No such method exists. Payment status is written only by `ft_on_transfer`, called by the token contract. |
+| Payee pays their own link | `ft_on_transfer` returns the full amount when `sender_id == link.creator`, so a self-payment is refunded and the link stays `OPEN`. The UI shows the payee a waiting state instead of a Pay button. |
+| Fake tokens | `predecessor_account_id` is checked against an allowlist. Unexpected token contracts get the full amount returned, per [NEAR's `ft_on_transfer` guidance](https://docs.near.org/smart-contracts/security/cross-contract-calls/ft-transfer-call). |
+| Underpayment | The credited amount must be at least the invoiced amount, otherwise the full amount is returned. |
+| Replaying one payment across links | Each `msg` names one link, and a link can only leave `OPEN` once. |
+| Payee never receives the funds | `claim` pays only `link.creator` and the fee account, never the caller. A failed transfer reverts the link to `PAID` so anyone can retry. |
+| Payee not registered with the token | `create_link` asks the token to register the payee but doesn't wait for the result. If that fails, the payout fails, the link goes back to `PAID`, and `claim` doesn't register the payee again, so the keeper retries every minute and fails each time. The funds stay in the contract until the payee is registered with the token (anyone can do this with a storage deposit on the token), and then any retry succeeds. Not fixed in this build. |
+| Stuck links crowd out others | The keeper claims at most 10 links per sweep. If 10 links were permanently stuck, the keeper would never reach link #11. The in-app release and the manual *Release* button still work for it. Not fixed in this build. |
+| Someone claims on the payee's behalf | `claim` is deliberately callable by anyone, but the payout address comes from the invoice, not from the caller. A stranger can only cause the payee to be paid. |
+| Payer loses money on a bad payment | Every rejection returns the full amount; the token contract refunds the sender. |
+| Deployer holds power | No admin function, no owner and no withdrawal path in the contract's code. The fee account and the 0.5% rate are fixed at deploy; changing either needs a code upgrade signed by the deployer's key — and that key can redeploy the contract, so the deployer retains that one power outside the code. |
+
+**Not audited.** This is a 14-day hackathon build. Do not send real funds to
+it.
+
+---
+
+## Honest limitations
+
+Stated plainly, because saying otherwise would be worse than saying it.
+
+- **Testnet only.** The demo runs on NEAR testnet with
+  `usdc.tidepool-sandbox.testnet` (6 decimals) — Tidepool's sandbox test USDC —
+  so no real money is involved. The contract is written to run on mainnet USDC
+  unchanged — only an allowlist entry and a frontend config value would differ —
+  but it has not been deployed there or tested against a mainnet token.
+- **Not production ready.** No audit, no rate limiting, no indexer. Payment
+  detection relies on the frontend polling contract state.
+
+---
+
+## Reused code and AI assistance
+
+Disclosed under [HACKATHON.md](https://nearhackathon.com/HACKATHON.md) **Q-002**
+(existing product on another chain) and **Q-005** (list reused code and AI code).
+
+**Reused from my earlier [Polaris](https://github.com/RaphaelC4/Polaris) project**
+(GenLayer StudioNet, committed 23-26 Oct 2026 — a different chain, not part of
+this submission):
+
+- The static, build-step-free frontend structure: hash routing, the tabbed
+  shell, and the `?flat=1` screenshot flag.
+- The CSS conventions that came with it: `.tiny`, `.mono`, `.pill`, `.net-k`
+  and `html.flat`.
+
+**Written new for this hackathon:** the NEAR contract, the keeper and parser
+Workers, the NEAR wallet layer, the pay / release / My links flow, and the
+design system — its palette, layout and components.
+
+**Not used:** no GenLayer code, calldata codec or dependency appears anywhere in
+this build.
+
+**Third-party libraries**, listed per Q-005:
+
+- [`@hot-labs/near-connect`](https://github.com/azbang/near-connect) (HOT
+  Labs, MIT) — the wallet layer, vendored as `frontend/vendor/near-connect.js`
+  so the page needs no bundler, no npm install and no CDN. At runtime it
+  fetches its wallet-selector manifest from
+  `raw.githubusercontent.com/hot-dao/near-selector` — the wallet's own
+  registry; no application data leaves the browser. Documented in
+  `frontend/vendor/README.md`.
+- QR Code Generator by Kazuhiko Arase (MIT, per the file header) — vendored as
+  `frontend/vendor/qrcode.js`; renders the QR in the browser with no image
+  request.
+- Satoshi by Indian Type Foundry — self-hosted `.woff2`, free under the
+  [Fontshare licence](https://www.fontshare.com/licenses/itf-ffl); documented
+  in `frontend/fonts/README.md`.
+- Gemini — called only by `workers/parse/` behind a Worker secret, described in
+  [Invoice parsing](#invoice-parsing-optional); the browser never holds the key.
+
+**AI assistance:** this build was written with AI assistance (Claude) — the
+contract, the frontend and the Workers. Q-005 explicitly allows it, so it is
+listed here rather than left for a reviewer to infer.
+
+---
+
+## Development
+
+```bash
+# prerequisites: rustup with the wasm32-unknown-unknown target, cargo-near,
+# near-cli-rs, and nasm (near-sdk's aws-lc-sys needs it for host builds)
+cargo near new contracts/paylink-contract   # generated project; never hand-rolled
+
+cargo test --lib                            # 37 unit tests, all pure host tests
+
+# build the wasm with its NEP-330 ABI embedded
+cargo near build non-reproducible-wasm --abi-features near-sdk/unit-testing
+#   -> contracts/paylink-contract/target/near/paylink_contract.wasm   (156 KB)
+
+# testnet accounts (keys saved to ~/.near-credentials)
+near account create-account sponsor-by-faucet-service paylink-v2.testnet \
+  autogenerate-new-keypair save-to-legacy-keychain
+near account create-account sponsor-by-faucet-service paylink-fees.testnet \
+  autogenerate-new-keypair save-to-legacy-keychain
+
+# deploy + init in one transaction. `new` registers the contract and the fee
+# account with the token, so it needs 0.02 NEAR per allowlisted token.
+near contract deploy paylink-v2.testnet \
+  use-file target/near/paylink_contract.wasm \
+  with-init-call new json-args \
+  '{"allowed_tokens":["usdc.tidepool-sandbox.testnet"],"fee_account":"paylink-fees.testnet"}' \
+  prepaid-gas '100.0 Tgas' attached-deposit '0.02 NEAR' \
+  network-config testnet sign-with-keychain send
+
+# frontend (static, no build step)
+cd frontend && python -m http.server 8000
+```
+
+The live deployment is **`paylink-v2.testnet`**. The first account,
+`paylink.testnet`, was initialised with the previous allowlist, and `#[init]`
+runs once — switching the accepted token therefore took a fresh account with
+the same wasm rather than a re-init.
+
+The invoice parser is optional and is not built here. Deploy it by pasting
+`workers/parse/src/index.js` into a Cloudflare Worker (dashboard → Workers &
+Pages → Create → Worker), then add `GEMINI_API_KEY` as a **secret** and set
+`ALLOWED_ORIGIN` to the demo's origin. Copy the Worker URL into
+`frontend/config.js` as `parseEndpoint`. `workers/parse/README.md` has the
+step-by-step and a `curl` check. Without it the "paste a payment request"
+block simply does not render.
+
+The release keeper deploys the same way: paste `workers/keeper/src/index.js`
+into a second Worker (one file, no dependencies), add the `KEEPER_KEY` and
+`TICK_SECRET` secrets plus four text variables, and set a `* * * * *` cron
+trigger. `workers/keeper/README.md` has the steps and a `curl` check. Without
+it the frontend still releases links itself — the keeper is the backstop.
+
+`--abi-features near-sdk/unit-testing` is not optional on a host build:
+near-sdk's ABI step links a host `cdylib`, and `unit-testing` is what
+supplies NEAR's host-side stubs. Without it the link fails on
+`storage_has_key`, `promise_batch_create` and friends.
+
+Keys belong in `.env`. Never in the repository.
+
+---
+
+## Deploy the demo
+
+The frontend is static: no build step, no server, no GitHub. Any host that
+serves a folder works. Two that need no install and no repository connection:
+
+- **Vercel** — open <https://vercel.com/new/drop> and drag the `frontend/`
+  folder onto the page. It returns an HTTPS URL in a few seconds. (The CLI
+  works too: `npx vercel` inside `frontend/` after `npx vercel login`.)
+- **Cloudflare Pages** — Workers & Pages → Create → Pages → *Upload assets*,
+  then upload `frontend/`.
+
+Both keep the hash routing intact (`/#pay/<id>`), so payment links work as
+soon as the folder is uploaded. If you deploy the parser too, set its
+`ALLOWED_ORIGIN` to the new origin and put the Worker URL in
+`frontend/config.js` before uploading.
+
+---
+
+## References
+
+- [NEAR HACKATHON](https://nearhackathon.com/) · [HACKATHON.md](https://nearhackathon.com/HACKATHON.md)
+- Track prompt: `tracks/08-realworld.md`
+- [NEP-141 Fungible Token Standard](https://github.com/near/NEPs/blob/master/neps/nep-0141.md)
+- [NEP-366 Meta Transactions](https://docs.near.org/protocol/transactions/meta-tx.md):
+  related reading only. **Paylink does not use NEP-366 or any relayer.** The payee
+  needs no gas because `claim` can be called by anyone and can only pay the invoice's
+  payee and the fee account. The payer's wallet signs the release in the app, and the
+  keeper Worker signs it from its own testnet account as a backstop. Track 08 asks
+  you to lean on meta transactions; this build reaches the same goal (payee pays no
+  gas) without them.
+- [1Click API](https://docs.near-intents.org/integration/distribution-channels/1click-api/quickstart) · [Tidepool testnet sandbox](https://www.usetidepool.tech/docs/quickstart)
+- [NEAR docs index](https://docs.near.org/llms.txt) · [NEAR Intents docs index](https://docs.near-intents.org/llms.txt)

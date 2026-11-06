@@ -1,0 +1,15 @@
+name = "paylink-parse"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# Set the browser origin allowed to call this Worker, e.g.
+#   https://paylink-demo.pages.dev
+# "*" works for local testing but lets any page spend your Gemini quota.
+[vars]
+ALLOWED_ORIGIN = "*"
+# gemini-2.5-flash is deprecated and API access is limited to existing users.
+# 3.5 Flash-Lite is Google's own migration target and is free-tier eligible.
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+
+# The key itself is a secret, never a var:
+#   npx wrangler secret put GEMINI_API_KEY

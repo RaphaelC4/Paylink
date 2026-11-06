@@ -1,0 +1,9 @@
+{
+  "name": "paylink-keeper",
+  "private": true,
+  "type": "module",
+  "description": "Releases PAID Paylink links; the contract's claim is callable by anyone. No dependencies — signs with WebCrypto Ed25519.",
+  "devDependencies": {
+    "wrangler": "^4.157.0"
+  }
+}
