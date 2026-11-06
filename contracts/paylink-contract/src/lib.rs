@@ -192,7 +192,8 @@ impl Contract {
 
     /// Record an invoice. Holds no funds and grants nobody a withdrawal; it
     /// only writes down what someone is owed, and registers the creator on the
-    /// invoice's token so the later payout cannot fail for want of an account.
+    /// invoice's token — a best-effort call that `claim` repeats before
+    /// paying out, so the payout cannot fail for want of an account.
     #[payable]
     pub fn create_link(
         &mut self,
@@ -229,8 +230,9 @@ impl Contract {
         }
 
         // Fire and forget: if the creator is already registered the token
-        // refunds this in full; if the call fails for any reason, creating the
-        // invoice still succeeds and `claim` simply retries later.
+        // refunds this in full; if the call fails for any reason, creating
+        // the invoice still succeeds — `claim` re-runs this registration
+        // before every payout, so a failed attempt here never strands money.
         let _ = Promise::new(token.clone()).function_call(
             "storage_deposit".to_string(),
             register_args(&creator),
@@ -337,6 +339,13 @@ impl Contract {
     /// The payout and the fee go out as one batch to the token contract, so
     /// they succeed or fail together: `on_claimed` can put the invoice back to
     /// `PAID` and nothing is ever half-paid.
+    ///
+    /// Before any money moves, the payee is registered on the token again.
+    /// `create_link`'s registration is fire-and-forget; this is the retry, so
+    /// a registration that never landed cannot strand a paid invoice. The
+    /// payout batch runs after it either way: if the payee is still
+    /// unregistered the batch fails, `on_claimed` returns the invoice to
+    /// `PAID`, and the next attempt — frontend or keeper — starts over.
     #[payable]
     pub fn claim(&mut self, link_id: String) -> Promise {
         require!(
@@ -363,7 +372,7 @@ impl Contract {
         self.links.insert(link_id.clone(), link);
 
         let one_yocto = NearToken::from_yoctonear(1);
-        let mut transfers = Promise::new(token).function_call(
+        let mut transfers = Promise::new(token.clone()).function_call(
             "ft_transfer".to_string(),
             ft_transfer_args(&payee, payout),
             one_yocto,
@@ -380,12 +389,26 @@ impl Contract {
             );
         }
 
-        transfers.then(Promise::new(env::current_account_id()).function_call(
-            "on_claimed".to_string(),
-            serde_json::to_vec(&json!({ "link_id": link_id })).expect("args serialize"),
-            NearToken::from_near(0),
-            CLAIM_CALLBACK_GAS,
-        ))
+        // Register the payee first, then pay. `create_link` fires the same
+        // registration without waiting for the result; this is the retry,
+        // paid for out of the contract's own balance (an already-registered
+        // payee is refunded in full). Success or failure, the payout batch
+        // runs next — still unregistered means it fails, `on_claimed` sends
+        // the invoice back to `PAID`, and the next attempt starts over.
+        Promise::new(token)
+            .function_call(
+                "storage_deposit".to_string(),
+                register_args(&payee),
+                NearToken::from_yoctonear(PAYEE_REGISTRATION_DEPOSIT),
+                STORAGE_DEPOSIT_GAS,
+            )
+            .then(transfers)
+            .then(Promise::new(env::current_account_id()).function_call(
+                "on_claimed".to_string(),
+                serde_json::to_vec(&json!({ "link_id": link_id })).expect("args serialize"),
+                NearToken::from_near(0),
+                CLAIM_CALLBACK_GAS,
+            ))
     }
 
     /// Settles `claim`. On failure the invoice returns to `PAID` so anyone can
@@ -850,9 +873,14 @@ mod tests {
         );
 
         let calls = calls_to(TOKEN);
-        assert!(!calls.is_empty(), "claim must queue transfers to the token");
-        for (function, args) in &calls {
-            assert_eq!(function, "ft_transfer");
+        // Registration runs first…
+        assert_eq!(calls[0].0, "storage_deposit");
+        let transfers: Vec<_> = calls
+            .iter()
+            .filter(|(f, _)| f == "ft_transfer")
+            .collect();
+        assert!(!transfers.is_empty(), "claim must queue transfers to the token");
+        for (_function, args) in transfers {
             let receiver = args["receiver_id"].as_str().unwrap();
             assert!(
                 receiver == "alice.near" || receiver == FEE_ACCOUNT,
@@ -869,19 +897,82 @@ mod tests {
         pay(&mut c, "bob.near", 10_000, "lnk-fee");
         claim_as(&mut c, "alice.near", "lnk-fee");
 
-        let calls = calls_to(TOKEN);
-        assert_eq!(calls.len(), 2, "payout and fee");
-        assert_eq!(calls[0].1["receiver_id"], "alice.near");
-        assert_eq!(calls[0].1["amount"], "9950");
-        assert_eq!(calls[1].1["receiver_id"], FEE_ACCOUNT);
-        assert_eq!(calls[1].1["amount"], "50");
+        let transfers: Vec<_> = calls_to(TOKEN)
+            .into_iter()
+            .filter(|(f, _)| f == "ft_transfer")
+            .collect();
+        assert_eq!(transfers.len(), 2, "payout and fee");
+        assert_eq!(transfers[0].1["receiver_id"], "alice.near");
+        assert_eq!(transfers[0].1["amount"], "9950");
+        assert_eq!(transfers[1].1["receiver_id"], FEE_ACCOUNT);
+        assert_eq!(transfers[1].1["amount"], "50");
 
         // One receipt carrying both transfers: they succeed or fail together.
-        let to_token = get_created_receipts()
+        // (The payee registration before them is its own receipt.)
+        let payout_receipts = get_created_receipts()
+            .into_iter()
+            .filter(|r| {
+                r.receiver_id.as_str() == TOKEN
+                    && r.actions.iter().any(|a| matches!(
+                        a,
+                        near_sdk::mock::MockAction::FunctionCallWeight { method_name, .. }
+                            if method_name.as_slice() == b"ft_transfer"
+                    ))
+            })
+            .count();
+        assert_eq!(payout_receipts, 1, "payout and fee must be a single batch");
+    }
+
+    #[test]
+    fn claim_re_registers_the_payee_before_paying_out() {
+        let mut c = setup();
+        open_link_for(&mut c, "alice.near", "lnk-retry-reg", 10_000);
+        pay(&mut c, "bob.near", 10_000, "lnk-retry-reg");
+        claim_as(&mut c, "carol.near", "lnk-retry-reg");
+
+        // Receipts toward the token, in order: the registration first —
+        // `create_link`'s own registration is fire-and-forget, so this is the
+        // retry that keeps a never-registered payee from stranding the payout.
+        let to_token: Vec<_> = get_created_receipts()
             .into_iter()
             .filter(|r| r.receiver_id.as_str() == TOKEN)
-            .count();
-        assert_eq!(to_token, 1, "payout and fee must be a single batch");
+            .collect();
+        assert!(to_token.len() >= 2, "registration receipt then payout batch");
+
+        let first: Vec<(String, near_sdk::serde_json::Value)> = to_token[0]
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                near_sdk::mock::MockAction::FunctionCallWeight {
+                    method_name, args, ..
+                } => Some((
+                    String::from_utf8(method_name.clone()).unwrap(),
+                    near_sdk::serde_json::from_slice(args).unwrap(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(first.len(), 1, "the registration is one call");
+        assert_eq!(first[0].0, "storage_deposit");
+        assert_eq!(first[0].1["account_id"], "alice.near");
+        assert_eq!(first[0].1["registration_only"], true);
+
+        // …and the payout batch in the receipt after it.
+        let second: Vec<String> = to_token[1]
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                near_sdk::mock::MockAction::FunctionCallWeight { method_name, .. } => {
+                    Some(String::from_utf8(method_name.clone()).unwrap())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            second,
+            vec!["ft_transfer".to_string(), "ft_transfer".to_string()],
+            "payout and fee follow the registration"
+        );
     }
 
     #[test]
@@ -891,9 +982,12 @@ mod tests {
         pay(&mut c, "bob.near", 20_000, "lnk-ov2");
         claim_as(&mut c, "alice.near", "lnk-ov2");
 
-        let calls = calls_to(TOKEN);
-        assert_eq!(calls[0].1["amount"], "19900");
-        assert_eq!(calls[1].1["amount"], "100");
+        let transfers: Vec<_> = calls_to(TOKEN)
+            .into_iter()
+            .filter(|(f, _)| f == "ft_transfer")
+            .collect();
+        assert_eq!(transfers[0].1["amount"], "19900");
+        assert_eq!(transfers[1].1["amount"], "100");
     }
 
     #[test]
@@ -903,10 +997,13 @@ mod tests {
         pay(&mut c, "bob.near", 100, "lnk-tiny");
         claim_as(&mut c, "alice.near", "lnk-tiny");
 
-        let calls = calls_to(TOKEN);
-        assert_eq!(calls.len(), 1, "no zero-amount fee transfer");
-        assert_eq!(calls[0].1["receiver_id"], "alice.near");
-        assert_eq!(calls[0].1["amount"], "100");
+        let transfers: Vec<_> = calls_to(TOKEN)
+            .into_iter()
+            .filter(|(f, _)| f == "ft_transfer")
+            .collect();
+        assert_eq!(transfers.len(), 1, "no zero-amount fee transfer");
+        assert_eq!(transfers[0].1["receiver_id"], "alice.near");
+        assert_eq!(transfers[0].1["amount"], "100");
     }
 
     #[test]
@@ -975,9 +1072,12 @@ mod tests {
 
         // And the retry queues the same full payout again: nothing was lost.
         claim_as(&mut c, "carol.near", "lnk-retry");
-        let calls = calls_to(TOKEN);
-        assert_eq!(calls[0].1["receiver_id"], "alice.near");
-        assert_eq!(calls[0].1["amount"], "9950");
+        let transfers: Vec<_> = calls_to(TOKEN)
+            .into_iter()
+            .filter(|(f, _)| f == "ft_transfer")
+            .collect();
+        assert_eq!(transfers[0].1["receiver_id"], "alice.near");
+        assert_eq!(transfers[0].1["amount"], "9950");
     }
 
     #[test]
