@@ -362,6 +362,20 @@ listed here rather than left for a reviewer to infer.
 
 ---
 
+## Hackathon diff
+
+Everything in this repository was committed inside the NEAR HACKATHON window
+(19 Oct – 14 Nov 2026); there is no earlier code to exclude. Two tags mark the
+window for review:
+
+- `pre-hackathon` — empty baseline (the repository did not exist before the window)
+- `hackathon-submission` — the state submitted for judging
+
+Full diff between them:
+<https://github.com/RaphaelC4/Paylink/compare/pre-hackathon...hackathon-submission>
+
+---
+
 ## Development
 
 ```bash
