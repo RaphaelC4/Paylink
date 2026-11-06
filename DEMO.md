@@ -166,7 +166,7 @@ swap**, and point at the swap row — pick **wNEAR**, press
 
 ### 2:20–2:30 — Close
 
-> "Contract, 37 tests, and deployment steps are in the repo. Testnet only —
+> "Contract, 38 tests, and deployment steps are in the repo. Testnet only —
 > the tokens come free from Tidepool's faucet."
 
 ---

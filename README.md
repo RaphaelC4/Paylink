@@ -4,8 +4,10 @@
 
 Paylink turns an invoice into a URL. A freelancer in Lagos sends a client in
 Berlin a link. The client pays with the tokens already in their wallet. The
-freelancer receives them on NEAR and never had to explain what a seed phrase
-is.
+freelancer receives them on NEAR and never had to walk a client through a seed
+phrase. Creating the link does take the freelancer's own funded wallet and one
+signed transaction, and the payer signs once to send the money — from then on
+the freelancer signs nothing.
 
 Built for **NEAR HACKATHON**, track **`realworld` — Real-World Money**.
 
@@ -27,23 +29,27 @@ Getting paid across borders still costs money and time.
 
 Every route asks one side to learn the other side's world.
 
-Paylink removes that requirement. The payer uses what they have. The payee
-does not have to claim, sweep, or hold gas: the frontend releases a paid
-invoice to them the moment it is settled, and a keeper Worker repeats that
-release every minute so nothing waits on a browser staying open.
+Paylink removes that requirement — once the link is created. That first step
+costs the payee one signed transaction from a funded wallet (a 0.01 NEAR
+stake plus gas). After that, the payer uses what they have, and the payee does
+not have to claim, sweep, or hold gas: the frontend releases a paid invoice to
+them the moment it is settled, and a keeper Worker repeats that release every
+minute so nothing waits on a browser staying open.
 
 ---
 
 ## What's proven
 
 [Security](#security) below states the threat model. This is the other side:
-what the build actually demonstrates, and the test that demonstrates it. All 37
-tests are pure host tests — `cargo test --lib`.
+what the build actually demonstrates, and the test that demonstrates it. All 38
+tests are pure host tests — `cargo test --lib`. On-chain evidence for the
+cross-contract steps that host tests cannot reach is
+[in its own section](#one-full-run-on-chain) below.
 
 | Behaviour | Proof |
 | --- | --- |
 | **Micro-invoices pay out.** A 100-unit link has a fee that rounds to zero, so `claim` skips the fee leg instead of failing on a zero-amount NEP-141 transfer, and the split never overflows or loses a unit. | `a_tiny_invoice_skips_the_fee_leg_instead_of_failing`, `split_fee_never_overflows_or_loses_a_unit` |
-| **Nobody needs gas to get paid.** `claim` is callable by anyone, so the frontend releases a paid invoice for the payee and the keeper repeats it every minute — the payee holds no NEAR and signs nothing after payment. | `a_stranger_can_trigger_claim_but_only_the_payee_is_paid`, `claim_pays_the_payee_less_the_fee_in_one_batch` |
+| **Nobody needs gas to get paid — once the link exists.** Creating the link is the payee's one signed transaction (0.01 NEAR stake plus gas). After that `claim` is callable by anyone, so the frontend releases a paid invoice for the payee and the keeper repeats it every minute — the payee holds no NEAR and signs nothing after payment. | `a_stranger_can_trigger_claim_but_only_the_payee_is_paid`, `claim_pays_the_payee_less_the_fee_in_one_batch` |
 | **Overpayment is never lost.** What arrived is what's credited, and the fee applies to the credited amount rather than the invoiced one. | `an_overpayment_is_credited_in_full`, `claim_applies_the_fee_to_an_overpayment` |
 | **Paying twice never double-credits.** A link leaves `OPEN` once; a second payment is returned. | `paying_twice_does_not_double_credit` |
 | **Expiry needs no background job.** `Expired` is derived on read from `expires_at`, never stored, so an aged link reports itself honestly and refuses payment. | `an_expired_invoice_cannot_be_paid`, `an_expired_invoice_is_reported_as_expired_even_unpaid` |
@@ -51,6 +57,36 @@ tests are pure host tests — `cargo test --lib`.
 | **The keeper needs no registry.** One `view_state` call with prefix `l` lists every link; it signs with the runtime's Ed25519 WebCrypto, so it is a single file with no dependencies. | `workers/keeper/src/index.js` |
 | **Storage is funded up front.** `create_link` requires a 0.01 NEAR stake that covers its own storage and registers the payee on the token. | `create_link_requires_a_storage_stake`, `the_stake_really_is_ten_millinear` |
 | **Settings are public getters.** The allowlist and both fee settings are readable by anyone, not admin-only views. | `the_allowlist_is_visible_to_callers`, `the_fee_settings_are_visible_to_callers` |
+
+### One full run, on-chain
+
+Host tests cannot execute the cross-contract steps, so here is a real run on
+`paylink-v2.testnet` instead: link `keeper-005`, created, paid and released on
+**5 Nov 2026** — the release signed by the keeper's cron, no human in the
+loop.
+
+| Step | Transaction |
+| --- | --- |
+| **Create** — payee calls `create_link` with a 0.01 NEAR stake, 12:14:24 UTC | [`4jLDBWkuAHRyPiZmGJmfN2uNdSsbJktvHhegH7rDCHaE`](https://testnet.nearblocks.io/txns/4jLDBWkuAHRyPiZmGJmfN2uNdSsbJktvHhegH7rDCHaE) — Success |
+| **Pay** — payer calls `ft_transfer_call` for 3 USDC, **8 seconds later** | [`7LiwE8BvSoUdoHZJmBA85App2TVWkVugvWyE57LTocLn`](https://testnet.nearblocks.io/txns/7LiwE8BvSoUdoHZJmBA85App2TVWkVugvWyE57LTocLn) — Success |
+| **Claim** — keeper cron calls `claim` 2 min 39 s later: 2.985 USDC to the payee, 0.015 to fees | [`HrrNqKHZoQu7QFZMENzsYT9eBxLqujRQrK8YuXvdocD1`](https://testnet.nearblocks.io/txns/HrrNqKHZoQu7QFZMENzsYT9eBxLqujRQrK8YuXvdocD1) — Success |
+
+That is one link's full lifecycle in three transactions, all visible in the
+explorer. This was not a one-off: the keeper's cron has released links on
+testnet repeatedly — [`paylink-keeper.testnet`](https://testnet.nearblocks.io/address/paylink-keeper.testnet)
+lists every `claim` it has sent, and each released link reads `CLAIMED` with a
+`claimed_at` timestamp when queried on chain.
+
+**After the payee-registration fix**, the same three-step cycle was run again
+live against the deployed code on **6 Nov 2026**, link `review-fix-001`
+(1 USDC): create
+[`Frh8z8mdXTTwKBwtyi33k9paYJQ6K6AE3LMKkFp6FPGv`](https://testnet.nearblocks.io/txns/Frh8z8mdXTTwKBwtyi33k9paYJQ6K6AE3LMKkFp6FPGv) →
+pay
+[`4dVD9fRSwd5Hmq9dimJNxoUECbPwBM3p39dfFeykyGXb`](https://testnet.nearblocks.io/txns/4dVD9fRSwd5Hmq9dimJNxoUECbPwBM3p39dfFeykyGXb) →
+claim
+[`8WmbLm4E92XE9cgoGZHhvwCuBNS6rbqDeVtJw8Fp1jw6`](https://testnet.nearblocks.io/txns/8WmbLm4E92XE9cgoGZHhvwCuBNS6rbqDeVtJw8Fp1jw6) —
+the claim's logs show the registration receipt executing before the payout
+batch, which is the fix working end to end.
 
 ---
 
@@ -65,8 +101,10 @@ tests are pure host tests — `cargo test --lib`.
 2. **Recognise payment.** The contract implements NEP-141 `ft_on_transfer`.
    When tokens arrive, the token contract itself calls the contract and passes
    the link id in `msg`. The contract checks it and marks the link paid.
-3. **Release the money.** `claim` sends the credited amount to the payee, minus
-   a fixed 0.5% fee. **Anyone can call it** — the money can only go to the
+3. **Release the money.** `claim` first makes sure the payee is registered on
+   the token — a deposit from the contract's own balance, refunded in full if
+   they already are — then sends the credited amount to the payee, minus a
+   fixed 0.5% fee. **Anyone can call it** — the money can only go to the
    invoice's payee and the fee account, never to the caller — so the frontend
    releases a paid invoice for the payee instead of asking them to come back
    and sign something, and `workers/keeper/` repeats the release from a cron
@@ -184,6 +222,8 @@ Payer's wallet
       │  ft_transfer_call(msg = link id)
       ▼
 Paylink contract            ← credits the link, returns 0 (all tokens used)
+      │  storage_deposit(payee)   register the payee first — refunded in full
+      │                           if already registered
       │  ft_transfer(99.5% → payee)  ┐ one batch, so they
       │  ft_transfer(0.5%  → fee)    ┘ succeed or fail together
       ▼
@@ -292,8 +332,8 @@ will look for them.
 | Underpayment | The credited amount must be at least the invoiced amount, otherwise the full amount is returned. |
 | Replaying one payment across links | Each `msg` names one link, and a link can only leave `OPEN` once. |
 | Payee never receives the funds | `claim` pays only `link.creator` and the fee account, never the caller. A failed transfer reverts the link to `PAID` so anyone can retry. |
-| Payee not registered with the token | `create_link` asks the token to register the payee but doesn't wait for the result. If that fails, the payout fails, the link goes back to `PAID`, and `claim` doesn't register the payee again, so the keeper retries every minute and fails each time. The funds stay in the contract until the payee is registered with the token (anyone can do this with a storage deposit on the token), and then any retry succeeds. Not fixed in this build. |
-| Stuck links crowd out others | The keeper claims at most 10 links per sweep. If 10 links were permanently stuck, the keeper would never reach link #11. The in-app release and the manual *Release* button still work for it. Not fixed in this build. |
+| Payee not registered with the token | `create_link` registers the payee but does not wait for the result, so `claim` now registers them again before every payout — a `storage_deposit` paid from the contract's own balance, refunded in full when the payee is already registered. If that registration fails, the payout batch fails too, `on_claimed` returns the link to `PAID`, and the next attempt — frontend or keeper, every minute — starts over. A slow registration can delay a payout; it can no longer strand one. Fixed in this build and deployed: test `claim_re_registers_the_payee_before_paying_out`, live in tx [`AZES8yzvj3nBxWeAe4HmgYfQMbqBPBYwGzdBXGUkDvYy`](https://testnet.nearblocks.io/txns/AZES8yzvj3nBxWeAe4HmgYfQMbqBPBYwGzdBXGUkDvYy). |
+| Stuck links crowd out others | The keeper claims at most 10 links per sweep — a per-tick gas bound, not a queue with a tail. The one failure mode that could make a claim fail forever (an unregistered payee) is now retried inside `claim` itself, so links no longer pile up in that state. The in-app release and the manual *Release* button call the contract directly and bypass the keeper entirely. |
 | Someone claims on the payee's behalf | `claim` is deliberately callable by anyone, but the payout address comes from the invoice, not from the caller. A stranger can only cause the payee to be paid. |
 | Payer loses money on a bad payment | Every rejection returns the full amount; the token contract refunds the sender. |
 | Deployer holds power | No admin function, no owner and no withdrawal path in the contract's code. The fee account and the 0.5% rate are fixed at deploy; changing either needs a code upgrade signed by the deployer's key — and that key can redeploy the contract, so the deployer retains that one power outside the code. |
@@ -383,7 +423,7 @@ Full diff between them:
 # near-cli-rs, and nasm (near-sdk's aws-lc-sys needs it for host builds)
 cargo near new contracts/paylink-contract   # generated project; never hand-rolled
 
-cargo test --lib                            # 37 unit tests, all pure host tests
+cargo test --lib                            # 38 unit tests, all pure host tests
 
 # build the wasm with its NEP-330 ABI embedded
 cargo near build non-reproducible-wasm --abi-features near-sdk/unit-testing
