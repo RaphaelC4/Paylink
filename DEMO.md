@@ -75,6 +75,10 @@ Scroll slowly past the hero and the three steps. Do not rush.
 > "One transaction writes the link. The contract takes a 0.01 NEAR storage
 > stake — no company, no server, no account on our side."
 
+> "And if a wallet can't sign directly, the paste step is the fallback: the
+> modal prints the exact near-cli command, you run it in your terminal, and
+> paste the transaction hash back — same chain, still no server in between."
+
 **On screen:** the button reads *Creating link…* while the wallet prompt is
 open, then the app lands on the share page: the link in a copy field, a QR
 code, WhatsApp / Telegram / Email buttons, and the status pill **UNPAID**.

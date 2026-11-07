@@ -1,13 +1,16 @@
 # Paylink
 
+**First, the honest part: creating a link needs a funded NEAR wallet** —
+Paylink has no relayer, so the payee signs and pays gas for that one creation
+transaction, and after that they never sign or pay again.
+
 **Send someone a link. Get paid from whatever they already hold.**
 
 Paylink turns an invoice into a URL. A freelancer in Lagos sends a client in
 Berlin a link. The client pays with the tokens already in their wallet. The
 freelancer receives them on NEAR and never had to walk a client through a seed
-phrase. Creating the link does take the freelancer's own funded wallet and one
-signed transaction, and the payer signs once to send the money — from then on
-the freelancer signs nothing.
+phrase. The payer signs once to send the money — from then on the freelancer
+signs nothing.
 
 **On gas:** the track hints at meta transactions; Paylink reaches the same
 outcome without NEP-366 or a relayer — `claim` is callable by anyone and can
@@ -59,7 +62,7 @@ cross-contract steps that host tests cannot reach is
 | **Nobody needs gas to get paid — once the link exists.** Creating the link is the payee's one signed transaction (0.01 NEAR stake plus gas). After that `claim` is callable by anyone, so the frontend releases a paid invoice for the payee and the keeper repeats it every minute — the payee holds no NEAR and signs nothing after payment. | `a_stranger_can_trigger_claim_but_only_the_payee_is_paid`, `claim_pays_the_payee_less_the_fee_in_one_batch` |
 | **Overpayment is never lost.** What arrived is what's credited, and the fee applies to the credited amount rather than the invoiced one. | `an_overpayment_is_credited_in_full`, `claim_applies_the_fee_to_an_overpayment` |
 | **Paying twice never double-credits.** A link leaves `OPEN` once; a second payment is returned. | `paying_twice_does_not_double_credit` |
-| **Expiry needs no background job.** `Expired` is derived on read from `expires_at`, never stored, so an aged link reports itself honestly and refuses payment. | `an_expired_invoice_cannot_be_paid`, `an_expired_invoice_is_reported_as_expired_even_unpaid` |
+| **Expiry needs no background job.** `Expired` is derived on read from `expires_at`, never stored, so an aged link reports itself honestly and refuses payment. The same timestamp is also the due date: after it, payment is refused and the tokens return to the payer in the same transaction — a hard cutoff, rather than a late payment accepted and marked late. | `an_expired_invoice_cannot_be_paid`, `an_expired_invoice_is_reported_as_expired_even_unpaid` |
 | **Sharing survives a dead RPC.** The QR code and Copy button are built from the link id alone — a vendored MIT encoder, no image request, no chain round trip. | `frontend/vendor/qrcode.js`, `qrMarkup()` in `frontend/app.js` |
 | **The keeper needs no registry.** One `view_state` call with prefix `l` lists every link; it signs with the runtime's Ed25519 WebCrypto, so it is a single file with no dependencies. | `workers/keeper/src/index.js` |
 | **Storage is funded up front.** `create_link` requires a 0.01 NEAR stake that covers its own storage and registers the payee on the token. | `create_link_requires_a_storage_stake`, `the_stake_really_is_ten_millinear` |
