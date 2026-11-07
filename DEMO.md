@@ -39,7 +39,7 @@ fund them from the CLI.
    # -> "100000000"   (100 USDC, 6 decimals)
    ```
 
-5. Open `http://127.0.0.1:8000/` in profile A. Connect the payee wallet.
+5. Open `https://paylink-near.vercel.app/` in profile A. Connect the payee wallet.
 6. Keep profile B open at the same URL, wallet not yet connected.
 7. Set the browser zoom to 100% and the window to roughly 1280×800. The layout
    is responsive, but the pay card reads best at that size.

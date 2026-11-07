@@ -3,7 +3,7 @@
    Reads are unsigned JSON-RPC view calls; writes are signed in the wallet. */
 
 import NearConnect from "@hot-labs/near-connect";
-import { CONFIG, ONE_YOCTO, CREATE_STAKE, MAX_DESCRIPTION_BYTES, GAS_DEFAULT, GAS_CLAIM, GAS_FT_CALL } from "./config.js?v=20261104e";
+import { CONFIG, ONE_YOCTO, CREATE_STAKE, MAX_DESCRIPTION_BYTES, GAS_DEFAULT, GAS_CLAIM, GAS_FT_CALL } from "./config.js?v=20261107a";
 
 /* The vendored bundle is the package's CommonJS build, so esbuild exposes the
    module namespace as the default export rather than as named exports. */
@@ -72,6 +72,39 @@ const usdOf = (raw) =>
 
 const usd = (n) =>
   n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
+
+/* Indicative naira reference for the pay card — the Lagos story made visible.
+   Fetched once from a public keyless FX endpoint; DISPLAY ONLY: on any
+   failure the line stays hidden and the pay flow never notices it exists. */
+let fxRate = null;
+let fxPending = null;
+
+function loadFx() {
+  if (!fxPending) {
+    fxPending = fetch(CONFIG.fx.url)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        const n = Number(d && d.rates && d.rates[CONFIG.fx.quote]);
+        if (Number.isFinite(n) && n > 0) fxRate = n;
+        return fxRate;
+      })
+      .catch(() => null);
+  }
+  return fxPending;
+}
+
+function paintNgn(root, usdValue) {
+  const el = root.querySelector("#payNgn");
+  if (!el) return;
+  const draw = () => {
+    if (!fxRate) { el.hidden = true; return; }
+    const naira = Math.round(usdValue * fxRate).toLocaleString("en-US");
+    el.innerHTML = `<span class="approx" aria-hidden="true">&asymp;</span><span>&#8358;${naira}</span><span class="fx-note">indicative FX</span>`;
+    el.hidden = false;
+  };
+  draw();
+  if (!fxRate) loadFx().then(draw);
+}
 
 function timeAgo(ms) {
   if (!ms) return "–";
@@ -1127,6 +1160,7 @@ async function renderPay(id) {
     </div>
 
     <div class="pay-usd"><span class="approx" aria-hidden="true">&asymp;</span><span>${usd(value)}</span></div>
+    <div class="pay-ngn" id="payNgn" hidden></div>
     <div class="pay-token">
       <svg class="coin" aria-hidden="true"><use href="#coin-usdc"/></svg>
       <span>${amount} ${esc(CONFIG.token.symbol)}</span>
@@ -1153,6 +1187,7 @@ async function renderPay(id) {
 
     ${st === "OPEN" && !mine ? fundRail() : ""}`;
 
+  paintNgn(card, value);
   renderPayActions(link, st);
   if (st === "OPEN" && !mine) wireFundRail(link);
 }

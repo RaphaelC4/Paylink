@@ -25,7 +25,7 @@ link fails on undefined references.
 
 ```bash
 cargo test --lib
-#   test result: ok. 37 passed; 0 failed; 0 ignored
+#   test result: ok. 38 passed; 0 failed; 0 ignored
 ```
 
 ## Deploy and initialise

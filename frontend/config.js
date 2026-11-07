@@ -41,6 +41,15 @@ export const CONFIG = {
   feeBps: 50,
   feeAccount: "paylink-fees.testnet",
 
+  /* Indicative naira line under the dollar figure on the pay card — the
+     Lagos story, on screen. Free, keyless, CORS-enabled public FX reference
+     (no account, no quota). Display only: if the fetch fails the line stays
+     hidden and the pay flow never notices. */
+  fx: {
+    url: "https://open.er-api.com/v6/latest/USD",
+    quote: "NGN",
+  },
+
   /* Invoice parsing proxy (Cloudflare Worker in workers/parse/).
      Empty string = the "paste a payment request" block stays hidden. The Worker
      holds the Gemini key; this file never does. Set this to the Worker URL

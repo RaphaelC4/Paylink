@@ -9,6 +9,12 @@ phrase. Creating the link does take the freelancer's own funded wallet and one
 signed transaction, and the payer signs once to send the money — from then on
 the freelancer signs nothing.
 
+**On gas:** the track hints at meta transactions; Paylink reaches the same
+outcome without NEP-366 or a relayer — `claim` is callable by anyone and can
+only pay the invoice's payee, so the release is signed by whoever is holding
+the app (or by the keeper Worker) and the payee never holds gas
+([why no relayer](#references)).
+
 Built for **NEAR HACKATHON**, track **`realworld` — Real-World Money**.
 
 **Live demo:** <https://paylink-near.vercel.app/> ·
@@ -279,7 +285,9 @@ invoiced one.
    pill *UNPAID*.
 3. **Copy the link.** Press *Copy* — the button flips to *Link copied!* — and
    open it in a second browser profile or a second wallet.
-   See the link rendered with *Pay* available and *Expired* or *Paid*
+   See the link rendered with *Pay* available — the amount in dollars with an
+   indicative naira line beneath it (fetched once from a public FX reference,
+   hidden on its own if that reference is unreachable) — and *Expired* or *Paid*
    correctly reflected once the state changes.
 4. **Pay it.** Switch the wallet to a payer account, press *Pay*, approve the
    transaction. See the timeline move `Open → Paid` and the payer's token
@@ -333,12 +341,12 @@ will look for them.
 | Replaying one payment across links | Each `msg` names one link, and a link can only leave `OPEN` once. |
 | Payee never receives the funds | `claim` pays only `link.creator` and the fee account, never the caller. A failed transfer reverts the link to `PAID` so anyone can retry. |
 | Payee not registered with the token | `create_link` registers the payee but does not wait for the result, so `claim` now registers them again before every payout — a `storage_deposit` paid from the contract's own balance, refunded in full when the payee is already registered. If that registration fails, the payout batch fails too, `on_claimed` returns the link to `PAID`, and the next attempt — frontend or keeper, every minute — starts over. A slow registration can delay a payout; it can no longer strand one. Fixed in this build and deployed: test `claim_re_registers_the_payee_before_paying_out`, live in tx [`AZES8yzvj3nBxWeAe4HmgYfQMbqBPBYwGzdBXGUkDvYy`](https://testnet.nearblocks.io/txns/AZES8yzvj3nBxWeAe4HmgYfQMbqBPBYwGzdBXGUkDvYy). |
-| Stuck links crowd out others | The keeper claims at most 10 links per sweep — a per-tick gas bound, not a queue with a tail. The one failure mode that could make a claim fail forever (an unregistered payee) is now retried inside `claim` itself, so links no longer pile up in that state. The in-app release and the manual *Release* button call the contract directly and bypass the keeper entirely. |
+| Stuck links crowd out others | The keeper claims at most 10 links per sweep — a per-tick gas bound, not a queue with a tail. Every sweep re-reads contract state, so whatever one tick settled leaves the set and the 11th link is simply first in the next tick. The one failure mode that could make a claim fail forever (an unregistered payee) is now retried inside `claim` itself, so links no longer pile up in that state. The in-app release and the manual *Release* button call the contract directly and bypass the keeper entirely. |
 | Someone claims on the payee's behalf | `claim` is deliberately callable by anyone, but the payout address comes from the invoice, not from the caller. A stranger can only cause the payee to be paid. |
 | Payer loses money on a bad payment | Every rejection returns the full amount; the token contract refunds the sender. |
 | Deployer holds power | No admin function, no owner and no withdrawal path in the contract's code. The fee account and the 0.5% rate are fixed at deploy; changing either needs a code upgrade signed by the deployer's key — and that key can redeploy the contract, so the deployer retains that one power outside the code. |
 
-**Not audited.** This is a 14-day hackathon build. Do not send real funds to
+**Not audited.** This is a hackathon build. Do not send real funds to
 it.
 
 ---
@@ -351,7 +359,11 @@ Stated plainly, because saying otherwise would be worse than saying it.
   `usdc.tidepool-sandbox.testnet` (6 decimals) — Tidepool's sandbox test USDC —
   so no real money is involved. The contract is written to run on mainnet USDC
   unchanged — only an allowlist entry and a frontend config value would differ —
-  but it has not been deployed there or tested against a mainnet token.
+  but it has not been deployed there or tested against a mainnet token. The
+  accepted token is also fixed at deploy (`#[init]` runs once), so moving this
+  build to a different token took a fresh contract account — exactly how it
+  went from `paylink.testnet` to `paylink-v2.testnet`, as described in
+  [Development](#development).
 - **Not production ready.** No audit, no rate limiting, no indexer. Payment
   detection relies on the frontend polling contract state.
 

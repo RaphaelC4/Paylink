@@ -969,6 +969,16 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
   font-size:.3em;line-height:1;margin-top:.24em;
   color:var(--muted);font-weight:500;letter-spacing:0;
 }
+/* Indicative naira line: display only, hidden until (and unless) the FX
+   reference answers. Same tabular figures as the row above it. */
+.pay-ngn{
+  display:flex;align-items:baseline;gap:.28rem;
+  margin-top:.5rem;font-size:15px;color:var(--body);
+  font-weight:500;font-variant-numeric:tabular-nums;
+}
+.pay-ngn[hidden]{display:none}
+.pay-ngn .approx{font-size:13px;color:var(--muted);font-weight:400}
+.pay-ngn .fx-note{font-size:12px;color:var(--muted);font-weight:400;letter-spacing:.01em}
 .pay-token{
   display:flex;align-items:center;gap:.45rem;
   margin-top:.65rem;font-size:14px;color:var(--body);
