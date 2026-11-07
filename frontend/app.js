@@ -3,7 +3,7 @@
    Reads are unsigned JSON-RPC view calls; writes are signed in the wallet. */
 
 import NearConnect from "@hot-labs/near-connect";
-import { CONFIG, ONE_YOCTO, CREATE_STAKE, MAX_DESCRIPTION_BYTES, GAS_DEFAULT, GAS_CLAIM, GAS_FT_CALL } from "./config.js?v=20261107a";
+import { CONFIG, ONE_YOCTO, CREATE_STAKE, MAX_DESCRIPTION_BYTES, GAS_DEFAULT, GAS_CLAIM, GAS_FT_CALL } from "./config.js?v=20261107c";
 
 /* The vendored bundle is the package's CommonJS build, so esbuild exposes the
    module namespace as the default export rather than as named exports. */
@@ -1082,6 +1082,46 @@ const PAY_SKELETON = `
   <div class="skeleton-block sk-w60" aria-hidden="true"></div>
   <div class="skeleton-block sk-w50" aria-hidden="true"></div>`;
 
+/* ─────────────────────────────────────────────────────── line items ──
+   A note written as "Label — price; Label — price" is a list on the payment
+   card, and only then: every segment has to parse AND the prices have to add
+   up to exactly what the link asks for (BigInt, in base units — no float
+   drift). One unparseable segment, or a sum that misses, and the note renders
+   as the plain sentence it has always been. */
+function lineItems(desc, rawAmount, decimals = CONFIG.token.decimals) {
+  const parts = String(desc || "").split(";").map((s) => s.trim()).filter(Boolean);
+  if (parts.length < 2) return null;
+  const want = BigInt(rawAmount);
+  const items = [];
+  let sum = 0n;
+  for (const p of parts) {
+    const m = /^(.+?)\s*[—–-]\s*(\d+(?:\.\d+)?)$/.exec(p);
+    if (!m) return null;
+    const label = m[1].trim();
+    if (!label) return null;
+    const base = BigInt(toBaseUnits(m[2], decimals));
+    if (base <= 0n) return null;
+    items.push({ label, base });
+    sum += base;
+  }
+  return sum === want ? items : null;
+}
+
+/* The card's "for" line: the list when the note itemises, the note itself
+   otherwise. Escaped either way — the labels are user text. */
+function payNoteHtml(link) {
+  const items = lineItems(link.description, link.amount);
+  if (!items) {
+    return link.description ? `<p class="pay-desc"><b>for</b>${esc(link.description)}</p>` : "";
+  }
+  const rows = items.map((i) => `
+          <div class="pi-row"><span class="pi-l">${esc(i.label)}</span><span class="pi-p">${formatAmount(String(i.base))} ${esc(CONFIG.token.symbol)}</span></div>`).join("");
+  return `
+        <div class="pay-items">
+          <span class="pi-h">for</span>${rows}
+        </div>`;
+}
+
 async function renderPay(id) {
   const card = $("#payCard");
   delete card.dataset.status;
@@ -1166,7 +1206,7 @@ async function renderPay(id) {
       <span>${amount} ${esc(CONFIG.token.symbol)}</span>
     </div>
 
-    ${link.description ? `<p class="pay-desc"><b>for</b>${esc(link.description)}</p>` : ""}
+    ${payNoteHtml(link)}
 
     ${timeline(st)}
 
@@ -1215,10 +1255,15 @@ function renderPayActions(link, st) {
          state and the tools that get it in front of a payer. */
       const payUrl = payUrlFor(link.link_id);
       const shareText = `${link.description || "Payment request"} — ${formatAmount(link.amount)} ${CONFIG.token.symbol}`;
+      /* The share screen carries the QR; this card is where a link you have
+         already created gets re-shared from "My links", so it carries one too
+         — otherwise a phone never sees the code at all. */
+      const qr = qrBlock(qrMarkup(payUrl));
       box.innerHTML = `
         <div class="tx-line pending" role="status">Waiting for payment &mdash; you're the payee here, so the Pay button is for whoever you send this to.</div>
         ${shareUrlField(payUrl)}
         <div class="share-btns">${shareRow(payUrl, shareText)}</div>
+        ${qr ? `<div class="qr-col pay-qr">${qr}</div>` : ""}
         <p class="pay-fee">Copy or share the link. It flips to <strong>PAID</strong> the moment their payment lands, and this page shows it happen.</p>`;
       return;
     }
@@ -1470,9 +1515,9 @@ function fundRail() {
         <div class="row"><span>your ${sym} balance</span><code data-fund-bal>${accountId ? "…" : "connect a wallet"}</code></div>
         ${faucetBlockHTML("rail")}
         <div class="fund-block">
-          <div class="fund-h">or swap what you already hold</div>
+          <div class="fund-h">or swap what you already hold <span class="pill">1Click sandbox</span></div>
           <div class="ai-row">${chips}</div>
-          <button class="btn btn-sm" type="button" id="fundSwap"><span>Swap wNEAR to cover this link</span></button>
+          <button class="btn btn-sm" type="button" id="fundSwap"><span>Swap ${esc(SWAP_SOURCES[0].symbol)} and pay</span></button>
           <div id="fundSwapOut" class="tx-line" hidden></div>
         </div>
         <p class="fund-note">Tidepool — community testnet sandbox of NEAR's 1Click API. Test tokens only; never send real funds.</p>
@@ -1496,7 +1541,7 @@ function wireFundRail(link) {
     btn.setAttribute("aria-pressed", "true");
     btn.classList.add("on");
     chosen = Number(btn.dataset.i) || 0;
-    swapBtn.querySelector("span").textContent = `Swap ${SWAP_SOURCES[chosen].symbol} to cover this link`;
+    swapBtn.querySelector("span").textContent = `Swap ${SWAP_SOURCES[chosen].symbol} and pay`;
     swapOut.hidden = true;
     /* A successful quote leaves the swap button disabled ("Send" became the
        next action) — but picking another source invalidates that quote, so
@@ -1558,7 +1603,7 @@ function wireFundRail(link) {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ txHash: hash, depositAddress: q.depositAddress }),
           }).catch(() => {});
-          pollSwap(q.depositAddress, src, swapBtn, refreshFundBal);
+          pollSwap(q.depositAddress, src, swapBtn, refreshFundBal, link.link_id);
         } catch (err) {
           sendBtn.disabled = false;
           const o = $("#fundPollOut");
@@ -1575,8 +1620,11 @@ function wireFundRail(link) {
 
 /* Poll a live quote until it reaches a terminal state. The verdict comes
    from `status`, never from a swap hash — that is how 1Click clients are
-   told to work, and it holds on testnet too. */
-function pollSwap(depositAddress, src, swapBtn, refreshBal) {
+   told to work, and it holds on testnet too. `linkId` is what turns the
+   settle into a payment: the swap's proceeds go straight at the link from
+   the same click, instead of leaving the payer to find the Pay button with
+   the money already in their account. */
+function pollSwap(depositAddress, src, swapBtn, refreshBal, linkId) {
   const out = $("#fundPollOut");
   if (!out) return;
   out.hidden = false;
@@ -1600,9 +1648,14 @@ function pollSwap(depositAddress, src, swapBtn, refreshBal) {
         out.className = "tx-line ok";
         out.innerHTML = `
           <div class="row"><span>swapped</span><strong>${esc(sd.amountInFormatted || "")} ${esc(src.symbol)} → ${esc(sd.amountOutFormatted || "")} ${esc(CONFIG.token.symbol)}</strong></div>
-          <div class="row"><span>ready</span><strong>the full amount is in your wallet — hit Pay</strong></div>`;
+          <div class="row"><span>next</span><strong>paying this link with it&hellip;</strong></div>`;
         refreshBal();
-        toast("Swap settled — you can pay now");
+        toast("Swap settled — paying now");
+        /* One click, two moves: the swap settles and the payment follows from
+           the same action. The wallet still signs each transaction — that is
+           the part no free testnet build can chain — but the payer never has
+           to go looking for the Pay button. */
+        if (linkId) payLink(linkId);
         return;
       }
       if (st === "REFUNDED" || st === "FAILED") {

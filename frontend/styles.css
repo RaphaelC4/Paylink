@@ -77,6 +77,14 @@
 
   --ease:cubic-bezier(.32,.72,0,1);
   --header:60px;
+
+  /* How far the floating tabbar lifts off the bottom edge — one value shared
+     by the bar, the toast and the faucet sheet so they can never drift apart.
+     The safe-area inset is honoured but capped: some wallet in-app browsers
+     report ~100px, which floats the bar up into the middle of the page. The
+     page padding below adds this same value, so the bar always clears the
+     last line of text whatever a browser happens to report. */
+  --safe-b:min(env(safe-area-inset-bottom),24px);
 }
 
 [data-theme="dark"]{
@@ -390,7 +398,7 @@ main{padding-top:var(--header)}
   .tabbar{
     display:flex;align-items:center;gap:8px;
     position:fixed;left:0;right:0;bottom:0;z-index:60;
-    padding:0 14px calc(10px + env(safe-area-inset-bottom));
+    padding:0 14px calc(10px + var(--safe-b));
     /* the pill takes the taps, the side gutters stay pass-through so the page
        underneath is still reachable */
     pointer-events:none;
@@ -461,8 +469,10 @@ main{padding-top:var(--header)}
 
   /* clear the floating pill: content mid-page, and the footer at the end of it.
      Both this and the toast lift live in the media query at the bottom of the
-     file — a rule here would lose to their base rules on equal specificity. */
-  main{padding-bottom:88px}
+     file — a rule here would lose to their base rules on equal specificity.
+     The clearance grows by the same capped safe area the pill itself lifts by,
+     so a browser reporting a huge inset can never leave text under the bar. */
+  main{padding-bottom:calc(88px + var(--safe-b))}
 }
 
 /* below 360 the chip drops its word so the five tabs keep their room —
@@ -826,6 +836,9 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
 }
 .qr-tile svg{display:block;width:176px;height:176px}
 .qr-cap{font-size:11px;color:var(--muted);text-align:center;max-width:200px}
+/* the same tile on the pay card's share row: a hairline above it so it reads
+   as its own block under the share buttons */
+.pay-qr{margin-top:.6rem;padding-top:1.1rem;border-top:1px solid var(--line)}
 
 .ready-actions{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:1.5rem;padding-top:1.4rem;border-top:1px solid var(--line)}
 
@@ -990,6 +1003,15 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
   border-top:1px solid var(--line);padding-top:1.1rem;
 }
 .pay-desc b{font-weight:500;color:var(--muted);font-size:13px;display:block;margin-bottom:.2rem}
+
+/* the same "for" line when the note itemises: label left, price right, and no
+   table rules — the amount above the list is already the total */
+.pay-items{margin-top:1.1rem;padding-top:1.1rem;border-top:1px solid var(--line)}
+.pay-items .pi-h{display:block;font-size:13px;font-weight:500;color:var(--muted);margin-bottom:.55rem}
+.pi-row{display:flex;align-items:baseline;justify-content:space-between;gap:1rem;font-size:15px;line-height:1.5}
+.pi-row+.pi-row{margin-top:.35rem}
+.pi-l{color:var(--ink);min-width:0;overflow-wrap:anywhere}
+.pi-p{color:var(--body);font-variant-numeric:tabular-nums;white-space:nowrap}
 
 .pay-actions{display:grid;gap:.6rem;margin-top:1.4rem}
 .pay-fee{font-size:12px;color:var(--muted);text-align:center}
@@ -1176,8 +1198,8 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
 /* Phones: lift both off the floating bar. These live after the base rules on
    purpose — earlier in the file they would lose on equal specificity. */
 @media (max-width:560px){
-  .footer-bar{padding-bottom:calc(1.6rem + 72px)}
-  .toast{bottom:calc(86px + env(safe-area-inset-bottom))}
+  .footer-bar{padding-bottom:calc(1.6rem + 72px + var(--safe-b))}
+  .toast{bottom:calc(86px + var(--safe-b))}
 }
 
 /* Wallet modal (rendered by the near-connect bundle) */
@@ -1228,6 +1250,8 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
 [data-theme="light"] .pay-card .pay-fee,
 [data-theme="light"] .pay-card .pay-fee strong,
 [data-theme="light"] .pay-card .pay-desc b,
+[data-theme="light"] .pay-card .pi-h,
+[data-theme="light"] .pay-card .pi-p,
 [data-theme="light"] .pay-card .tech-body{color:#a3a3a1}
 
 /* tertiary / meta text on the dark surface */
@@ -1241,6 +1265,7 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
 [data-theme="light"] .ready-card .ready-title span,
 [data-theme="light"] .ready-card .net-k,
 [data-theme="light"] .ready-card .qr-cap,
+[data-theme="light"] .pay-card .qr-cap,
 [data-theme="light"] .pay-card .eyebrow,
 [data-theme="light"] .pay-card .approx,
 [data-theme="light"] .pay-card .wallet-note,
@@ -1252,6 +1277,7 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
 [data-theme="light"] .ready-card .ready-top,
 [data-theme="light"] .ready-card .ready-actions,
 [data-theme="light"] .pay-card .pay-desc,
+[data-theme="light"] .pay-card .pay-qr,
 [data-theme="light"] .pay-card .tech,
 [data-theme="light"] .invoice-card .ai-block{border-color:#2c2c2a}
 
@@ -1285,6 +1311,7 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
 [data-theme="light"] .ready-card .copy{background:#141413;border-color:#2c2c2a;color:#a3a3a1}
 [data-theme="light"] .ready-card .copy:hover{color:#f4f4f3;border-color:#55554f}
 [data-theme="light"] .ready-card .qr-tile{border-color:#2c2c2a}
+[data-theme="light"] .pay-card .qr-tile{border-color:#2c2c2a}
 
 /* pills sit on the card: the neutral ones go dark, the status ones stay
    pale chips (light on dark reads fine in every theme) */
@@ -1313,7 +1340,8 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
 [data-theme="light"] .acct-card .skeleton-block{background:#1f1f1e}
 
 /* pay card internals */
-[data-theme="light"] .pay-card .pay-desc{color:#f4f4f3}
+[data-theme="light"] .pay-card .pay-desc,
+[data-theme="light"] .pay-card .pi-l{color:#f4f4f3}
 [data-theme="light"] .pay-card .empty-line{color:#8a8a88;border-color:#2c2c2a}
 [data-theme="light"] .pay-card .tl-bar{background:#2c2c2a}
 [data-theme="light"] .pay-card .tl-step.done .tl-bar{background:#f4f4f3}
@@ -1364,7 +1392,8 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
 }
 
 /* "for" note: inset block with a brand bar rather than a bare divider */
-[data-theme="light"] .pay-card .pay-desc{
+[data-theme="light"] .pay-card .pay-desc,
+[data-theme="light"] .pay-card .pay-items{
   margin-top:1.3rem;padding:.8rem .95rem;
   background:rgba(255,255,255,.045);
   border:1px solid #2c2c2a;border-left:3px solid #00ec97;
@@ -1458,7 +1487,7 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
   background:var(--bg);color:var(--ink);
   border:1px solid var(--line);border-radius:var(--r-lg);
   box-shadow:var(--shadow-lift);
-  padding:1.05rem 1.1rem calc(1.1rem + env(safe-area-inset-bottom));
+  padding:1.05rem 1.1rem calc(1.1rem + var(--safe-b));
 }
 .sheet-head{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:.7rem}
 .sheet-head h3{margin:0;font-size:15px;font-weight:700;letter-spacing:-.01em}

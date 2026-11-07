@@ -17,7 +17,7 @@
   } catch (e) { document.documentElement.dataset.theme = "light"; }
 })();
 </script>
-<link rel="stylesheet" href="styles.css?v=20261107a">
+<link rel="stylesheet" href="styles.css?v=20261107c">
 <!-- Preload the weights the first screen uses. The fonts are otherwise only
      discovered after the stylesheet parses, which delays the swap that
      re-paints the hero and pushes LCP. -->
@@ -213,6 +213,7 @@
             <div class="field">
               <label class="label" for="description">note <span class="tiny">&middot; optional</span></label>
               <input id="description" name="description" placeholder="What's it for? e.g. Brand identity" autocomplete="off" maxlength="200">
+              <p class="tiny">Write <code>Logo &mdash; 15; Banner &mdash; 10</code> and, when the prices add up to the amount, the payment page shows them as a list.</p>
             </div>
 
             <button class="btn btn-lg" type="submit" id="createBtn"><span>Create link</span></button>
@@ -402,6 +403,6 @@
 <!-- defer keeps it off the critical path but preserves execution order ahead
      of the module below, so window.qrcode exists when app.js renders. -->
 <script defer src="vendor/qrcode.js"></script>
-<script type="module" src="app.js?v=20261107a"></script>
+<script type="module" src="app.js?v=20261107c"></script>
 </body>
 </html>
