@@ -41,7 +41,20 @@ fund them from the CLI.
 
 5. Open `https://paylink-near.vercel.app/` in profile A. Connect the payee wallet.
 6. Keep profile B open at the same URL, wallet not yet connected.
-7. Set the browser zoom to 100% and the window to roughly 1280×800. The layout
+7. Confirm the relayer and keeper each hold **more than 1 NEAR** — below that
+   the relayer refuses new links with a 503:
+
+   ```bash
+   for a in paylink-relay.testnet paylink-keeper.testnet; do
+     curl -s https://rpc.testnet.near.org -H 'Content-Type: application/json' \
+       -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"query\",\"params\":{\"request_type\":\"view_account\",\"finality\":\"final\",\"account_id\":\"$a\"}}" \
+       | grep -o '"amount":"[0-9]*"'
+   done
+   # each "amount" must be > 1000000000000000000000000 (1 NEAR)
+   # last check 8 Nov 2026: relay 9.936919, keeper 9.973031 NEAR
+   ```
+
+8. Set the browser zoom to 100% and the window to roughly 1280×800. The layout
    is responsive, but the pay card reads best at that size.
 
 **Check before recording:** the header chip reads `testnet`, the footer reads
