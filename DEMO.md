@@ -94,9 +94,15 @@ Scroll slowly past the hero and the three steps. Do not rush.
 > `paylink-relay.testnet` — the contract still takes 0.01 NEAR, just not from
 > the payee. The on-screen flow is unchanged; no re-record needed.)*
 
-> "And if a wallet can't sign directly, the paste step is the fallback: the
-> modal prints the exact near-cli command, you run it in your terminal, and
-> paste the transaction hash back — same chain, still no server in between."
+> "You sign with your own wallet — your keys never touch our servers. And if
+> your wallet can't sign a delegate, it falls back to one direct transaction,
+> the payee covering that one creation — same chain, same link."
+
+> *([drift] The recorded video shows an older build's paste-step modal — a
+> near-cli command you ran yourself and a hash you pasted back. That code
+> never shipped; today the prompt opens straight in your wallet's approve
+> screen. If the modal is on camera at 0:32, don't narrate it — the sentence
+> above is what the live demo does.)*
 
 **On screen:** the button reads *Creating link…* while the wallet prompt is
 open, then the app lands on the share page: the link in a copy field, a QR
