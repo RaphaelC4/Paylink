@@ -27,7 +27,7 @@ Built for **NEAR HACKATHON**, track **`realworld` — Real-World Money**.
 
 **Live demo:** <https://paylink-near.vercel.app/> ·
 **Demo video:** [`docs/Paylink-demo-full.mp4`](docs/Paylink-demo-full.mp4) ·
-**Launch post:** <https://x.com/agu_raphael_/status/2119550637348200569> ·
+**Launch post:** <https://x.com/agu_raphael_/status/2119552525439492372> ·
 **Contract:** [`paylink-v2.testnet`](https://testnet.nearblocks.io/address/paylink-v2.testnet)
 on NEAR testnet explorer
 
