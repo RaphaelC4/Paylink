@@ -1,0 +1,6 @@
+{
+  "name": "paylink-relayer",
+  "private": true,
+  "type": "module",
+  "description": "Submits NEP-366 meta-transactions so creating a Paylink link never costs the payee NEAR. No dependencies — validates and signs with WebCrypto Ed25519."
+}

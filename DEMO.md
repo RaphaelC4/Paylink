@@ -70,10 +70,16 @@ Scroll slowly past the hero and the three steps. Do not rush.
 2. Amount: `25`
 3. Note: `Brand identity — logo + type`
 4. Expiry: leave at **in 3 days**.
-5. Click **Create link**, approve in the wallet.
+5. Click **Create link**, approve the sign prompt in the wallet (the relayer
+   pays the stake and gas — the payee's balance does not move).
 
 > "One transaction writes the link. The contract takes a 0.01 NEAR storage
 > stake — no company, no server, no account on our side."
+
+> *([drift] In the recorded video this line predates the relayer: the payee's
+> wallet paid the stake directly. Since the relayer landed the stake comes from
+> `paylink-relay.testnet` — the contract still takes 0.01 NEAR, just not from
+> the payee. The on-screen flow is unchanged; no re-record needed.)*
 
 > "And if a wallet can't sign directly, the paste step is the fallback: the
 > modal prints the exact near-cli command, you run it in your terminal, and
@@ -162,7 +168,7 @@ balance has increased by 24.875 USDC.
 
 Optional, 15 s: open any open link, expand **No test USDC? — free faucet &
 swap**, and point at the swap row — pick **wNEAR**, press
-**Swap wNEAR to cover this link**, and show the quote.
+**Swap wNEAR and pay**, and show the quote.
 
 > "If the payer holds something else instead, Tidepool quotes a swap into
 > exactly enough USDC for this link — free, testnet-only, and the app says
@@ -181,7 +187,7 @@ swap**, and point at the swap row — pick **wNEAR**, press
 | --- | --- |
 | Fee | 0.5% (50 bps), constant in the contract |
 | 25 USDC link | payee receives **24.875**, fee **0.125** |
-| Create cost | 0.01 NEAR storage stake |
+| Create cost | 0.01 NEAR storage stake + ~0.0005 gas — paid by the relayer (`paylink-relay.testnet`); the payee's wallet signs off-chain only |
 | Claim deposit | 1 yoctoNEAR |
 | Release keeper | `paylink-keeper.testnet`, sweeps every minute, ~0.0008 NEAR gas per claim |
 | Contract | `paylink-v2.testnet` |

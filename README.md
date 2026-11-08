@@ -1,8 +1,12 @@
 # Paylink
 
-**First, the honest part: creating a link needs a funded NEAR wallet** —
-Paylink has no relayer, so the payee signs and pays gas for that one creation
-transaction, and after that they never sign or pay again.
+**First, the honest part: creating a link needs no NEAR from the payee** —
+the wallet signs a delegate action off-chain (a signature is free), Paylink's
+relayer pays the gas and the 0.01 NEAR storage stake, and the link still
+belongs to the payee. A wallet that cannot sign a delegate falls back to the
+direct transaction and covers that one creation itself (0.01 NEAR stake plus
+gas). After that the payer signs once to send the money, and the payee signs
+nothing.
 
 **Send someone a link. Get paid from whatever they already hold.**
 
@@ -12,11 +16,12 @@ freelancer receives them on NEAR and never had to walk a client through a seed
 phrase. The payer signs once to send the money — from then on the freelancer
 signs nothing.
 
-**On gas:** the track hints at meta transactions; Paylink reaches the same
-outcome without NEP-366 or a relayer — `claim` is callable by anyone and can
+**On gas:** the track hints at meta transactions; Paylink uses them — a
+NEP-366 delegate action carries `create_link` to chain with the relayer
+paying the gas and the stake, while `claim` is callable by anyone and can
 only pay the invoice's payee, so the release is signed by whoever is holding
 the app (or by the keeper Worker) and the payee never holds gas
-([why no relayer](#references)).
+([how the relayer works](#references)).
 
 Built for **NEAR HACKATHON**, track **`realworld` — Real-World Money**.
 
@@ -39,12 +44,13 @@ Getting paid across borders still costs money and time.
 
 Every route asks one side to learn the other side's world.
 
-Paylink removes that requirement — once the link is created. That first step
-costs the payee one signed transaction from a funded wallet (a 0.01 NEAR
-stake plus gas). After that, the payer uses what they have, and the payee does
-not have to claim, sweep, or hold gas: the frontend releases a paid invoice to
-them the moment it is settled, and a keeper Worker repeats that release every
-minute so nothing waits on a browser staying open.
+Paylink removes that requirement — even for creating the link. The payee's
+wallet signs a delegate action off-chain and the relayer covers the 0.01 NEAR
+stake and the gas for that first transaction (a wallet that cannot sign a
+delegate pays it itself, once). After that, the payer uses what they have, and
+the payee does not have to claim, sweep, or hold gas: the frontend releases a
+paid invoice to them the moment it is settled, and a keeper Worker repeats
+that release every minute so nothing waits on a browser staying open.
 
 ---
 
@@ -59,13 +65,13 @@ cross-contract steps that host tests cannot reach is
 | Behaviour | Proof |
 | --- | --- |
 | **Micro-invoices pay out.** A 100-unit link has a fee that rounds to zero, so `claim` skips the fee leg instead of failing on a zero-amount NEP-141 transfer, and the split never overflows or loses a unit. | `a_tiny_invoice_skips_the_fee_leg_instead_of_failing`, `split_fee_never_overflows_or_loses_a_unit` |
-| **Nobody needs gas to get paid — once the link exists.** Creating the link is the payee's one signed transaction (0.01 NEAR stake plus gas). After that `claim` is callable by anyone, so the frontend releases a paid invoice for the payee and the keeper repeats it every minute — the payee holds no NEAR and signs nothing after payment. | `a_stranger_can_trigger_claim_but_only_the_payee_is_paid`, `claim_pays_the_payee_less_the_fee_in_one_batch` |
+| **Nobody needs gas to get paid — not even for the link itself.** Creating the link goes through a NEP-366 delegate action: the payee signs off-chain and the relayer Worker attaches the 0.01 NEAR stake and pays the gas, measured on testnet with the payee's balance unchanged to the yocto across four creations. After that `claim` is callable by anyone, so the frontend releases a paid invoice for the payee and the keeper repeats it every minute — the payee holds no NEAR and signs nothing after payment. | `a_stranger_can_trigger_claim_but_only_the_payee_is_paid`, `claim_pays_the_payee_less_the_fee_in_one_batch`, `workers/relayer/test/parse.test.mjs` (45 assertions over two real on-chain fixtures) |
 | **Overpayment is never lost.** What arrived is what's credited, and the fee applies to the credited amount rather than the invoiced one. | `an_overpayment_is_credited_in_full`, `claim_applies_the_fee_to_an_overpayment` |
 | **Paying twice never double-credits.** A link leaves `OPEN` once; a second payment is returned. | `paying_twice_does_not_double_credit` |
 | **Expiry needs no background job.** `Expired` is derived on read from `expires_at`, never stored, so an aged link reports itself honestly and refuses payment. The same timestamp is also the due date: after it, payment is refused and the tokens return to the payer in the same transaction — a hard cutoff, rather than a late payment accepted and marked late. | `an_expired_invoice_cannot_be_paid`, `an_expired_invoice_is_reported_as_expired_even_unpaid` |
 | **Sharing survives a dead RPC.** The QR code and Copy button are built from the link id alone — a vendored MIT encoder, no image request, no chain round trip. | `frontend/vendor/qrcode.js`, `qrMarkup()` in `frontend/app.js` |
 | **The keeper needs no registry.** One `view_state` call with prefix `l` lists every link; it signs with the runtime's Ed25519 WebCrypto, so it is a single file with no dependencies. | `workers/keeper/src/index.js` |
-| **Storage is funded up front.** `create_link` requires a 0.01 NEAR stake that covers its own storage and registers the payee on the token. | `create_link_requires_a_storage_stake`, `the_stake_really_is_ten_millinear` |
+| **Storage is funded up front.** `create_link` requires a 0.01 NEAR stake that covers its own storage and registers the payee on the token — on a delegated creation the relayer attaches it. | `create_link_requires_a_storage_stake`, `the_stake_really_is_ten_millinear` |
 | **Settings are public getters.** The allowlist and both fee settings are readable by anyone, not admin-only views. | `the_allowlist_is_visible_to_callers`, `the_fee_settings_are_visible_to_callers` |
 
 ### One full run, on-chain
@@ -97,6 +103,24 @@ claim
 [`8WmbLm4E92XE9cgoGZHhvwCuBNS6rbqDeVtJw8Fp1jw6`](https://testnet.nearblocks.io/txns/8WmbLm4E92XE9cgoGZHhvwCuBNS6rbqDeVtJw8Fp1jw6) —
 the claim's logs show the registration receipt executing before the payout
 batch, which is the fix working end to end.
+
+**With the relayer in front of `create_link`**, the creation step no longer
+touches the payee's wallet at all. Link `lnk-jhfmt56d` (3.25 USDC, 72-hour
+expiry) was created on **7 Nov 2026** through the full browser flow — Meteor
+Wallet signed a delegate action, the frontend POSTed it to the relayer
+Worker, the Worker wrapped and signed the transaction as
+`paylink-relay.testnet`:
+[`pYBw2vTh8B3ZDK7qwbDqre8x5c7iHqEzTLFVD68USYU`](https://testnet.nearblocks.io/transactions/pYBw2vTh8B3ZDK7qwbDqre8x5c7iHqEzTLFVD68USYU) —
+Success. The payee's balance read 19.7890472296385996 NEAR before and after;
+the relayer's dropped by 0.010514 (stake plus gas). Three earlier creations
+proved the same path from other angles: `spikea01`
+([`HJML2cY2AfWb5Tcows4C3BmyEAGV3FigtQ8xXGrtLwTz`](https://testnet.nearblocks.io/transactions/HJML2cY2AfWb5Tcows4C3BmyEAGV3FigtQ8xXGrtLwTz),
+signed by near-cli-rs), `spikea02`
+([`B37vJV8ZfGK3yo8KAQDoqjkPdi3yipVBsNX3GhijTWNf`](https://testnet.nearblocks.io/transactions/B37vJV8ZfGK3yo8KAQDoqjkPdi3yipVBsNX3GhijTWNf),
+signed by Meteor Wallet) and `spikea03`
+([`26asviviWDe7EFprdWH6fgDhrJUoUjRhJwZYLkKzJQcm`](https://testnet.nearblocks.io/transactions/26asviviWDe7EFprdWH6fgDhrJUoUjRhJwZYLkKzJQcm),
+submitted through the Worker's `POST /submit` exactly as the frontend does).
+All four links read `creator: paylink-payee.testnet` on chain.
 
 ---
 
@@ -220,6 +244,32 @@ and the fee account, because that is all `claim` can pay. `POST /tick` runs the
 same sweep on demand behind a secret, for tests and demos.
 `workers/keeper/README.md` has the deploy steps.
 
+### The relayer
+
+`workers/relayer/` is the second Cloudflare Worker, also a single dependency-free
+file. It makes creation free for the payee: the wallet signs a NEP-366
+`DelegateAction` for `create_link` off-chain — a signature costs nothing — and
+POSTs it to `POST /submit`. The Worker borsh-parses the delegate and validates
+it before spending a yocto: outer receiver must be the delegate's sender
+(NEP-366 rule 3), inner receiver must be the contract, the single action must be
+`create_link` with at least the 0.01 NEAR stake, sane link id / amount / token /
+description / future expiry, a nonce that beats the sender's access key, a
+`max_block_height` still ahead of the chain, and — proven against two fixtures
+the chain accepted — the signature itself under NEP-461's preimage (the NEP-366
+discriminant prefixed to the delegate bytes, hashed). Rate-limited to 10
+submissions per IP per hour, and it refuses to spend below a 1 NEAR balance
+floor. Only then does it wrap the raw delegate bytes in a transaction signed by
+`paylink-relay.testnet` and broadcast it.
+
+On chain the inner call executes with the payee as `predecessor`, so the link's
+creator is the payee exactly as with a direct transaction — no contract change.
+Measured on testnet: the payee's balance does not move by one yocto; the relayer
+pays the stake and gas. The frontend takes this path whenever
+`CONFIG.relayer.endpoint` is set and the wallet offers `signDelegateActions`
+(Meteor Wallet does); otherwise it falls back to the direct transaction, and a
+failed relayer POST surfaces as an error rather than silently making the payee
+pay. `workers/relayer/test/parse.test.mjs` (45 assertions) runs the parser,
+validator and tx builder against the two real signed fixtures.
 
 ---
 
@@ -368,8 +418,9 @@ Stated plainly, because saying otherwise would be worse than saying it.
   build to a different token took a fresh contract account — exactly how it
   went from `paylink.testnet` to `paylink-v2.testnet`, as described in
   [Development](#development).
-- **Not production ready.** No audit, no rate limiting, no indexer. Payment
-  detection relies on the frontend polling contract state.
+- **Not production ready.** No audit, no indexer. Payment detection relies on
+  the frontend polling contract state; the relayer caps submissions per IP and
+  keeps a balance floor, but nothing here is hardened for mainnet traffic.
 
 ---
 
@@ -483,6 +534,14 @@ into a second Worker (one file, no dependencies), add the `KEEPER_KEY` and
 trigger. `workers/keeper/README.md` has the steps and a `curl` check. Without
 it the frontend still releases links itself — the keeper is the backstop.
 
+The relayer is a third Worker of the same shape: paste
+`workers/relayer/src/index.js`, add the `RELAYER_KEY` secret plus five text
+variables, and put its `/submit` URL into `frontend/config.js` as
+`relayer.endpoint` (then bump the `?v=` cache bust). `workers/relayer/README.md`
+has the steps and the fund check. With the endpoint empty the create form
+sends the direct wallet transaction — the payee covers that one stake and gas —
+so the demo works with or without it.
+
 `--abi-features near-sdk/unit-testing` is not optional on a host build:
 near-sdk's ABI step links a host `cdylib`, and `unit-testing` is what
 supplies NEAR's host-side stubs. Without it the link fails on
@@ -515,12 +574,17 @@ soon as the folder is uploaded. If you deploy the parser too, set its
 - [NEAR HACKATHON](https://nearhackathon.com/) · [HACKATHON.md](https://nearhackathon.com/HACKATHON.md)
 - Track prompt: `tracks/08-realworld.md`
 - [NEP-141 Fungible Token Standard](https://github.com/near/NEPs/blob/master/neps/nep-0141.md)
-- [NEP-366 Meta Transactions](https://docs.near.org/protocol/transactions/meta-tx.md):
-  related reading only. **Paylink does not use NEP-366 or any relayer.** The payee
-  needs no gas because `claim` can be called by anyone and can only pay the invoice's
-  payee and the fee account. The payer's wallet signs the release in the app, and the
-  keeper Worker signs it from its own testnet account as a backstop. Track 08 asks
-  you to lean on meta transactions; this build reaches the same goal (payee pays no
-  gas) without them.
+- [NEP-366 Meta Transactions](https://docs.near.org/protocol/transactions/meta-tx.md)
+  · [NEP-461 signing scheme](https://github.com/near/NEPs/pull/461): used for
+  `create_link`. The payee's wallet signs a `DelegateAction` off-chain, the
+  relayer Worker validates it (receiver, method, stake, nonce, expiry, and the
+  NEP-461 signature) and submits it signed by `paylink-relay.testnet`, which
+  pays the gas and the 0.01 NEAR stake — while the inner call still runs with
+  the payee as predecessor, so the link belongs to the payee exactly as with a
+  direct transaction ([how the relayer works](#the-relayer)). The payer's
+  wallet signs their own payment, and `claim` can be called by anyone but can
+  only pay the invoice's payee and the fee account: the release is signed by
+  whoever is holding the app (or by the keeper Worker). Between the two, the
+  payee never holds gas at any point in the lifecycle.
 - [1Click API](https://docs.near-intents.org/integration/distribution-channels/1click-api/quickstart) · [Tidepool testnet sandbox](https://www.usetidepool.tech/docs/quickstart)
 - [NEAR docs index](https://docs.near.org/llms.txt) · [NEAR Intents docs index](https://docs.near-intents.org/llms.txt)

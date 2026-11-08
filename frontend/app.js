@@ -3,7 +3,7 @@
    Reads are unsigned JSON-RPC view calls; writes are signed in the wallet. */
 
 import NearConnect from "@hot-labs/near-connect";
-import { CONFIG, ONE_YOCTO, CREATE_STAKE, MAX_DESCRIPTION_BYTES, GAS_DEFAULT, GAS_CLAIM, GAS_FT_CALL } from "./config.js?v=20261107c";
+import { CONFIG, ONE_YOCTO, CREATE_STAKE, MAX_DESCRIPTION_BYTES, GAS_DEFAULT, GAS_CLAIM, GAS_FT_CALL } from "./config.js?v=20261107e";
 
 /* The vendored bundle is the package's CommonJS build, so esbuild exposes the
    module namespace as the default export rather than as named exports. */
@@ -441,6 +441,48 @@ async function call(methodName, args, { deposit = "0", gas = GAS_DEFAULT, receiv
   return hash;
 }
 
+/* Create through the relayer: sign a DelegateAction off-chain — a signature
+   costs no gas and no stake — then POST it to the relayer Worker, which wraps
+   it in its own transaction and pays the gas AND the 0.01 NEAR storage stake.
+   On chain the inner call still runs as this account (predecessor is
+   preserved through NEP-366), so the link is created exactly as a direct
+   transaction would create it. Returns the relayer's transaction hash — the
+   same value `call` returns, so the caller treats both paths identically. */
+async function callViaRelayer(methodName, args, { deposit = "0", gas = GAS_DEFAULT } = {}) {
+  if (!accountId) throw new Error("Connect a wallet first");
+  const wallet = await connector.wallet();
+  const res = await wallet.signDelegateActions({
+    delegateActions: [{
+      signerId: accountId,
+      receiverId: CONFIG.contractId,
+      actions: [{ type: "FunctionCall", params: { methodName, args, gas, deposit } }],
+    }],
+  });
+  const signed = res?.signedDelegateActions?.[0];
+  if (!signed) throw new Error("The wallet did not return a signed delegate action.");
+
+  /* A POST failure surfaces as an error rather than silently retrying the
+     direct path: the signature already exists, and making the payee pay is a
+     decision, not a fallback. The Worker answers 400/429/503 with a message
+     that `friendly()` can render as-is. */
+  let r;
+  try {
+    r = await fetch(CONFIG.relayer.endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ signedDelegateAction: signed }),
+    });
+  } catch {
+    throw new Error("Could not reach the relayer. Nothing was sent — your NEAR is untouched.");
+  }
+  let j = null;
+  try { j = await r.json(); } catch { /* non-JSON reply falls through */ }
+  if (!r.ok || !j?.ok) {
+    throw new Error(j?.error || `The relayer replied ${r.status}. Nothing was sent.`);
+  }
+  return j.hash;
+}
+
 /* ────────────────────────────────────────────────────────────── routing ── */
 
 const TABS = ["home", "create", "ledger", "alerts", "account"];
@@ -584,7 +626,19 @@ async function handleCreate(e) {
   label.textContent = "Creating link…";
 
   try {
-    const hash = await call("create_link", args, { deposit: CREATE_STAKE });
+    /* Relayer first, gated on deploy state (empty endpoint = direct, exactly
+       as before). The wallet must advertise signDelegateActions — wallets
+       that cannot sign delegates fall back to the direct transaction, where
+       the payee pays gas + stake (the corner case, not the default). */
+    let hash;
+    if (CONFIG.relayer.endpoint) {
+      const relayerWallet = await connector.wallet();
+      hash = typeof relayerWallet.signDelegateActions === "function"
+        ? await callViaRelayer("create_link", args, { deposit: CREATE_STAKE })
+        : await call("create_link", args, { deposit: CREATE_STAKE });
+    } else {
+      hash = await call("create_link", args, { deposit: CREATE_STAKE });
+    }
     line.className = "tx-line ok";
     line.innerHTML = `created · <a class="mono" href="${CONFIG.explorer}/transactions/${hash}" target="_blank" rel="noopener">${truncate(hash, 12, 8)}</a>`;
     toast("Link created");

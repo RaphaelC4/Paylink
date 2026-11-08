@@ -56,6 +56,17 @@ export const CONFIG = {
      after deploying it — see README.md. */
   parseEndpoint: "https://paylink-parse.g32772584.workers.dev",
 
+  /* Meta-transaction relayer (NEP-366, Cloudflare Worker in workers/relayer/).
+     When set, creating a link signs a delegate action off-chain and POSTs it
+     here: the relayer pays the gas AND the 0.01 NEAR stake, so the payee's
+     NEAR balance never moves. Empty string = dev escape hatch: the create
+     form sends the direct wallet transaction (payee pays), which is also the
+     path taken by wallets with no signDelegateActions. The deployed Worker
+     only accepts requests from this site's origin — see workers/relayer/. */
+  relayer: {
+    endpoint: "https://paylink-relayer.g32772584.workers.dev/submit",
+  },
+
   /* Tidepool — community testnet sandbox of the NEAR 1Click API.
      Keyless, free: the faucet drips test tokens and quotes settle swaps
      into the allowlisted USDC. Fail-closed everywhere in app.js. */
