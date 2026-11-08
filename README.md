@@ -26,7 +26,8 @@ the app (or by the keeper Worker) and the payee never holds gas
 Built for **NEAR HACKATHON**, track **`realworld` — Real-World Money**.
 
 **Live demo:** <https://paylink-near.vercel.app/> ·
-**Demo video:** [`docs/Paylink-demo-final.mp4`](docs/Paylink-demo-final.mp4) ·
+**Demo video:** [`docs/Paylink-demo-full.mp4`](docs/Paylink-demo-full.mp4) ·
+**Launch post:** <https://x.com/agu_raphael_/status/2119550637348200569> ·
 **Contract:** [`paylink-v2.testnet`](https://testnet.nearblocks.io/address/paylink-v2.testnet)
 on NEAR testnet explorer
 
