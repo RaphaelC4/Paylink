@@ -1,6 +1,7 @@
 [toolchain]
-# gnu host variant: this machine has no Visual Studio / Windows SDK, so the
-# MSVC variant cannot link. Same channel, different host triple.
-channel = "stable-x86_64-pc-windows-gnu"
+# Host-neutral channel on purpose: pinning a host triple here (e.g. the gnu
+# variant of one Windows box) makes rustup refuse the file on every other
+# machine — a clean clone must resolve on any OS.
+channel = "stable"
 components = ["rustfmt", "clippy"]
 targets = ["wasm32-unknown-unknown"]
