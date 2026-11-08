@@ -1,0 +1,1 @@
+2/4  CREATE: ask for 7.5 USDC - amount, note, expiry

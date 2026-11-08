@@ -1,0 +1,11 @@
+[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,zoompan=z='1+0.10*on/240':d=240:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=30,setsar=1[v0];
+[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,zoompan=z='1+0.10*on/240':d=240:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=30,setsar=1[v1];
+[2:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,zoompan=z='1+0.10*on/240':d=240:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=30,setsar=1[v2];
+[3:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,zoompan=z='1+0.10*on/240':d=240:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1920x1080:fps=30,setsar=1[v3];
+[v0][v1]xfade=transition=fade:duration=0.6:offset=7.4[x1];
+[x1][v2]xfade=transition=fade:duration=0.6:offset=14.8[x2];
+[x2][v3]xfade=transition=fade:duration=0.6:offset=22.2[base];
+[base]drawtext=fontfile='C:/Windows/Fonts/arialbd.ttf':textfile='C:/Users/HP/Documents/Paylink/docs/video-frames/cap1.txt':fontsize=46:fontcolor=white:box=1:boxcolor=black@0.72:boxborderw=16:x=(w-tw)/2:y=h-th-70:enable='between(t,0.4,7)'[c1];
+[c1]drawtext=fontfile='C:/Windows/Fonts/arialbd.ttf':textfile='C:/Users/HP/Documents/Paylink/docs/video-frames/cap2.txt':fontsize=46:fontcolor=white:box=1:boxcolor=black@0.72:boxborderw=16:x=(w-tw)/2:y=h-th-70:enable='between(t,8.2,14.4)'[c2];
+[c2]drawtext=fontfile='C:/Windows/Fonts/arialbd.ttf':textfile='C:/Users/HP/Documents/Paylink/docs/video-frames/cap3.txt':fontsize=46:fontcolor=white:box=1:boxcolor=black@0.72:boxborderw=16:x=(w-tw)/2:y=h-th-70:enable='between(t,15.6,21.8)'[c3];
+[c3]drawtext=fontfile='C:/Windows/Fonts/arialbd.ttf':textfile='C:/Users/HP/Documents/Paylink/docs/video-frames/cap4.txt':fontsize=46:fontcolor=white:box=1:boxcolor=black@0.72:boxborderw=16:x=(w-tw)/2:y=h-th-70:enable='between(t,23,30)'[out]
