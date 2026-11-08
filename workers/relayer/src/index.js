@@ -26,10 +26,18 @@
  *   - the sender must exist and own the public key that signed, the delegate's
  *     nonce must beat that key's nonce, and max_block_height must still be
  *     ahead of the chain — each of these failing on chain costs us gas.
- * Abuse control: a per-IP sliding window (RATE_LIMIT per RATE_WINDOW_MS) and
- * a balance floor — below BALANCE_FLOOR_NEAR the Worker refuses rather than
- * spend its last NEAR. Per-isolate memory is fine for a demo; the numbers
- * bound worst-case drain to well under one relayed link per limit window.
+ * Abuse control, stated at its real strength: a per-IP sliding window
+ * (RATE_LIMIT per RATE_WINDOW_MS) and a balance floor — below
+ * BALANCE_FLOOR_NEAR the Worker refuses rather than spend its last NEAR.
+ * Both guards are best-effort, not a hard bound: the per-IP count lives in
+ * one isolate's memory, so a second instance allows the full RATE_LIMIT and
+ * any restart clears the count, and ALLOWED_ORIGIN only constrains browsers —
+ * a script ignores it entirely. The balance floor is therefore the real
+ * limit on worst-case drain: an attacker with many free testnet accounts
+ * could spend the relayer down to BALANCE_FLOOR_NEAR — several hundred
+ * relayed links from a 10 NEAR balance — before it refuses anything. Testnet
+ * NEAR only, so nothing of value is at stake; this is a demo guard, not a
+ * security guarantee.
  *
  * Secrets:  wrangler secret put RELAYER_KEY     (ed25519, matches RELAYER_ACCOUNT)
  *           wrangler secret put TICK_SECRET     (unused; kept for symmetry)

@@ -421,6 +421,12 @@ Stated plainly, because saying otherwise would be worse than saying it.
 - **Not production ready.** No audit, no indexer. Payment detection relies on
   the frontend polling contract state; the relayer caps submissions per IP and
   keeps a balance floor, but nothing here is hardened for mainnet traffic.
+  Both of those guards are best-effort rather than a hard bound: the per-IP
+  count lives in a single Worker instance's memory (a second instance allows
+  the full quota again, and a restart clears it), and `ALLOWED_ORIGIN` only
+  constrains browsers, which a script is free to ignore — so the real limit
+  is the relayer's 1 NEAR balance floor, several hundred links away at the
+  current balance. Testnet NEAR only, so nothing of value is at stake.
 
 ---
 

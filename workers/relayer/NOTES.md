@@ -95,5 +95,8 @@ The relayer does not re-check on-chain state (link id unused, payee
 registration) beyond the access-key/nonce/expiry checks — those two checks
 exist because they fail *before* execution and still cost gas; a duplicate
 link id fails *inside* `create_link` at the same gas cost as any other panic,
-and the 400/429/503 bounds keep abuse to roughly one wasted link per limit
-window even in the worst case.
+and the 400/429/503 bounds are best-effort rather than a hard cap: the
+per-IP count is held in one isolate's memory (a second instance allows the
+full quota, a restart clears it) and `ALLOWED_ORIGIN` does not bind
+non-browser clients, so the balance floor — not the rate limit — is what
+actually bounds worst-case drain.
