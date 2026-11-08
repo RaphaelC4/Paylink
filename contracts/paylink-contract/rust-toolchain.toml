@@ -1,7 +1,7 @@
 [toolchain]
-# Host-neutral channel on purpose: pinning a host triple here (e.g. the gnu
-# variant of one Windows box) makes rustup refuse the file on every other
-# machine — a clean clone must resolve on any OS.
+# Host-neutral, download-free: only the channel. Pinning a host triple here
+# (e.g. the gnu variant of one Windows box) makes rustup refuse this file on
+# every other machine, and listing components/targets forces rustup to fetch
+# them from static.rust-lang.org even when a checker only wants `cargo test`.
+# Building wasm instead needs: rustup target add wasm32-unknown-unknown
 channel = "stable"
-components = ["rustfmt", "clippy"]
-targets = ["wasm32-unknown-unknown"]

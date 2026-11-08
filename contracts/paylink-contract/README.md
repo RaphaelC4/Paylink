@@ -16,6 +16,10 @@ cargo near build non-reproducible-wasm --abi-features near-sdk/unit-testing
 #   -> target/near/paylink_contract.wasm        (~156 KB, ABI embedded)
 ```
 
+`rust-toolchain.toml` pins only `channel = "stable"` — no host triple, no
+auto-downloads — so first time on a new machine install the wasm target
+yourself: `rustup target add wasm32-unknown-unknown`.
+
 `--abi-features near-sdk/unit-testing` is required. cargo-near's ABI step links
 a host `cdylib`, and near-sdk's `unit-testing` feature is what supplies NEAR's
 host-side stubs (`storage_has_key`, `promise_batch_create`, …). Without it the
