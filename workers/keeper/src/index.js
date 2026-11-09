@@ -317,21 +317,36 @@ async function broadcast(env, txB64) {
 
 /* ─────────────────────────────────────────────────────────── sweep ── */
 
+/* One structured JSON line per settlement event, greppable in Workers →
+   Logs or `wrangler tail`. Six events, in the order they happen:
+   invoice_discovered, claim_submitted, claim_successful, claim_failed,
+   invoice_already_claimed, retry_scheduled. Never logs the key — only
+   link ids, transaction hashes and error text. */
+const logEvent = (event, detail) => console.log(JSON.stringify({ event, ...detail }));
+
 /**
  * Claim every link sitting in PAID. Idempotent by construction: `claim`
  * panics unless the link is PAID, so a link released elsewhere between the
  * scan and the broadcast simply fails its own transaction and is reported.
  */
 export async function sweep(env) {
-  const report = { scanned: 0, paid: [], claimed: [], failed: [] };
+  const report = { scanned: 0, paid: [], claimed: [], failed: [], alreadyClaimed: [] };
   const { links, blockHash } = await scanLinks(env);
   report.scanned = links.length;
 
-  const paid = links.filter((l) => l.status === "PAID").slice(0, MAX_CLAIMS_PER_SWEEP);
+  const paidAll = links.filter((l) => l.status === "PAID");
+  const paid = paidAll.slice(0, MAX_CLAIMS_PER_SWEEP);
   report.paid = paid.map((l) => l.link_id);
+  for (const l of paid) logEvent("invoice_discovered", { link_id: l.link_id });
+  /* Over the per-sweep cap: not forgotten — the next run picks it up. */
+  for (const l of paidAll.slice(MAX_CLAIMS_PER_SWEEP)) {
+    logEvent("retry_scheduled", { link_id: l.link_id, reason: "sweep cap — next run" });
+  }
   if (!paid.length) return report;
   if (!env.KEEPER_KEY || !env.KEEPER_ACCOUNT) {
     report.failed.push({ error: "KEEPER_KEY/KEEPER_ACCOUNT not set — nothing released" });
+    logEvent("claim_failed", { error: "KEEPER_KEY/KEEPER_ACCOUNT not set — nothing released" });
+    logEvent("retry_scheduled", { reason: "missing key — every minute until set" });
     return report;
   }
 
@@ -352,12 +367,27 @@ export async function sweep(env) {
         nonce: ak.nonce + 1,
         blockHash: ak.blockHash,
       });
+      logEvent("claim_submitted", { link_id: link.link_id });
       const res = await broadcast(env, tx);
       const entry = { link_id: link.link_id, hash: res.hash };
-      if (res.ok) report.claimed.push(entry);
-      else report.failed.push({ ...entry, status: res.status });
+      if (res.ok) {
+        logEvent("claim_successful", entry);
+        report.claimed.push(entry);
+      } else if (JSON.stringify(res.status ?? "").includes("link is not paid")) {
+        /* Released elsewhere between scan and broadcast — success by other
+           hands, not a failure. The next sweep simply won't see it as PAID. */
+        logEvent("invoice_already_claimed", entry);
+        report.alreadyClaimed.push(entry);
+      } else {
+        logEvent("claim_failed", { ...entry, status: res.status });
+        report.failed.push({ ...entry, status: res.status });
+        logEvent("retry_scheduled", { link_id: link.link_id, reason: "claim failed — next sweep" });
+      }
     } catch (err) {
-      report.failed.push({ link_id: link.link_id, error: String(err.message || err).slice(0, 200) });
+      const msg = String(err.message || err).slice(0, 200);
+      logEvent("claim_failed", { link_id: link.link_id, error: msg });
+      report.failed.push({ link_id: link.link_id, error: msg });
+      logEvent("retry_scheduled", { link_id: link.link_id, reason: "broadcast error — next sweep" });
     }
   }
   return report;

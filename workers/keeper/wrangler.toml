@@ -8,9 +8,10 @@ name = "paylink-keeper"
 main = "src/index.js"
 compatibility_date = "2026-10-01"
 
-# Release anything paid more than a minute ago. The frontend also tries to
-# release right after payment; this is the backstop for the times that fails
-# (wallet reject, closed tab, dead network).
+# The settler: release anything sitting in PAID, every minute. The frontend
+# never asks anyone to sign the release — after one payment approval it only
+# watches PAID → CLAIMED — so this cron is the automatic path, and the pay
+# card's Release button is the manual fallback for the rare failed sweep.
 [triggers]
 crons = ["* * * * *"]
 

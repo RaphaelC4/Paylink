@@ -66,7 +66,7 @@ cross-contract steps that host tests cannot reach is
 | Behaviour | Proof |
 | --- | --- |
 | **Micro-invoices pay out.** A 100-unit link has a fee that rounds to zero, so `claim` skips the fee leg instead of failing on a zero-amount NEP-141 transfer, and the split never overflows or loses a unit. | `a_tiny_invoice_skips_the_fee_leg_instead_of_failing`, `split_fee_never_overflows_or_loses_a_unit` |
-| **Nobody needs gas to get paid — not even for the link itself.** Creating the link goes through a NEP-366 delegate action: the payee signs off-chain and the relayer Worker attaches the 0.01 NEAR stake and pays the gas, measured on testnet with the payee's balance unchanged to the yocto across four creations. After that `claim` is callable by anyone, so the frontend releases a paid invoice for the payee and the keeper repeats it every minute — the payee holds no NEAR and signs nothing after payment. | `a_stranger_can_trigger_claim_but_only_the_payee_is_paid`, `claim_pays_the_payee_less_the_fee_in_one_batch`, `workers/relayer/test/parse.test.mjs` (45 assertions over two real on-chain fixtures) |
+| **Nobody needs gas to get paid — not even for the link itself.** Creating the link goes through a NEP-366 delegate action: the payee signs off-chain and the relayer Worker attaches the 0.01 NEAR stake and pays the gas, measured on testnet with the payee's balance unchanged to the yocto across four creations. After that `claim` is callable by anyone, so the keeper releases every paid invoice within a minute from its own gas account — after the payer's single approval the frontend only watches the link move `PAID → CLAIMED` — and the payee holds no NEAR and signs nothing after payment. | `a_stranger_can_trigger_claim_but_only_the_payee_is_paid`, `claim_pays_the_payee_less_the_fee_in_one_batch`, `workers/keeper/test/sweep.test.mjs` (38 assertions over mocked RPC) |
 | **Overpayment is never lost.** What arrived is what's credited, and the fee applies to the credited amount rather than the invoiced one. | `an_overpayment_is_credited_in_full`, `claim_applies_the_fee_to_an_overpayment` |
 | **Paying twice never double-credits.** A link leaves `OPEN` once; a second payment is returned. | `paying_twice_does_not_double_credit` |
 | **Expiry needs no background job.** `Expired` is derived on read from `expires_at`, never stored, so an aged link reports itself honestly and refuses payment. The same timestamp is also the due date: after it, payment is refused and the tokens return to the payer in the same transaction — a hard cutoff, rather than a late payment accepted and marked late. | `an_expired_invoice_cannot_be_paid`, `an_expired_invoice_is_reported_as_expired_even_unpaid` |
@@ -349,15 +349,17 @@ invoiced one.
    balance decrease by exactly the link amount. If the payer holds no USDC,
    expand **No test USDC?** first: *Get test tokens* funds them for free, and
    the swap row covers the exact amount from wNEAR, USDT or ETH instead.
-5. **Watch it release.** About two seconds after the payment the app asks for a
-   second approval. It is signed by the wallet still connected — the payer from
-   step 4, **not** the payee — because `claim` is callable by anyone, so the
-   payee never signs anything. Approve it. See the timeline move
-   `Paid → Claimed`, the payee's token balance increase by 99.5% of the invoice,
-   and the fee account increase by 0.5%. If you reject the second approval, the
-   link stays `PAID` with a *Release* button that anyone can press — and the
-   keeper Worker releases it within a minute anyway, from its own gas account.
-   A second release attempt fails with `link is not paid`.
+5. **Watch it release.** There is no second approval. The status line moves
+   from *Your payment is being confirmed.* to *Payment confirmed! Your funds
+   are being released automatically.*, and the keeper Worker — a Cloudflare
+   cron sweeping every minute from its own gas account — calls `claim`. See
+   the timeline move `Paid → Claimed`, the status line read *Payment completed
+   successfully. The recipient has received the funds.*, the payee's token
+   balance increase by 99.5% of the invoice, and the fee account increase by
+   0.5%. `claim` is callable by anyone but can only pay the link's creator, so
+   the payee never signs anything either. The *Release* button stays on the
+   `PAID` card as manual fallback — anyone can press it if the keeper is ever
+   down — and a second release attempt fails with `link is not paid`.
 6. **Check My links.** Enter the creator account in *My links* and press *Load*.
    See the link listed with its id, amount, status and the payer that
    settled it — read straight from `get_links_by_creator`, unsigned. The stats
@@ -498,6 +500,11 @@ Full diff between them:
 cargo near new contracts/paylink-contract   # generated project; never hand-rolled
 
 cargo test --lib                            # 38 unit tests, all pure host tests
+
+# the three JS suites — no dependencies, plain node:
+node workers/relayer/test/parse.test.mjs    # 45 assertions: delegate parse + signing
+node workers/keeper/test/sweep.test.mjs     # 38 assertions: settlement, retry, logs
+node frontend/test/one-approval.test.mjs    # 26 assertions: one payer approval only
 
 # build the wasm with its NEP-330 ABI embedded
 cargo near build non-reproducible-wasm --abi-features near-sdk/unit-testing

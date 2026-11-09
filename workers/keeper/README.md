@@ -2,9 +2,11 @@
 
 Releases paid links. The contract's `claim` is callable by anyone — the money
 can only go to the link's payee and the fee account, never to the caller — so
-this Worker only ever pays gas. The frontend already releases a link right
-after payment; this is the backstop for a rejected second approval, a closed
-tab, or a dropped connection.
+this Worker only ever pays gas. It is the **default settlement path**: after
+the payer's one wallet approval the frontend only watches the link move
+`PAID → CLAIMED`; this Worker makes that happen within a minute. The pay
+card's Release button stays as manual recovery for the rare failed sweep, a
+closed tab on a slow chain, or a keeper outage.
 
 No registry, no state of its own: one `view_state` call with prefix `l` lists
 every link the contract stores, each value borsh-decodes to the link, and
@@ -22,8 +24,14 @@ POST https://<worker>/tick
        -> { "scanned": 9, "paid": [], "claimed": [], "failed": [] }
 ```
 
-The cron (`* * * * *`) runs the same sweep and logs the report to
-Workers → Logs.
+The cron (`* * * * *`) runs the same sweep and logs to Workers → Logs: one
+structured JSON line per event — `invoice_discovered`, `claim_submitted`,
+`claim_successful`, `claim_failed`, `invoice_already_claimed`,
+`retry_scheduled` — plus the per-run report. No key material is ever logged.
+The whole behaviour (discovery, the exact claim tx, retry, already-claimed,
+outage and log events) is covered by `test/sweep.test.mjs` — run it with
+`node workers/keeper/test/sweep.test.mjs`; the RPC is mocked, so no network
+or key is needed.
 
 How it all actually works — transaction format, RPC quirks, the nonce race,
 key custody, the end-to-end proof log and the full debug trail — is written

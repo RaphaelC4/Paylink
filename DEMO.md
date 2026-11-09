@@ -146,29 +146,32 @@ Point at the fee line: "payee receives 24.875 USDC after the 0.5% fee".
 
    (On a phone the same button sits behind the **Faucet** chip beside the
    bottom bar, or as a card in **Account**.)
-3. Click **Pay 25 USDC**, approve.
+3. Click **Pay 25 USDC**, approve. One approval is the whole payment.
 
 > "The wallet sends one `ft_transfer_call` with the link id in `msg`. The token
 > contract calls Paylink, and that call — not any user call — is what marks the
 > link paid. There is no function anyone can call to fake it."
 
-**On screen:** the timeline moves to **Paid**, and the payer balance drops by
-exactly 25. Two seconds later the app asks for a second approval.
+**On screen:** the timeline moves to **Paid**, the payer balance drops by
+exactly 25, and the status line reads *Payment confirmed! Your funds are being
+released automatically.* Nobody is asked to sign anything again.
 
-### 1:35–2:00 — Release, without the payee doing anything
+### 1:35–2:00 — Release, without anyone signing
 
-Approve the second prompt (the release).
+Wait for the status line to read *Payment completed successfully. The
+recipient has received the funds.* and the timeline to move to **Claimed** —
+the keeper sweeps every minute.
 
-> "The link is paid, so the app immediately releases it. Anyone can trigger
-> this — the money can only go to the link's payee and the fee account, never
-> to whoever clicks. So the payee never has to come back, sign, or hold gas.
-> 99.5% goes to them, 0.5% is the fee. And if I had rejected that prompt, a
-> keeper would release it within a minute anyway — from its own gas account."
+> "Nobody signs the release. The payer's one approval was the payment; a
+> keeper Worker scans the contract for paid links and calls `claim` from its
+> own gas account. Anyone can call it — the money can only go to the link's
+> payee and the fee account, never to whoever clicks. So the payee never has
+> to come back, sign, or hold gas. 99.5% goes to them, 0.5% is the fee."
 
-(The last sentence needs the release keeper Worker deployed — confirm
-`curl https://<keeper-url>/` returns `"ok": true` beforehand, and drop the
-sentence if it is not deployed. The app's own release is the main path either
-way.)
+(Confirm the keeper beforehand: `curl https://<keeper-url>/` must return
+`"ok": true`. If it is ever down, the app shows *Your payment is confirmed.
+Automatic settlement is in progress.* and the **Release** button on the paid
+card is the manual fallback — anyone can press it.)
 
 **On screen:** the timeline moves to **Claimed**. Switch to profile A: the payee
 balance has increased by 24.875 USDC.

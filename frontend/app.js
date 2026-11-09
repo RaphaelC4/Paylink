@@ -3,7 +3,7 @@
    Reads are unsigned JSON-RPC view calls; writes are signed in the wallet. */
 
 import NearConnect from "@hot-labs/near-connect";
-import { CONFIG, ONE_YOCTO, CREATE_STAKE, MAX_DESCRIPTION_BYTES, GAS_DEFAULT, GAS_CLAIM, GAS_FT_CALL } from "./config.js?v=20261107e";
+import { CONFIG, ONE_YOCTO, CREATE_STAKE, MAX_DESCRIPTION_BYTES, GAS_DEFAULT, GAS_CLAIM, GAS_FT_CALL } from "./config.js?v=20261109a";
 
 /* The vendored bundle is the package's CommonJS build, so esbuild exposes the
    module namespace as the default export rather than as named exports. */
@@ -1334,7 +1334,7 @@ function renderPayActions(link, st) {
     }
     box.insertAdjacentHTML("beforeend", `
       <p class="pay-fee">they receive <strong>${formatAmount(payoutOf(credited))} ${esc(CONFIG.token.symbol)}</strong> after the ${CONFIG.feeBps / 100}% fee</p>
-      <p class="wallet-note">Your wallet signs the payment, then the release. Two approvals, one link.</p>`);
+      <p class="wallet-note">One approval — your wallet signs the payment, and the release happens automatically.</p>`);
     return;
   }
 
@@ -1343,7 +1343,7 @@ function renderPayActions(link, st) {
       <button class="btn btn-lg" type="button" data-claim="${esc(link.link_id)}">
         <span>Release ${formatAmount(payoutOf(credited))} ${esc(CONFIG.token.symbol)}</span>
       </button>
-      <p class="pay-fee">${mine ? "you receive" : "they receive"} <strong>${formatAmount(payoutOf(credited))} ${esc(CONFIG.token.symbol)}</strong> after the ${CONFIG.feeBps / 100}% fee · anyone can trigger this, and the money can only go to ${mine ? "you" : "the payee"}</p>`;
+      <p class="pay-fee">${mine ? "you receive" : "they receive"} <strong>${formatAmount(payoutOf(credited))} ${esc(CONFIG.token.symbol)}</strong> after the ${CONFIG.feeBps / 100}% fee · released automatically by the keeper — the button below is a fallback anyone can press, and the money can only go to ${mine ? "you" : "the payee"}</p>`;
     return;
   }
 
@@ -1379,28 +1379,65 @@ async function payLink(linkId) {
       msg: linkId,
     }, { receiverId: link.token, deposit: ONE_YOCTO, gas: GAS_FT_CALL });
 
-    show("ok", `payment sent · <a class="mono" href="${CONFIG.explorer}/transactions/${hash}" target="_blank" rel="noopener">${truncate(hash, 12, 8)}</a>`);
+    show("ok", `Your payment is being confirmed. · <a class="mono" href="${CONFIG.explorer}/transactions/${hash}" target="_blank" rel="noopener">${truncate(hash, 12, 8)}</a>`);
     toast("Payment sent");
     /* Remember it locally: the contract indexes links by creator, not by payer,
        so this is the only way the payer's own activity can be read back. */
     rememberPaid(linkId);
-    /* The link is PAID once the token contract's callback lands, which can
-       trail the transaction result by a block or two. Poll briefly for PAID,
-       then release it to the payee — `claim` is callable by anyone, so the
-       payer's wallet can do it and the payee never has to come back and sign.
-       If the second approval is rejected the link simply stays PAID with the
-       Release button available. */
+    /* ONE approval ends here — the payer's wallet never signs again. The token
+       contract's callback marks the link PAID, and the keeper Worker (every
+       minute, from its own gas account) calls `claim`, which can only pay the
+       link's creator. This loop merely *watches* the two transitions —
+       OPEN→PAID (payment verified) and PAID→CLAIMED (funds released) — speaks
+       them to the status line, and stops when the chain confirms settlement.
+       The Release button stays on the card as manual recovery if the keeper
+       is ever down. Read errors keep the loop going; none of them re-prompt
+       the wallet. */
     (async () => {
-      for (let i = 0; i < 8; i++) {
-        await new Promise((r) => setTimeout(r, 1200));
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      let st = null;
+      for (let i = 0; i < 10; i++) {
+        await sleep(1500);
         const fresh = await V.getLink(linkId).catch(() => null);
-        if (fresh && statusOf(fresh) === "PAID") {
-          celebrated = true;   // renderPay fires the confetti from here
-          await renderPay(linkId);
-          await claimLink(linkId, { auto: true });
-          return;
+        if (fresh) {
+          st = statusOf(fresh);
+          if (st === "PAID" || st === "CLAIMED") break;
         }
       }
+      if (st === "PAID") {
+        celebrated = true;   // renderPay fires the confetti from here
+        await renderPay(linkId);
+        show("ok", "Payment confirmed! Your funds are being released automatically.");
+      } else if (st === "CLAIMED") {
+        celebrated = true;
+        await renderPay(linkId);
+        show("ok", "Payment completed successfully. The recipient has received the funds.");
+        if (currentTab === "ledger") loadLedger();
+        return;
+      } else {
+        /* Neither PAID nor CLAIMED inside the window: the callback is slow,
+           not failed — the transaction itself already landed. Repaint and let
+           the page's own status timer keep the card honest. */
+        await renderPay(linkId);
+        return;
+      }
+      /* PAID → CLAIMED. The keeper sweeps every minute, so watch for up to
+         ~2 minutes; on completion stop, and if the window expires leave the
+         pending message up — the keeper still owns the claim and the Release
+         button remains as manual recovery. */
+      for (let i = 0; i < 60; i++) {
+        await sleep(2000);
+        const fresh = await V.getLink(linkId).catch(() => null);
+        if (!fresh) continue; // transient read failure: keep watching
+        if (statusOf(fresh) === "CLAIMED") {
+          show("ok", "Payment completed successfully. The recipient has received the funds.");
+          await renderPay(linkId);
+          if (currentTab === "ledger") loadLedger();
+          return;
+        }
+        if (i === 4) show("pending", "Your payment is confirmed. Automatic settlement is in progress.");
+      }
+      show("pending", "Your payment is confirmed. Automatic settlement is in progress.");
       await renderPay(linkId);
     })();
   } catch (err) {
@@ -1410,18 +1447,15 @@ async function payLink(linkId) {
   }
 }
 
-async function claimLink(linkId, { auto = false } = {}) {
+/* Manual recovery only: anyone can press this when the keeper is down — the
+   payout still lands solely on the link's creator. The pay flow never calls
+   this; settlement is the keeper's job, so the payer is never prompted twice. */
+async function claimLink(linkId) {
   const line = $("#payStatus");
   const show = (cls, html) => { line.hidden = false; line.className = `tx-line ${cls}`; line.innerHTML = html; };
 
   if (!accountId) { toast("Connect a wallet first"); return connectWallet(); }
-  /* Auto-release runs after a payment; if someone else already released it (or
-     the payment was refunded), there is nothing to sign. */
-  if (auto) {
-    const fresh = await V.getLink(linkId).catch(() => null);
-    if (!fresh || statusOf(fresh) !== "PAID") return;
-  }
-  show("pending", auto ? "releasing to the payee…" : "signing the release…");
+  show("pending", "signing the release…");
   try {
     const hash = await call("claim", { link_id: linkId }, { deposit: ONE_YOCTO, gas: GAS_CLAIM });
     show("ok", `released · <a class="mono" href="${CONFIG.explorer}/transactions/${hash}" target="_blank" rel="noopener">${truncate(hash, 12, 8)}</a>`);
