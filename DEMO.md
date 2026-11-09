@@ -94,15 +94,15 @@ Scroll slowly past the hero and the three steps. Do not rush.
 > `paylink-relay.testnet` — the contract still takes 0.01 NEAR, just not from
 > the payee. The on-screen flow is unchanged; no re-record needed.)*
 
-> "You sign with your own wallet — your keys never touch our servers. And if
-> your wallet can't sign a delegate, it falls back to one direct transaction,
-> the payee covering that one creation — same chain, same link."
+> "People sign with their wallet — Meteor and others. The connector also
+> lists a NEAR CLI option, which lets a terminal or an agent sign the same
+> transactions."
 
-> *([drift] The recorded video shows an older build's paste-step modal — a
-> near-cli command you ran yourself and a hash you pasted back. That code
-> never shipped; today the prompt opens straight in your wallet's approve
-> screen. If the modal is on camera at 0:32, don't narrate it — the sentence
-> above is what the live demo does.)*
+> *(On camera at 0:32 is that NEAR CLI option: the connector prints the
+> exact near-cli command, a terminal or an agent runs it, and the hash comes
+> back to the app — same chain, same link. It's reachable on the live site
+> today: disconnect, open the wallet list, and pick **NEAR CLI**
+> (`near.cli.rs`) — enter an account, choose **Keychain**.)*
 
 **On screen:** the button reads *Creating link…* while the wallet prompt is
 open, then the app lands on the share page: the link in a copy field, a QR
@@ -217,7 +217,7 @@ swap**, and point at the swap row — pick **wNEAR**, press
 ## If something goes wrong on camera
 
 - **Wallet won't connect** — reload the page; the modal lists Meteor, Intear,
-  Ledger, Nightly and EVM wallets.
+  Ledger, Nightly, EVM wallets and NEAR CLI (`near.cli.rs`, terminal signing).
 - **`link id already used`** — the id is random per click; press Create again.
 - **Pay button says the balance is short** — expand **No test USDC?** on the
   pay card and click **Get test tokens**.
