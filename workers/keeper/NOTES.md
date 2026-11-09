@@ -174,11 +174,14 @@ Why this is acceptable (and was proven live as `keeper-004`):
 
 ## 9. End-to-end proof log
 
-Every claim below moved real USDC (`payee +2.985`, `fees +0.015` per 3-USDC link) plus a bit
+Every claim below moved real USDC (`payee +2.985`, `fees +0.015` per 3-USDC link; the
+one-approval runs used 1-USDC links: `+0.995` / `+0.005`) plus a bit
 of keeper gas. Newest first:
 
 | Link | How | Result |
 | --- | --- | --- |
+| `rotchk02` | one-approval E2E after the auto-claim removal: payer signed **once**, no frontend claim, cron alone | PAID → CLAIMED ~60 s; payee `286565000 → 287560000` (+995000), fees `860000 → 865000` (+5000) — exact split |
+| `rotchk01` | same run, pair of the above (payment tx `Fipq9K6N…`) | PAID → CLAIMED 38 s; +995000 / +5000 confirmed |
 | `keeper-005` | **cron alone**, zero human intervention | PAID → CLAIMED ≤ 90 s |
 | `keeper-004` | deployed worker, `POST /tick` with auth; cron raced it | claimed; loser reported `InvalidNonce`, burned no gas |
 | `keeper-003` | local `wrangler dev` (workerd runtime) | tx `DwpshVcN…` |
