@@ -7,6 +7,7 @@
  * signers, the preimage this Worker checks is the one the chain checks.
  */
 
+import { generateKeyPairSync } from "node:crypto";
 import { parseSignedDelegate, signDelegateTx } from "../src/index.js";
 
 const b64decode = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
@@ -148,18 +149,16 @@ if (!subtle) {
 /* ── outer transaction: embed the delegate verbatim, receiver = sender ── */
 
 {
-  const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-  const b58decode = (s) => {
-    let n = 0n;
-    for (const c of s) { const i = B58.indexOf(c); if (i < 0) throw new Error("bad b58"); n = n * 58n + BigInt(i); }
-    const out = [];
-    while (n > 0n) { out.unshift(Number(n & 0xffn)); n >>= 8n; }
-    for (const c of s) { if (c === "1") out.unshift(0); else break; }
-    return Uint8Array.from(out);
-  };
-
-  const secret = b58decode("2dA4rSFnCrJBGAX1PPZiKSqC6vHCv4PS6GG1kvcNQetYcSxG2mxsWRAqdkx7tJpXtrSRuaiiLcZds1wX6YBxwpXJ");
-  ok(secret.length === 64, "relayer secret key decodes to 64 bytes");
+  /* Signing key generated fresh on every run — the outer-signature test needs
+     *a* consistent seed||pub pair, never a real account's key. No secret key
+     *is stored in this file (the one that was got rotated out on sight). */
+  const kp = generateKeyPairSync("ed25519");
+  const pkcs8 = kp.privateKey.export({ type: "pkcs8", format: "der" });
+  const spki = kp.publicKey.export({ type: "spki", format: "der" });
+  const secret = new Uint8Array(64);
+  secret.set(pkcs8.subarray(pkcs8.length - 32), 0); // seed
+  secret.set(spki.subarray(spki.length - 32), 32);  // matching public half
+  ok(secret.length === 64, "generated signing secret is 64 bytes");
 
   const raw = b64decode(FIX_MET);
   const txB64 = await signDelegateTx({
