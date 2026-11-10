@@ -307,10 +307,7 @@ impl Contract {
             .unwrap_or_else(|| env::panic_str("link not found"));
 
         let predecessor = env::predecessor_account_id();
-        require!(
-            predecessor == link.creator,
-            "only the creator can cancel"
-        );
+        require!(predecessor == link.creator, "only the creator can cancel");
         // Stored status, not `effective_status`: an expired-but-unpaid link
         // is still safe to cancel, and every paid/claimed/cancelled state
         // is refused here before anything else can happen.
@@ -1495,10 +1492,7 @@ mod tests {
             let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 c2.cancel_link("lnk-race-b".into())
             }));
-            assert!(
-                attempt.is_err(),
-                "cancel after payment must panic, not win"
-            );
+            assert!(attempt.is_err(), "cancel after payment must panic, not win");
             assert_eq!(
                 c2.get_link("lnk-race-b".into()).unwrap().status,
                 Status::Paid,
