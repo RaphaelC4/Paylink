@@ -75,6 +75,27 @@ Then paste a document the model should refuse — for example one that says
 fields as data; it never executes anything in the document. The browser then
 rejects an amount above the cap and leaves the form untouched.
 
+## Monitoring (M-01)
+
+Every event is one structured JSON line (`{ts, svc, build, level, event,
+...}`, build `20261110a` in log lines — no `GET /` build stamp: the `405 +
+Allow: POST` deploy signal stays untouched). Each `POST /` response carries
+an `X-Request-Id` echoed in that request's log lines.
+
+- **Events**: `parse_ok` (source, size, model, duration — **never the
+  parsed values**), `parse_rejected` with reason codes (M-02 bodies and
+  statuses are byte-identical), `rate_limited`, `upstream_error` (kind +
+  ≤ 240-char scrubbed detail), `service_error`, plus the alert
+  `upstream_degraded` (5 upstream failures in 5 minutes, once per window).
+- **Never logged**: the Gemini key — redacted **by value** as well as by
+  shape (upstream error bodies echo it), plus the system prompt, request
+  text/file bytes and parsed field values.
+- **Alert delivery**: log-only by default; the optional
+  `ALERT_WEBHOOK_URL` secret POSTs each `level:"alert"` record to any JSON
+  webhook (free, best-effort, URL never logged).
+- Catalog, thresholds, required Cloudflare configuration and gaps:
+  [`workers/OPERATIONS.md`](../OPERATIONS.md).
+
 ## What this Worker does not do
 
 - It does not create invoices, sign, or touch the chain.

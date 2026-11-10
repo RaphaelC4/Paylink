@@ -8,7 +8,7 @@
  */
 
 import { generateKeyPairSync } from "node:crypto";
-import { sweep, decodeLink, parseSecretKey } from "../src/index.js";
+import worker, { sweep, decodeLink, parseSecretKey, logEvent } from "../src/index.js";
 
 let passed = 0;
 let failed = 0;
@@ -80,6 +80,8 @@ let broadcastMode;  // "ok" | "generic-fail" | "not-paid-fail" | "throw"
 let broadcasts;     // captured signed transactions
 let keyQueries;     // captured view_access_key params
 let nonceCounter = 41;
+let scanFail;       // M-01: true -> view_state answers with a fatal query error
+const webhookPosts = []; // M-01: ALERT_WEBHOOK_URL deliveries captured here
 
 const link = (id, status, extra = {}) => ({
   link_id: id,
@@ -98,10 +100,22 @@ const link = (id, status, extra = {}) => ({
 });
 
 globalThis.fetch = async (_url, opts) => {
+  /* M-01: alert-webhook deliveries are captured here, not sent anywhere */
+  if (String(_url).startsWith("https://hooks.test/")) {
+    webhookPosts.push(JSON.parse(opts.body));
+    return { json: async () => ({}) };
+  }
   const body = JSON.parse(opts.body);
   const json = (obj) => ({ json: async () => obj });
 
   if (body.method === "query" && body.params.request_type === "view_state") {
+    if (scanFail) {
+      /* deliberately carries a key-shaped string so the scrub backstop is
+         exercised on the scan-failure path too */
+      return json({
+        result: { error: `node unreachable — last seen holding ed25519:${"A".repeat(64)}` },
+      });
+    }
     return json({
       result: {
         values: state.map((l) => ({ key: btoa("l" + l.link_id), value: b64(encodeLink(l)) })),
@@ -176,6 +190,8 @@ const reset = (links, mode) => {
   broadcasts = [];
   keyQueries = [];
   nonceCounter = 41;
+  scanFail = false;
+  webhookPosts.length = 0;
 };
 
 /* ══════════════════════════ tests ══════════════════════════ */
@@ -285,6 +301,187 @@ const reset = (links, mode) => {
   let threw = false;
   try { parseSecretKey({ KEEPER_KEY: KEEPER_PUB }); } catch { threw = true; }
   ok(threw, "parseSecretKey rejects a public key (paste-safety guard intact)");
+}
+
+/* ══════════════════════ M-01: structured logging & alerts ═══════════
+   Every event is one JSON record; assertions parse the captured lines via
+   events()/byEvent(). The mock above can fail the scan itself and receives
+   ALERT_WEBHOOK_URL deliveries, so alert TRIGGERS and delivery are
+   exercised end-to-end with no network. Sweep-level state (sweepFails,
+   claimFails) lives in the module, so each test leaves it clean: a
+   successful scan zeroes the outage streak, a successful claim clears the
+   per-link one. */
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const byEvent = (name) => events().filter((e) => e.event === name);
+
+/* 10. GET /: health shape — fixed allowlist + build stamp */
+{
+  const res = await worker.fetch(new Request("https://keeper.test/"), ENV);
+  const body = await res.json();
+  const keys = Object.keys(body).sort();
+  ok(res.status === 200 && JSON.stringify(keys) === JSON.stringify(["account", "build", "contract", "ok", "service"]),
+    "GET / body is a fixed key allowlist (no run or user data)");
+  ok(body.build === "20261110a", "GET / reports the build stamp (bump with BUILD)");
+  ok(!JSON.stringify(body).includes("ed25519"), "health output carries no key material");
+}
+
+/* 11. /tick: one structured run — response and lines share a run_id */
+{
+  reset([link("tick1", 1)], "ok");
+  const tickEnv = { ...ENV, TICK_SECRET: "test-tick-secret" };
+  const res = await captureLogs(() => worker.fetch(
+    new Request("https://keeper.test/tick", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-tick-secret": "test-tick-secret" },
+      body: "{}",
+    }),
+    tickEnv,
+  ));
+  const report = await res.json();
+  ok(res.status === 200 && report.run_id && report.claimed.length === 1,
+    "tick releases a PAID link and returns its report");
+  const summary = byEvent("sweep_summary")[0];
+  ok(summary && summary.run_id === report.run_id,
+    "sweep_summary shares the response's run_id (one trace, one id)");
+  ok(summary && summary.scanned === 1 && summary.claimed === 1 && summary.over_cap === 0
+    && typeof summary.ms === "number",
+    "sweep_summary carries the run's aggregate outcome and duration");
+  ok(summary && summary.svc === "paylink-keeper" && summary.build === "20261110a"
+    && summary.level === "info" && typeof summary.ts === "string",
+    "line carries the ts/svc/build/level envelope");
+  ok(!hasEvent("unsettled_paid"), "a fully settled run does not warn unsettled_paid");
+}
+
+/* 12. /tick against a dead RPC: 500 + structured failure lines */
+{
+  reset([link("tick2", 1)], "ok");
+  scanFail = true;
+  const tickEnv = { ...ENV, TICK_SECRET: "test-tick-secret" };
+  const res = await captureLogs(() => worker.fetch(
+    new Request("https://keeper.test/tick", { method: "POST", headers: { "x-tick-secret": "test-tick-secret" } }),
+    tickEnv,
+  ));
+  ok(res.status === 500, "a dead RPC still answers tick with 500");
+  ok(hasEvent("sweep_failed") && hasEvent("tick_failed"),
+    "the failure is logged as sweep_failed + tick_failed");
+  const tf = byEvent("tick_failed")[0];
+  ok(tf && tf.level === "error" && typeof tf.run_id === "string",
+    "tick_failed carries level=error and a run_id");
+}
+
+/* 13. scheduled: exactly one cron_heartbeat per run, success and failure */
+{
+  reset([link("cron1", 1)], "ok");
+  let pending = [];
+  const ctx = { waitUntil: (p) => { if (p) pending.push(p); } };
+  await captureLogs(async () => {
+    worker.scheduled({}, ENV, ctx);
+    await Promise.all(pending);
+  });
+  let hb = byEvent("cron_heartbeat");
+  ok(hb.length === 1 && hb[0].ok === true && typeof hb[0].ms === "number",
+    "a healthy cron run logs exactly one cron_heartbeat (ok:true)");
+  ok(hb[0].run_id && byEvent("sweep_summary")[0].run_id === hb[0].run_id,
+    "heartbeat and sweep_summary share the run's run_id");
+  ok(broadcasts.length === 1, "the scheduled sweep actually claimed the PAID link");
+
+  reset([link("cron2", 1)], "ok");
+  scanFail = true;
+  pending = [];
+  await captureLogs(async () => {
+    worker.scheduled({}, ENV, ctx);
+    await Promise.all(pending);
+  });
+  hb = byEvent("cron_heartbeat");
+  ok(hb.length === 1 && hb[0].ok === false && hb[0].level === "error"
+    && typeof hb[0].error === "string",
+    "a failed run logs one cron_heartbeat ok:false (missed runs = its absence)");
+}
+
+/* 14. unsettled_paid: links still PAID after a run warn, with the count */
+{
+  reset([link("unset1", 1)], "generic-fail");
+  const report = await captureLogs(() => sweep(ENV));
+  ok(report.failed.length === 1, "the claim failed as instructed");
+  const u = byEvent("unsettled_paid");
+  ok(u.length === 1 && u[0].level === "warn" && u[0].count === 1 && u[0].link_ids[0] === "unset1",
+    "a link still PAID after the run warns unsettled_paid with count and id");
+}
+
+/* 15. repeated_claim_failure: alert on the THIRD consecutive failure only */
+{
+  const id = "m01strike";
+  reset([link(id, 1)], "generic-fail");
+  await captureLogs(() => sweep(ENV));
+  ok(!hasEvent("repeated_claim_failure"), "first failed claim: no alert yet");
+  reset([link(id, 1)], "generic-fail");
+  await captureLogs(() => sweep(ENV));
+  ok(!hasEvent("repeated_claim_failure"), "second failed claim: still under the threshold");
+
+  reset([link(id, 1)], "generic-fail");
+  await captureLogs(() => sweep({ ...ENV, ALERT_WEBHOOK_URL: "https://hooks.test/keeper" }));
+  const r = byEvent("repeated_claim_failure");
+  ok(r.length === 1 && r[0].level === "alert" && r[0].consecutive === 3 && r[0].link_id === id,
+    "third consecutive failure fires repeated_claim_failure exactly once");
+  await sleep(30);
+  ok(webhookPosts.length === 1 && webhookPosts[0].event === "repeated_claim_failure"
+    && webhookPosts[0].svc === "paylink-keeper" && webhookPosts[0].level === "alert",
+    "the alert is POSTed to ALERT_WEBHOOK_URL as the full record");
+
+  reset([link(id, 1)], "ok");
+  await captureLogs(() => sweep(ENV));
+  reset([link(id, 1)], "generic-fail");
+  await captureLogs(() => sweep(ENV));
+  ok(!hasEvent("repeated_claim_failure"),
+    "after a success the streak restarts — one failure is never an alert");
+}
+
+/* 16. sweep_failed + sweep_outage: three consecutive dead scans alert once */
+{
+  reset([link("scan1", 1)], "ok");
+  scanFail = true;
+
+  const sfAll = []; // captureLogs resets `logs` per call — accumulate across runs
+  let threw = false;
+  await captureLogs(() => sweep(ENV).catch(() => { threw = true; }));
+  ok(threw, "a dead scan still rejects the sweep (tick 500 / heartbeat ok:false)");
+  sfAll.push(...byEvent("sweep_failed"));
+  ok(sfAll.length === 1 && !hasEvent("sweep_outage"),
+    "first failed scan: sweep_failed only");
+
+  await captureLogs(() => sweep(ENV).catch(() => {}));
+  sfAll.push(...byEvent("sweep_failed"));
+  ok(sfAll.length === 2 && !hasEvent("sweep_outage"),
+    "second failed scan: still under the threshold");
+
+  await captureLogs(() => sweep(ENV).catch(() => {}));
+  sfAll.push(...byEvent("sweep_failed"));
+  const o = byEvent("sweep_outage");
+  ok(o.length === 1 && o[0].level === "alert" && o[0].consecutive === 3,
+    "third consecutive failed scan fires sweep_outage exactly once");
+
+  ok(sfAll.length === 3 && sfAll.every((e) => e.level === "error"),
+    "every failed scan logs sweep_failed at level=error");
+  ok(sfAll.every((e) => e.error.includes("ed25519:[redacted]") && !e.error.includes("A".repeat(40))),
+    "the scan error's key-shaped text is scrubbed out of the log");
+
+  reset([link("scan1", 1)], "ok");
+  await captureLogs(() => sweep(ENV));
+  scanFail = true;
+  await captureLogs(() => sweep(ENV).catch(() => {}));
+  ok(!hasEvent("sweep_outage"),
+    "after one healthy scan the streak restarts — no stale alert");
+}
+
+/* 17. scrub backstop at the logEvent level (direct probe) */
+{
+  const ed = "ed25519:" + "B".repeat(64);
+  await captureLogs(() => logEvent("keeper_probe", { detail: `${ed} ${"x".repeat(400)}` }));
+  const [p] = byEvent("keeper_probe");
+  ok(p && p.detail.includes("ed25519:[redacted]") && !p.detail.includes("B".repeat(40)),
+    "logEvent scrubs ed25519 key shapes");
+  ok(p && p.detail.length <= 240, "strings capped at 240 chars — no payload can hide in a log line");
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

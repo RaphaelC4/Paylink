@@ -9,7 +9,7 @@
 
 import { generateKeyPairSync } from "node:crypto";
 import { readFileSync } from "node:fs";
-import worker, { parseSignedDelegate, signDelegateTx, submit } from "../src/index.js";
+import worker, { parseSignedDelegate, signDelegateTx, submit, logEvent } from "../src/index.js";
 
 const b64decode = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const b64encode = (bytes) => {
@@ -356,7 +356,7 @@ throwsWith(() => parseSignedDelegate(withDeposit(rawCli, 2n ** 128n - 1n), env),
   const res = await worker.fetch(new Request("https://relayer.test/"), env);
   const body = await res.json();
   ok(res.status === 200 && body.ok === true, "GET / still answers ok");
-  ok(body.build === "20261110b", "GET / reports the build stamp (bump with BUILD)");
+  ok(body.build === "20261110c", "GET / reports the build stamp (bump with BUILD)");
 }
 
 /* ═════════════════════════════ M-07: composite rate limiting ═══════
@@ -639,6 +639,301 @@ const postSubmit = (body, env2, headers = {}) =>
   const after = await capture(() => submit(env, {}, heavy));
   ok(after.err && after.err.status === 429,
     "after the prune the heavy client is still capped — eviction, not clear-all");
+}
+
+/* ═══════════════════════════ M-01: structured logging & alerts ═══════
+   Every operational line the Worker emits is one JSON record
+   {ts, svc, build, level, event, ...} — assertions parse captured console
+   output rather than scraping text. Nothing here touches the network:
+   globalThis.fetch is stubbed per scenario, the "chain" is an in-process
+   mock, and the only "webhook" is a local stub. Runs after the overflow
+   block: that block's prune already fired, so the once-a-minute throttle
+   guarantees no prune can evict keys mid-test here. */
+
+const withLogs = async (fn) => {
+  const lines = [];
+  const realLog = console.log;
+  console.log = (...args) => { lines.push(args.join(" ")); };
+  try {
+    const value = await fn();
+    return { lines, value };
+  } finally {
+    console.log = realLog;
+  }
+};
+const evs = (lines) =>
+  lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+
+/* ── GET /: health shape — fixed key allowlist, counters only ── */
+{
+  const res = await worker.fetch(
+    new Request("https://relayer.test/"),
+    { ...env, RELAYER_ACCOUNT: "paylink-relayer.testnet" },
+  );
+  const body = await res.json();
+  const keys = Object.keys(body).sort();
+  ok(JSON.stringify(keys) === JSON.stringify(["account", "build", "contract", "ok", "service", "stats"]),
+    "GET / body is a fixed key allowlist (no per-request or user data)");
+  const skeys = Object.keys(body.stats || {}).sort();
+  ok(JSON.stringify(skeys) === JSON.stringify(["errors", "ok", "rate_limited", "rejected", "started", "submit"]),
+    "stats expose only aggregate per-isolate counters");
+  ok(typeof body.stats.submit === "number" && body.stats.submit >= 1,
+    "the counters actually counted this suite's traffic");
+  ok(!("rid" in body) && !("ip" in body) && !JSON.stringify(body).includes("ed25519"),
+    "health output carries no correlation ids, IPs or key material");
+}
+
+/* ── rejection paths: reason codes + correlation id echo ── */
+{
+  const a = await withLogs(() =>
+    postSubmit({}, env, { "cf-connecting-ip": "198.51.100.201" }));
+  ok(a.value.status === 400, "handler maps a missing delegate to 400");
+  const [ev] = evs(a.lines).filter((e) => e.event === "submit_rejected");
+  ok(ev && ev.reason === "bad_request" && ev.status === 400,
+    "missing delegate logs submit_rejected with reason bad_request");
+  const rid = a.value.headers.get("x-request-id");
+  ok(typeof rid === "string" && rid.length === 8, "response carries an 8-char X-Request-Id");
+  ok(ev && ev.rid === rid, "the log line's rid matches the echoed header");
+  ok(ev && ev.svc === "paylink-relayer" && ev.build === "20261110c" && ev.level === "info",
+    "every line carries the svc/build/level envelope");
+
+  const b = await withLogs(() =>
+    postSubmit({ signedDelegateAction: "!!not-base64!!" }, env, { "cf-connecting-ip": "198.51.100.202" }));
+  ok(b.value.status === 400, "invalid base64 -> 400");
+  ok(evs(b.lines).some((e) => e.event === "submit_rejected" && e.reason === "bad_base64"),
+    "invalid base64 logs reason bad_base64");
+
+  const c = await withLogs(() =>
+    postSubmit({ signedDelegateAction: b64encode(Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8])) }, env,
+      { "cf-connecting-ip": "198.51.100.203" }));
+  ok(c.value.status === 400, "undecodable delegate -> 400");
+  ok(evs(c.lines).some((e) => e.event === "submit_rejected" && e.reason === "invalid_delegate"),
+    "garbage delegate logs reason invalid_delegate");
+}
+
+/* ── submit_ok: the full happy path logs safe identifiers only ──
+   An in-process RPC mock (status, view_access_key x2, view_account,
+   broadcast_tx_commit) lets a real fixture reach the broadcast, so the
+   success record is what production would emit. Signing key generated
+   fresh on this run — no secret lives in this file. */
+{
+  const kp = generateKeyPairSync("ed25519");
+  const pkcs8 = kp.privateKey.export({ type: "pkcs8", format: "der" });
+  const spki = kp.publicKey.export({ type: "spki", format: "der" });
+  const secret = new Uint8Array(64);
+  secret.set(pkcs8.subarray(pkcs8.length - 32), 0);
+  secret.set(spki.subarray(spki.length - 32), 32);
+  const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  const b58e = (bytes) => {
+    let n = 0n;
+    for (const x of bytes) n = (n << 8n) | BigInt(x);
+    let s = "";
+    while (n > 0n) { s = B58[Number(n % 58n)] + s; n /= 58n; }
+    for (const x of bytes) { if (x === 0) s = "1" + s; else break; }
+    return s || "1";
+  };
+  const secretB58 = b58e(secret);
+  const BLOCK_HASH = "75xVe8oDH4VV9uKpcGsx7xTQFWtNsbngukNMC8qsqKTw";
+  const TX_HASH = "5KvQmWnJ4dP8sR2tY6vB9xZ1cF7hL3aE5uG8iM4oN6q";
+
+  const okEnv = {
+    ...env,
+    RELAYER_KEY: `ed25519:${secretB58}`,
+    RELAYER_ACCOUNT: "paylink-relayer.testnet",
+    RPC_URL: "https://rpc.mock.testnet",
+  };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init) => {
+    const req = JSON.parse(init.body);
+    let result = null;
+    if (req.method === "status") {
+      result = { latest_block_height: 200_000_000 };
+    } else if (req.method === "broadcast_tx_commit") {
+      result = { status: "SuccessValue", transaction: { hash: TX_HASH } };
+    } else if (req.method === "query" && req.params.request_type === "view_access_key") {
+      /* nonces are plain numbers, exactly as parsed JSON-RPC delivers them */
+      result = req.params.account_id === "paylink-payee.testnet"
+        ? { nonce: 0, block_hash: BLOCK_HASH }
+        : { nonce: 50, block_hash: BLOCK_HASH };
+    } else if (req.method === "query" && req.params.request_type === "view_account") {
+      result = { amount: "10000000000000000000000000" }; // 10 NEAR > 1 NEAR floor
+    }
+    return { json: async () => ({ jsonrpc: "2.0", id: "1", result }) };
+  };
+  let res, lines;
+  try {
+    ({ value: res, lines } = await withLogs(() =>
+      postSubmit({ signedDelegateAction: FIX_CLI }, okEnv, { "cf-connecting-ip": "198.51.100.204" })));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  const out = await res.json();
+  ok(res.status === 200 && out.ok === true && out.hash === TX_HASH,
+    "happy path: a real fixture submits through the mocked chain");
+  const [ev] = evs(lines).filter((e) => e.event === "submit_ok");
+  ok(ev && ev.hash === TX_HASH && ev.link_id === "spikea01" && ev.sender_id === "paylink-payee.testnet",
+    "submit_ok carries link id, sender and tx hash");
+  ok(ev && ev.rid === res.headers.get("x-request-id") && typeof ev.ms === "number",
+    "submit_ok is correlated (rid echo) and timed (ms)");
+  ok(!lines.some((l) => l.includes(FIX_CLI)) && !lines.some((l) => l.includes("signedDelegateAction")),
+    "no delegate bytes or body content in any line");
+  ok(!lines.some((l) => l.includes(secretB58)), "no relayer key material in any line");
+}
+
+/* ── rate_limited: the limiter's 429 lands as a structured warn ── */
+{
+  const ip = "203.0.113.121";
+  const seen = [];
+  for (let i = 0; i < 11; i++) {
+    const r = await capture(() => submit(env, {}, ip));
+    seen.push(r.ok ? 200 : r.err.status);
+  }
+  ok(seen[10] === 429, "fresh IP capped at the 11th local-window request");
+  const { lines, value: res } = await withLogs(() =>
+    postSubmit({}, env, { "cf-connecting-ip": ip }));
+  ok(res.status === 429, "handler repeats the 429");
+  const [ev] = evs(lines).filter((e) => e.event === "rate_limited");
+  ok(ev && ev.level === "warn" && ev.layer === "local" && ev.status === 429,
+    "429 logs rate_limited/warn naming the layer that fired");
+  ok(ev && ev.rid === res.headers.get("x-request-id") && ev.retry_after > 0,
+    "rate_limited is correlated and carries retry_after");
+}
+
+/* ── volume_anomaly: alert once per 60 s window, at the threshold ── */
+{
+  let hits = [];
+  let i = 0;
+  for (; i < 150 && hits.length === 0; i++) {
+    const { lines } = await withLogs(() =>
+      postSubmit({}, env, { "cf-connecting-ip": `198.51.100.${(205 + i) % 255}` }));
+    hits = evs(lines).filter((e) => e.event === "volume_anomaly");
+  }
+  ok(hits.length === 1, `unusual request volume fires volume_anomaly (after ${i} requests this window)`);
+  ok(hits[0] && hits[0].level === "alert" && hits[0].window_s === 60 && hits[0].count >= 120,
+    "volume_anomaly is an alert carrying the window and the count");
+  const extra = await withLogs(() => Promise.all(
+    Array.from({ length: 10 }, (_, k) =>
+      postSubmit({}, env, { "cf-connecting-ip": `198.51.100.${100 + k}` }))));
+  ok(evs(extra.lines).filter((e) => e.event === "volume_anomaly").length === 0,
+    "the anomaly alerts once per window, not once per request");
+}
+
+/* ── error_burst: five 5xx in five minutes = one alert, delivered ──
+   The RPC is stubbed dead (network disabled), so every request fails with
+   503/rpc_access_key; ALERT_WEBHOOK_URL points at a local stub so the
+   delivery path itself is under test. A fake ctx collects waitUntil
+   promises exactly as the runtime would. */
+{
+  const burstEnv = { ...env, ALERT_WEBHOOK_URL: "https://hooks.test/paylink" };
+  const posts = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith("https://hooks.test/")) {
+      posts.push(JSON.parse(init.body));
+      return { ok: true, status: 200 };
+    }
+    throw new Error("network disabled in test");
+  };
+  const pending = [];
+  const ctx = { waitUntil: (p) => { if (p) pending.push(p); } };
+  let lines = [];
+  try {
+    for (let i = 0; i < 5; i++) {
+      const r = await withLogs(() =>
+        worker.fetch(
+          new Request("https://relayer.test/submit", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "cf-connecting-ip": `198.51.100.${220 + i}`,
+            },
+            body: JSON.stringify({ signedDelegateAction: FIX_CLI }),
+          }),
+          burstEnv,
+          ctx,
+        ));
+      lines = lines.concat(r.lines);
+    }
+    await Promise.all(pending);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  const es = evs(lines);
+  ok(es.filter((e) => e.event === "service_error").length === 5,
+    "each 5xx logs a service_error line");
+  ok(es.some((e) => e.event === "service_error" && e.level === "error"
+    && e.status === 503 && e.reason === "rpc_access_key"),
+    "service_error carries level/status/reason");
+  const bursts = es.filter((e) => e.event === "error_burst");
+  ok(bursts.length === 1 && bursts[0].level === "alert" && bursts[0].count === 5,
+    "the fifth 5xx in five minutes fires exactly one error_burst alert");
+  ok(posts.length === 1 && posts[0].event === "error_burst" && posts[0].svc === "paylink-relayer",
+    "the alert was POSTed to the configured webhook as the full record");
+  ok(!posts.some((p) => JSON.stringify(p).includes("hooks.test")),
+    "the webhook payload never echoes its own destination URL");
+}
+
+/* ── alert delivery plumbing: on / off / failure, URL never logged ── */
+{
+  const realFetch = globalThis.fetch;
+  const posts = [];
+  try {
+    globalThis.fetch = async (url, init) => {
+      posts.push({ url: String(url), body: JSON.parse(init.body) });
+      return { ok: true, status: 200 };
+    };
+    let d = null;
+    let delivered = null;
+    const { lines } = await withLogs(async () => {
+      d = logEvent("plumb_test", { level: "alert", note: "hello" },
+        { ALERT_WEBHOOK_URL: "https://hooks.test/secret-token" });
+      delivered = await d;
+    });
+    ok(typeof (d && d.then) === "function", "logEvent(level=alert) returns the delivery promise");
+    ok(delivered === true, "delivery resolves true when the webhook answers");
+    ok(posts.length === 1 && posts[0].body.event === "plumb_test" && posts[0].body.level === "alert",
+      "webhook receives the complete structured record");
+    ok(!lines.some((l) => l.includes("secret-token")),
+      "the webhook URL (and its embedded token) never reaches the log");
+
+    posts.length = 0;
+    const off = await withLogs(() => logEvent("plumb_off", { level: "alert" }, {}));
+    ok(evs(off.lines).some((e) => e.event === "plumb_off" && e.level === "alert"),
+      "without ALERT_WEBHOOK_URL the alert is still logged (log-only mode)");
+    ok(off.value === false, "but no delivery is attempted (resolves false)");
+    ok(posts.length === 0, "and no webhook POST happened");
+
+    globalThis.fetch = async () => { throw new Error("webhook down"); };
+    let threw = false;
+    let dead = null;
+    try {
+      dead = await logEvent("plumb_dead", { level: "alert" }, { ALERT_WEBHOOK_URL: "https://hooks.test/down" });
+    } catch {
+      threw = true;
+    }
+    ok(!threw && dead === false, "a dead webhook resolves false instead of throwing");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+/* ── scrub backstop: key-shaped and oversized strings never survive ── */
+{
+  const ed = "ed25519:" + "A".repeat(64);
+  const google = "AIza" + "Sy".repeat(20);
+  const bearer = "Bearer abcdefghijklmnop";
+  const { lines } = await withLogs(() =>
+    logEvent("scrub_probe", { detail: `${ed} ${google} ${bearer} ${"x".repeat(400)}` }));
+  const [rec] = evs(lines).filter((e) => e.event === "scrub_probe");
+  ok(rec !== undefined, "probe line emitted");
+  ok(rec && rec.detail.includes("ed25519:[redacted]") && !rec.detail.includes("A".repeat(40)),
+    "ed25519 key material redacted");
+  ok(rec && rec.detail.includes("[redacted-key]") && !rec.detail.includes(google),
+    "Google API key redacted");
+  ok(rec && rec.detail.includes("Bearer [redacted]") && !rec.detail.includes("abcdefghijklmnop"),
+    "bearer token redacted");
+  ok(rec && rec.detail.length <= 240,
+    "strings capped at 240 chars — a full signed delegate cannot fit");
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

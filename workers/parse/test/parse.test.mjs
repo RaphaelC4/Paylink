@@ -360,8 +360,9 @@ try {
   /* ── 11. upstream failures stay safe ── */
   {
     /* This 500 body deliberately contains the key and a marker; the Worker
-       logs it server-side (visible in this test's output on purpose) and
-       must never hand it to the client. */
+       logs it server-side as a structured upstream_error line with the
+       configured key REDACTED by value (asserted in 11b below) and must
+       never hand it to the client. */
     globalThis.fetch = async () =>
       new Response(JSON.stringify({ error: { message: "UPSTREAM-DETAIL-MARKER key=" + KEY } }), { status: 500 });
     let r = await post({ text: "hi" }, baseEnv());
@@ -388,6 +389,168 @@ try {
 
     r = await post({ text: "hi" }, baseEnv({ GEMINI_API_KEY: "" }));
     ok(r.res.status === 500 && JSON.parse(r.text).error === "GEMINI_API_KEY is not set", "missing key -> 500, never a silent pass");
+  }
+
+  /* ── 11b. M-01: structured logging, correlation ids, alert triggers ──
+     One JSON line per event. `around` captures ONLY the console output of
+     the request under test (ok/FAIL lines keep printing) and returns the
+     parsed events that call produced, so assertions never see a previous
+     test's lines. globalThis.fetch stays stubbed as in section 11. */
+  {
+    const captured = [];
+    const baseLog = console.log;
+    const parse = (l) => { try { return JSON.parse(l); } catch { return null; } };
+    const around = async (fn) => {
+      const start = captured.length;
+      console.log = (...a) => captured.push(a.join(" "));
+      try {
+        const value = await fn();
+        return { value, evs: captured.slice(start).map(parse).filter(Boolean) };
+      } finally {
+        console.log = baseLog;
+      }
+    };
+
+    /* a. parse_ok: envelope + correlation, and NO user data in the line */
+    globalThis.fetch = geminiOk();
+    {
+      const sample = "Chidi owes me 400 USDC for the logo work";
+      const ip = "198.51.100.211";
+      const { value: { res }, evs } = await around(() =>
+        post({ text: sample }, baseEnv(), { "CF-Connecting-IP": ip }));
+      ok(res.status === 200, "M-01: a valid request still 200 under structured logging");
+      const ridHdr = res.headers.get("x-request-id");
+      ok(typeof ridHdr === "string" && ridHdr.length === 8, "POST response carries an 8-char X-Request-Id");
+      const [ev] = evs.filter((e) => e.event === "parse_ok");
+      ok(ev && ev.rid === ridHdr, "parse_ok shares the response's rid (one trace end to end)");
+      ok(ev && ev.svc === "paylink-parse" && ev.build === "20261110a" && ev.level === "info"
+        && typeof ev.ts === "string", "line carries the ts/svc/build/level envelope");
+      ok(ev && ev.source === "text" && ev.chars === sample.length && typeof ev.ms === "number"
+        && ev.ip === ip, "parse_ok records source/size/duration/ip — operational facts only");
+      const line = JSON.stringify(evs);
+      ok(!line.includes("Chidi owes") && !line.includes("chidi.testnet") && !line.includes("Logo work"),
+        "no request text and no parsed field values appear in any line");
+      ok(!line.includes(KEY), "the API key appears in no line");
+    }
+
+    /* b. the GET-signal contract: 405 + Allow: POST, untouched by M-01 */
+    {
+      const res = await worker.fetch(new Request("https://parse.test/"), baseEnv());
+      ok(res.status === 405 && res.headers.get("allow") === "POST",
+        "GET / still 405 with Allow: POST (deploy signal preserved)");
+      ok(res.headers.get("x-request-id") === null,
+        "the 405 response gains no correlation header — only POST / is instrumented");
+    }
+
+    /* c. parse_rejected: reason codes + rid correlation */
+    {
+      const { value: r, evs } = await around(() => post("this is not json", baseEnv()));
+      ok(r.res.status === 400, "malformed body still 400");
+      const [ev] = evs.filter((e) => e.event === "parse_rejected");
+      ok(ev && ev.reason === "bad_json" && ev.status === 400
+        && ev.rid === r.res.headers.get("x-request-id"),
+        "bad_json reject logged with status and the response's rid");
+
+      const r2 = await around(() => post({}, baseEnv()));
+      ok(r2.value.res.status === 400, "empty object still 400");
+      ok(r2.evs.some((e) => e.event === "parse_rejected" && e.reason === "no_content"),
+        "empty body logs reason no_content");
+
+      const r3 = await around(() => post({ text: "hi" }, baseEnv(), { Origin: "https://evil.example" }));
+      ok(r3.value.res.status === 403, "cross-origin still 403");
+      ok(r3.evs.some((e) => e.event === "parse_rejected" && e.reason === "origin_not_allowed"
+        && e.status === 403), "origin gate logs reason origin_not_allowed");
+    }
+
+    /* d. rate_limited: the 11th request logs a warn with the rid */
+    {
+      const ip = "203.0.113.70";
+      let last = null;
+      for (let i = 0; i < 10; i++) {
+        last = await around(() => post({ text: "invoice" }, baseEnv(), { "CF-Connecting-IP": ip }));
+      }
+      ok(last.value.res.status === 200, "the first 10 from one IP pass");
+      const { value: r, evs } = await around(() =>
+        post({ text: "invoice" }, baseEnv(), { "CF-Connecting-IP": ip }));
+      ok(r.res.status === 429, "the 11th -> 429");
+      const [ev] = evs.filter((e) => e.event === "rate_limited");
+      ok(ev && ev.level === "warn" && ev.status === 429 && ev.retry_after === 60 && ev.ip === ip,
+        "429 logs rate_limited/warn with retry_after and the limiter key");
+      ok(ev && ev.rid === r.res.headers.get("x-request-id"),
+        "rate_limited is correlated to the 429 response");
+    }
+
+    /* e. upstream_error: bounded detail, key redacted BY VALUE */
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ error: { message: "UPSTREAM-DETAIL-MARKER key=" + KEY } }), { status: 500 });
+    {
+      const { value: r, evs } = await around(() => post({ text: "hi" }, baseEnv()));
+      ok(r.res.status === 502, "upstream 500 still maps to 502");
+      const [ev] = evs.filter((e) => e.event === "upstream_error");
+      ok(ev && ev.level === "error" && ev.kind === "http_status" && ev.status === 500,
+        "upstream failure logs upstream_error with kind and status");
+      ok(ev && ev.detail.includes("UPSTREAM-DETAIL-MARKER"),
+        "bounded upstream detail is kept server-side for debugging");
+      ok(ev && ev.detail.includes("[redacted-key]") && !ev.detail.includes(KEY),
+        "…but the configured API key is redacted out of it");
+      ok(ev && ev.detail.length <= 240, "upstream detail capped at 240 chars");
+      ok(ev && ev.rid === r.res.headers.get("x-request-id"), "upstream_error carries the rid");
+    }
+
+    /* f. upstream_degraded: the fifth failure in five minutes alerts once,
+       delivered to the webhook. Earlier suite failures already filled the
+       window, so the clock slides forward to start a fresh one. */
+    {
+      const posts = [];
+      const realNow = Date.now;
+      globalThis.fetch = async (url, init) => {
+        if (String(url).startsWith("https://hooks.test/")) {
+          posts.push(JSON.parse(init.body));
+          return new Response("{}", { status: 200 });
+        }
+        return new Response(JSON.stringify({ error: { message: "upstream exploded" } }), { status: 500 });
+      };
+      const wEnv = { ...baseEnv(), ALERT_WEBHOOK_URL: "https://hooks.test/parse" };
+      let all = [];
+      try {
+        Date.now = () => realNow() + 6 * 60_000;
+        for (let i = 0; i < 5; i++) {
+          const c = await around(() => post({ text: "hi" }, wEnv));
+          all = all.concat(c.evs);
+        }
+      } finally {
+        Date.now = realNow;
+        globalThis.fetch = geminiOk();
+      }
+      ok(all.filter((e) => e.event === "upstream_error").length === 5,
+        "each of the five failures logs upstream_error");
+      const d = all.filter((e) => e.event === "upstream_degraded");
+      ok(d.length === 1 && d[0].level === "alert" && d[0].count === 5 && d[0].window_s === 300,
+        "the fifth failure fires exactly one upstream_degraded alert");
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      ok(posts.length === 1 && posts[0].event === "upstream_degraded"
+        && posts[0].svc === "paylink-parse" && posts[0].level === "alert",
+        "the alert is POSTed to ALERT_WEBHOOK_URL as the full record");
+      ok(!posts.some((p) => JSON.stringify(p).includes("hooks.test")),
+        "the webhook payload never echoes its own destination URL");
+    }
+
+    /* g. service_error: an unexpected exception is logged, then generic 500 */
+    {
+      /* a bare object whose URL is syntactically invalid trips new URL()
+         inside the handler — the one path no admission test can reach */
+      const { value: res, evs } = await around(() =>
+        worker.fetch({ method: "POST", url: "http://[bad", headers: { get: () => null } }, baseEnv()));
+      ok(res.status === 500, "an unexpected exception answers a generic 500");
+      const txt = await res.text();
+      bodies.push(txt);
+      ok(JSON.parse(txt).error === "internal error", "…with a generic message, no internals");
+      const [ev] = evs.filter((e) => e.event === "service_error");
+      ok(ev && ev.level === "error" && typeof ev.error === "string",
+        "the exception is logged as service_error at level=error");
+      ok(!txt.includes("index.js") && !txt.includes("at Object"),
+        "the response carries no stack trace");
+    }
   }
 
   /* ── 12. leak sweep across every captured response ── */

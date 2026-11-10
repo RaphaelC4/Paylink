@@ -84,6 +84,31 @@ npx wrangler secret put TICK_SECRET
 For a local run, put `KEEPER_KEY=...` and `TICK_SECRET=...` in `.dev.vars`
 (gitignored, never committed) and use `npx wrangler dev`.
 
+## Monitoring (M-01)
+
+Every event is one structured JSON line (`{ts, svc, build, level, event,
+...}`, build `20261110a`) on stdout — Workers → Logs or `wrangler tail`.
+All lines of one sweep share a `run_id` (also returned by `/tick`), so
+"did the 14:03 run settle it?" is one query.
+
+- **Events**: one `cron_heartbeat` per scheduled run (**missed runs show as
+  its absence**; failures as `ok:false`), a `sweep_summary` per healthy run,
+  `unsettled_paid` warn with the backlog count, per-claim outcomes
+  (`invoice_discovered`, `claim_submitted`, `claim_successful`,
+  `invoice_already_claimed`, `claim_failed`, `retry_scheduled`), and
+  `sweep_failed` / `tick_failed` errors.
+- **Alerts**: `sweep_outage` (3rd consecutive failed scan),
+  `repeated_claim_failure` (3rd consecutive failure for one link) — both
+  fire exactly once per streak; a healthy run resets the streak.
+- **Never logged**: the keeper key (scrub backstop: `ed25519:` shapes +
+  240-char cap); everything else — link ids, tx hashes — is public on chain.
+  `GET /` is a fixed allowlist with the build stamp.
+- **Alert delivery**: log-only by default; the optional
+  `ALERT_WEBHOOK_URL` secret POSTs each `level:"alert"` record to any JSON
+  webhook (free, best-effort; the sweep awaits delivery before it returns).
+- Catalog, thresholds, required Cloudflare configuration and gaps:
+  [`workers/OPERATIONS.md`](../OPERATIONS.md).
+
 ## What it signs with
 
 WebCrypto Ed25519 — the runtime's own `crypto.subtle`, pkcs8 import of the

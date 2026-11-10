@@ -8,7 +8,21 @@
  *   scheduled (every minute)  -> sweep(): scan contract state, claim every
  *                               link sitting in PAID, log what happened.
  *   POST /tick (x-tick-secret)-> the same sweep on demand, for demos/tests.
- *   GET /                     -> liveness.
+ *   GET /                     -> liveness + build stamp.
+ *
+ * Observability (M-01): every event is one structured JSON line
+ * ({ts, svc, build, level, event, ...}) greppable in Workers → Logs or
+ * `wrangler tail` — per-run sweep_summary and cron_heartbeat, per-claim
+ * outcome events, unsettled_paid (warn), repeated_claim_failure and
+ * sweep_outage (alert), sweep_failed / tick_failed (error). Every line of
+ * one run shares a run_id (also returned by /tick), so a "did the 14:03 run
+ * settle it?" question maps onto exactly one set of lines. Never logged:
+ * key material (the logger scrubs ed25519/API-key/bearer shapes as a
+ * backstop); everything else logged — link ids, tx hashes, account ids —
+ * is public on chain. Missed cron runs are detected by the ABSENCE of a
+ * cron_heartbeat line. Alert delivery optional: set ALERT_WEBHOOK_URL and
+ * level=alert events are POSTed there (best-effort, never fatal). Event
+ * catalog, thresholds and required config: workers/OPERATIONS.md.
  *
  * Discovery needs no registry: `view_state` with prefix "l" returns every
  * link the contract stores (LookupMap key = b"l" + borsh(link_id)), and the
@@ -16,6 +30,7 @@
  *
  * Secrets:  wrangler secret put KEEPER_KEY      (ed25519, matches KEEPER_ACCOUNT)
  *           wrangler secret put TICK_SECRET     (for POST /tick)
+ *           wrangler secret put ALERT_WEBHOOK_URL (optional — where level=alert events go)
  * Vars:     RPC_URL, CONTRACT_ID, KEEPER_ACCOUNT, ALLOWED_ORIGIN
  *
  * No Node APIs and no dependencies: Workers get atob/btoa and Uint8Array,
@@ -30,6 +45,14 @@ const BROADCAST_TIMEOUT_MS = 30_000;
 const GAS_CLAIM = 150_000_000_000_000; // 150 Tgas — claim queues 2 transfers + a callback
 const ONE_YOCTO = 1n; // claim requires exactly 1 yoctoNEAR
 const MAX_CLAIMS_PER_SWEEP = 10; // bound one sweep's runtime and spend
+
+/* M-01 alert thresholds (see workers/OPERATIONS.md): three failed claims in
+   a row for one link, or three consecutive sweeps unable to scan at all,
+   mean the trouble is systemic — one bad transaction never trips either. */
+const CLAIM_STRIKE_ALERT = 3;
+const SWEEP_OUTAGE_ALERT = 3;
+const SVC = "paylink-keeper";
+const BUILD = "20261110a";
 
 /* ────────────────────────────────────────────────────────────── rpc ── */
 
@@ -317,41 +340,177 @@ async function broadcast(env, txB64) {
 
 /* ─────────────────────────────────────────────────────────── sweep ── */
 
-/* One structured JSON line per settlement event, greppable in Workers →
-   Logs or `wrangler tail`. Six events, in the order they happen:
-   invoice_discovered, claim_submitted, claim_successful, claim_failed,
-   invoice_already_claimed, retry_scheduled. Never logs the key — only
-   link ids, transaction hashes and error text. */
-const logEvent = (event, detail) => console.log(JSON.stringify({ event, ...detail }));
+/* ─────────────────────────────── structured logging + alerts (M-01) ── */
+
+/* One event = one JSON line, envelope first: ts, svc, build, level
+   (info | warn | error | alert), event, then the detail. Catalog:
+   per-run      sweep_summary, cron_heartbeat, unsettled_paid (warn),
+                sweep_failed (error), sweep_outage (alert), tick_failed,
+   per-claim    invoice_discovered, claim_submitted, claim_successful,
+                claim_failed, invoice_already_claimed, retry_scheduled,
+                repeated_claim_failure (alert).
+   Only level=alert is webhook-eligible, so warnings never spam a channel. */
+
+const newRunId = () => {
+  const b = new Uint8Array(4);
+  crypto.getRandomValues(b);
+  return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+};
+
+/* Belt-and-braces redaction applied to EVERY string that reaches a log line
+   or an alert webhook: ed25519 key material, Google API keys, bearer tokens,
+   and a 240-char cap so an error blob can never carry a whole secret or blow
+   the log budget. Call-site discipline still applies — nothing here logs a
+   request body or the key — this is the backstop. */
+function scrub(v) {
+  if (typeof v !== "string") return v;
+  return v
+    .replace(/ed25519:[1-9A-HJ-NP-Za-km-z]{32,}/g, "ed25519:[redacted]")
+    .replace(/AIza[0-9A-Za-z_-]{16,}/g, "[redacted-key]")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [redacted]")
+    .slice(0, 240);
+}
+const scrubDeep = (o) => {
+  if (typeof o === "string") return scrub(o);
+  if (Array.isArray(o)) return o.map(scrubDeep);
+  if (o && typeof o === "object") {
+    const out = {};
+    for (const [k, val] of Object.entries(o)) out[k] = scrubDeep(val);
+    return out;
+  }
+  return o;
+};
+
+/* Optional alert delivery: POST level=alert events to ALERT_WEBHOOK_URL.
+   Off unless the secret is set; short timeout; failures swallowed (a dead
+   webhook must never break a sweep); the URL itself is never logged — it
+   may embed the destination's token. */
+async function notifyAlert(env, payload) {
+  const url = env && env.ALERT_WEBHOOK_URL;
+  if (!url || typeof url !== "string") return false;
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 3_000);
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: ctl.signal,
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+export function logEvent(event, detail = {}, env) {
+  const level = detail.level || "info";
+  const record = scrubDeep({ ts: new Date().toISOString(), svc: SVC, build: BUILD, level, event, ...detail });
+  console.log(JSON.stringify(record));
+  if (level === "alert") return notifyAlert(env, record);
+  return null;
+}
+
+/* Failure memory for the alert conditions (module = per isolate; a restart
+   clears it, so streaks are per-isolate — documented in OPERATIONS.md):
+   claimFails counts consecutive failed claims per link, sweepFails counts
+   consecutive sweeps that could not even scan. */
+const claimFails = new Map();
+let sweepFails = 0;
 
 /**
  * Claim every link sitting in PAID. Idempotent by construction: `claim`
  * panics unless the link is PAID, so a link released elsewhere between the
  * scan and the broadcast simply fails its own transaction and is reported.
+ *
+ * M-01: one run_id correlates every line it emits; each exit path reports
+ * unsettled_paid (warn) then sweep_summary; a scan that cannot run logs
+ * sweep_failed (+ sweep_outage alert on the third consecutive run) and
+ * rethrows so /tick still 500s and the cron's heartbeat reads ok:false.
  */
-export async function sweep(env) {
-  const report = { scanned: 0, paid: [], claimed: [], failed: [], alreadyClaimed: [] };
-  const { links, blockHash } = await scanLinks(env);
+export async function sweep(env, run_id = newRunId()) {
+  const t0 = Date.now();
+  const report = { run_id, scanned: 0, paid: [], claimed: [], failed: [], alreadyClaimed: [] };
+  /* Alert deliveries started during this run — awaited before it returns,
+     so ctx.waitUntil (cron) or the /tick response can never cut them off. */
+  const alerts = [];
+
+  let links;
+  try {
+    ({ links } = await scanLinks(env));
+  } catch (err) {
+    const msg = scrub(String(err.message || err).slice(0, 200));
+    logEvent("sweep_failed", { level: "error", run_id, error: msg }, env);
+    const consecutive = ++sweepFails;
+    /* exactly at the threshold: the streak alerts once, not every minute */
+    if (consecutive === SWEEP_OUTAGE_ALERT) {
+      await logEvent("sweep_outage", { level: "alert", run_id, consecutive, error: msg }, env);
+    }
+    throw err;
+  }
+  sweepFails = 0; // this run scanned fine — the outage streak is over
   report.scanned = links.length;
 
   const paidAll = links.filter((l) => l.status === "PAID");
   const paid = paidAll.slice(0, MAX_CLAIMS_PER_SWEEP);
   report.paid = paid.map((l) => l.link_id);
-  for (const l of paid) logEvent("invoice_discovered", { link_id: l.link_id });
+  for (const l of paid) logEvent("invoice_discovered", { link_id: l.link_id, run_id }, env);
   /* Over the per-sweep cap: not forgotten — the next run picks it up. */
   for (const l of paidAll.slice(MAX_CLAIMS_PER_SWEEP)) {
-    logEvent("retry_scheduled", { link_id: l.link_id, reason: "sweep cap — next run" });
+    logEvent("retry_scheduled", { link_id: l.link_id, reason: "sweep cap — next run", run_id }, env);
   }
-  if (!paid.length) return report;
+
+  /* Every healthy exit reports the same way: warn about links still sitting
+     in PAID (failed claims, missing key, over-cap deferrals — one link
+     settling next minute is normal, so warn, never alert; the COUNT is what
+     a dashboard should graph), then the run's summary as the final line. */
+  const done = () => {
+    const released = new Set([
+      ...report.claimed.map((e) => e.link_id),
+      ...report.alreadyClaimed.map((e) => e.link_id),
+    ]);
+    const remaining = paidAll.filter((l) => !released.has(l.link_id));
+    if (remaining.length) {
+      logEvent("unsettled_paid", {
+        level: "warn", run_id, count: remaining.length,
+        link_ids: remaining.slice(0, 10).map((l) => l.link_id),
+      }, env);
+    }
+    logEvent("sweep_summary", {
+      run_id, scanned: report.scanned, paid: paidAll.length,
+      claimed: report.claimed.length, failed: report.failed.length,
+      already_claimed: report.alreadyClaimed.length,
+      over_cap: Math.max(0, paidAll.length - paid.length),
+      ms: Date.now() - t0,
+    }, env);
+    return Promise.all(alerts).then(() => report);
+  };
+  if (!paid.length) return done();
   if (!env.KEEPER_KEY || !env.KEEPER_ACCOUNT) {
     report.failed.push({ error: "KEEPER_KEY/KEEPER_ACCOUNT not set — nothing released" });
-    logEvent("claim_failed", { error: "KEEPER_KEY/KEEPER_ACCOUNT not set — nothing released" });
-    logEvent("retry_scheduled", { reason: "missing key — every minute until set" });
-    return report;
+    logEvent("claim_failed", { run_id, error: "KEEPER_KEY/KEEPER_ACCOUNT not set — nothing released" }, env);
+    logEvent("retry_scheduled", { run_id, reason: "missing key — every minute until set" }, env);
+    return done();
   }
 
   const secret = parseSecretKey(env);
   const publicKeyB58 = `ed25519:${b58encode(secret.subarray(32))}`;
+
+  /* Consecutive-failure streak per link: a success or already-claimed
+     outcome clears it; the third failure in a row alerts once (reason
+     attached so the channel says what to look at). */
+  const settled = (link_id) => claimFails.delete(link_id);
+  const strike = (link, detail) => {
+    const n = (claimFails.get(link.link_id) || 0) + 1;
+    claimFails.set(link.link_id, n);
+    if (n === CLAIM_STRIKE_ALERT) {
+      alerts.push(logEvent("repeated_claim_failure", {
+        level: "alert", run_id, link_id: link.link_id, consecutive: n, ...detail,
+      }, env));
+    }
+  };
 
   for (const link of paid) {
     try {
@@ -367,30 +526,34 @@ export async function sweep(env) {
         nonce: ak.nonce + 1,
         blockHash: ak.blockHash,
       });
-      logEvent("claim_submitted", { link_id: link.link_id });
+      logEvent("claim_submitted", { link_id: link.link_id, run_id }, env);
       const res = await broadcast(env, tx);
       const entry = { link_id: link.link_id, hash: res.hash };
       if (res.ok) {
-        logEvent("claim_successful", entry);
+        logEvent("claim_successful", { ...entry, run_id }, env);
         report.claimed.push(entry);
+        settled(link.link_id);
       } else if (JSON.stringify(res.status ?? "").includes("link is not paid")) {
         /* Released elsewhere between scan and broadcast — success by other
            hands, not a failure. The next sweep simply won't see it as PAID. */
-        logEvent("invoice_already_claimed", entry);
+        logEvent("invoice_already_claimed", { ...entry, run_id }, env);
         report.alreadyClaimed.push(entry);
+        settled(link.link_id);
       } else {
-        logEvent("claim_failed", { ...entry, status: res.status });
+        logEvent("claim_failed", { ...entry, status: res.status, run_id }, env);
         report.failed.push({ ...entry, status: res.status });
-        logEvent("retry_scheduled", { link_id: link.link_id, reason: "claim failed — next sweep" });
+        logEvent("retry_scheduled", { link_id: link.link_id, reason: "claim failed — next sweep", run_id }, env);
+        strike(link, { reason: "claim reverted" });
       }
     } catch (err) {
       const msg = String(err.message || err).slice(0, 200);
-      logEvent("claim_failed", { link_id: link.link_id, error: msg });
+      logEvent("claim_failed", { link_id: link.link_id, error: msg, run_id }, env);
       report.failed.push({ link_id: link.link_id, error: msg });
-      logEvent("retry_scheduled", { link_id: link.link_id, reason: "broadcast error — next sweep" });
+      logEvent("retry_scheduled", { link_id: link.link_id, reason: "broadcast error — next sweep", run_id }, env);
+      strike(link, { reason: "broadcast error", error: msg });
     }
   }
-  return report;
+  return done();
 }
 
 /* ────────────────────────────────────────────────────────── http ── */
@@ -417,8 +580,10 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
+      /* Health signal for uptime checks: identity, build, per-isolate
+         counters — aggregate numbers only, no run or user detail. */
       return json(
-        { ok: true, service: "paylink-keeper", contract: env.CONTRACT_ID, account: env.KEEPER_ACCOUNT },
+        { ok: true, service: "paylink-keeper", contract: env.CONTRACT_ID, account: env.KEEPER_ACCOUNT, build: BUILD },
         200,
         cors,
       );
@@ -429,11 +594,16 @@ export default {
       if (!env.TICK_SECRET || given !== env.TICK_SECRET) {
         return json({ error: "forbidden" }, 403, cors);
       }
+      /* The tick's run_id is passed into the sweep, so the HTTP response and
+         every log line it produced share one correlation id. Sweep already
+         logs sweep_summary on success and sweep_failed on a scan failure —
+         tick_failed covers the throws in between (e.g. a bad KEEPER_KEY). */
+      const run_id = newRunId();
       try {
-        const report = await sweep(env);
-        console.log("tick", JSON.stringify(report));
+        const report = await sweep(env, run_id);
         return json(report, 200, cors);
       } catch (err) {
+        logEvent("tick_failed", { level: "error", run_id, error: scrub(String(err.message || err).slice(0, 200)) }, env);
         return json({ error: String(err.message || err).slice(0, 300) }, 500, cors);
       }
     }
@@ -442,10 +612,19 @@ export default {
   },
 
   async scheduled(_event, env, ctx) {
+    /* One cron_heartbeat per scheduled run, success or failure: missed runs
+       are detected by its ABSENCE, failed ones by ok:false. waitUntil keeps
+       the run (and its alert deliveries) alive past the response. */
+    const run_id = newRunId();
+    const t0 = Date.now();
     ctx.waitUntil(
-      sweep(env)
-        .then((r) => console.log("cron", JSON.stringify(r)))
-        .catch((e) => console.log("cron error", String(e.message || e))),
+      sweep(env, run_id)
+        .then((r) => {
+          logEvent("cron_heartbeat", { run_id, ok: true, claimed: r.claimed.length, failed: r.failed.length, ms: Date.now() - t0 }, env);
+        })
+        .catch((e) => {
+          logEvent("cron_heartbeat", { level: "error", run_id, ok: false, ms: Date.now() - t0, error: scrub(String(e.message || e).slice(0, 200)) }, env);
+        }),
     );
   },
 };

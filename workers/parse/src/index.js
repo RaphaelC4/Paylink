@@ -19,7 +19,23 @@
  * after 15 s (504). Every error is a JSON { error } string — never a key,
  * a prompt, an upstream body or a stack trace.
  *
+ * Observability (M-01): one structured JSON line per event
+ * ({ts, svc, build, level, event, ...}) — parse_ok, parse_rejected (reason
+ * codes), rate_limited, upstream_error (bounded, scrubbed upstream detail),
+ * upstream_degraded (alert: 5 upstream failures in 5 minutes), and
+ * service_error for an unexpected exception. Every POST / response carries
+ * an X-Request-Id echoed in that request's log lines; GET/405, OPTIONS and
+ * 404 responses are untouched — the 405 + Allow: POST remains the deploy
+ * signal, so this Worker deliberately exposes no GET / build stamp (build
+ * appears in log lines instead). Never logged: the Gemini key (the logger
+ * redacts the configured value itself, plus AIza/bearer/ed25519 shapes), the
+ * system prompt, request text or file bytes, and parsed field VALUES —
+ * parse_ok records source/size/duration only. Alert delivery is optional:
+ * set ALERT_WEBHOOK_URL and level=alert events are POSTed there (best-effort,
+ * never fatal). Catalog and thresholds: workers/OPERATIONS.md.
+ *
  * Secrets:  wrangler secret put GEMINI_API_KEY
+ *           wrangler secret put ALERT_WEBHOOK_URL (optional — where level=alert events go)
  * Vars:     GEMINI_MODEL (default gemini-3.5-flash-lite), ALLOWED_ORIGIN
  *           (default *, enforced server-side), PARSE_TIMEOUT_MS (tuning/test
  *           override of the 15000 ms upstream timeout)
@@ -35,6 +51,11 @@ const MAX_BODY_BYTES = 5.5 * 1024 * 1024;
 const RATE_LIMIT = 10; // requests per window per IP — identical in both limiter paths
 const RATE_WINDOW_MS = 60_000;
 const UPSTREAM_TIMEOUT_MS = 15_000;
+/* M-01 alert threshold (see workers/OPERATIONS.md): five upstream failures
+   within five minutes means Gemini/the network is degraded, not one bad
+   request — alert once per window, log every failure regardless. */
+const UPSTREAM_ALERT_MAX = 5;
+const UPSTREAM_ALERT_WINDOW_MS = 5 * 60_000;
 
 const MIME_OK = new Set([
   "application/pdf",
@@ -62,8 +83,134 @@ Return one JSON object and nothing else.
   document states no due date. Never negative.
 Never invent a value that is not in the document.`;
 
+/* ─────────────────────────── structured logging + alerts (M-01) ── */
+
+const SVC = "paylink-parse";
+const BUILD = "20261110a";
+
+/* Correlation id for one request: 8 hex chars, no user data in it. */
+const newRid = () => {
+  const b = new Uint8Array(4);
+  crypto.getRandomValues(b);
+  return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+};
+
+/* Redaction applied to every string that reaches a log line or an alert
+   webhook. The configured GEMINI_API_KEY is redacted BY VALUE first — it is
+   an arbitrary literal that pattern matching cannot know, and upstream error
+   bodies have been known to echo it back — then the shape patterns (ed25519
+   keys, AIza-style Google keys, bearer tokens), then a 240-char cap so no
+   line can carry a full upstream body or a large secret. Call-site rules
+   still apply: request text, file bytes, prompts and parsed values are
+   simply never passed in. */
+function scrub(v, env) {
+  if (typeof v !== "string") return v;
+  let s = v;
+  const key = env && typeof env.GEMINI_API_KEY === "string" && env.GEMINI_API_KEY.length >= 6
+    ? env.GEMINI_API_KEY
+    : "";
+  if (key) s = s.split(key).join("[redacted-key]");
+  return s
+    .replace(/ed25519:[1-9A-HJ-NP-Za-km-z]{32,}/g, "ed25519:[redacted]")
+    .replace(/AIza[0-9A-Za-z_-]{16,}/g, "[redacted-key]")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [redacted]")
+    .slice(0, 240);
+}
+const scrubDeep = (o, env) => {
+  if (typeof o === "string") return scrub(o, env);
+  if (Array.isArray(o)) return o.map((x) => scrubDeep(x, env));
+  if (o && typeof o === "object") {
+    const out = {};
+    for (const [k, val] of Object.entries(o)) out[k] = scrubDeep(val, env);
+    return out;
+  }
+  return o;
+};
+
+/* Optional alert delivery: POST level=alert events to ALERT_WEBHOOK_URL.
+   Off unless the secret is set; short timeout; failures swallowed (a dead
+   webhook must never break a request); the URL is never logged — it may
+   embed the destination's token. */
+async function notifyAlert(env, payload) {
+  const url = env && env.ALERT_WEBHOOK_URL;
+  if (!url || typeof url !== "string") return false;
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 3_000);
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: ctl.signal,
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/* One event = one JSON line. Only level=alert is webhook-eligible (rate
+   rejections and individual failures never spam a channel). Exported for
+   test/parse.test.mjs. */
+export function logEvent(event, detail = {}, env) {
+  const level = detail.level || "info";
+  const record = scrubDeep({ ts: new Date().toISOString(), svc: SVC, build: BUILD, level, event, ...detail }, env);
+  console.log(JSON.stringify(record));
+  if (level === "alert") return notifyAlert(env, record);
+  return null;
+}
+
+/* Attach an alert delivery to the invocation when a ctx exists (it does in
+   production); tests call the handler without ctx and get a floating promise
+   that cannot break the response either way. */
+const track = (ctx, p) => {
+  if (p && ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
+};
+
+/* Upstream failures per isolate: count within a sliding 5-minute window,
+   alert once per window at the threshold. */
+let upStart = 0;
+let upCount = 0;
+let upAlerted = false;
+function noteUpstream(env, rid) {
+  const now = Date.now();
+  if (now - upStart >= UPSTREAM_ALERT_WINDOW_MS) {
+    upStart = now;
+    upCount = 0;
+    upAlerted = false;
+  }
+  upCount++;
+  if (!upAlerted && upCount >= UPSTREAM_ALERT_MAX) {
+    upAlerted = true;
+    return logEvent("upstream_degraded", {
+      level: "alert", rid, count: upCount, window_s: UPSTREAM_ALERT_WINDOW_MS / 1000,
+    }, env);
+  }
+  return null;
+}
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
+    try {
+      return await handle(request, env, ctx);
+    } catch (err) {
+      /* Unexpected exception: one structured line + a generic 500. Any
+         stack stays in Workers Logs; the client never sees it. */
+      try {
+        logEvent("service_error", {
+          level: "error",
+          method: request && request.method,
+          error: scrub(String((err && err.message) || err), env),
+        }, env);
+      } catch { /* logging must never mask the original failure */ }
+      return json({ error: "internal error" }, 500, corsHeaders(env));
+    }
+  },
+};
+
+async function handle(request, env, ctx) {
     const cors = corsHeaders(env);
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: cors });
@@ -75,6 +222,28 @@ export default {
       return json({ error: "not found" }, 404, cors);
     }
 
+    /* Correlation id: born here, so OPTIONS/405/404 responses stay exactly
+       as the GET-signal tests expect — every other response in this request
+       carries the header, and every log line it produces is stamped with it. */
+    const rid = newRid();
+    const rh = { ...cors, "X-Request-Id": rid };
+    const t0 = Date.now();
+    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+    let source = "text";
+    let chars = 0;
+    /* Every admission reject: identical response to M-02, plus one
+       structured line with a reason code. Never the body, never user text. */
+    const reject = (status, message, reason, level = "info") => {
+      logEvent("parse_rejected", { level, rid, ip, status, reason, error: message }, env);
+      return json({ error: message }, status, rh);
+    };
+    /* Every upstream failure: one structured line (detail bounded + scrubbed)
+       and a tick toward the degraded alert. */
+    const upstreamFail = (kind, extra = {}) => {
+      track(ctx, logEvent("upstream_error", { level: "error", rid, kind, ...extra }, env));
+      track(ctx, noteUpstream(env, rid));
+    };
+
     /* ── admission control (M-02): cheapest rejects first, and every POST
        is charged to its IP before any real work happens. ──────────────── */
 
@@ -85,23 +254,25 @@ export default {
     const allowedOrigin = env.ALLOWED_ORIGIN || "*";
     const origin = request.headers.get("Origin");
     if (allowedOrigin !== "*" && origin && origin !== allowedOrigin) {
-      return json({ error: "Origin not allowed" }, 403, cors);
+      return reject(403, "Origin not allowed", "origin_not_allowed");
     }
 
     /* 2. Rate limit — 10 requests/minute per IP (see rateLimited below). */
-    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
     if (await rateLimited(env, ip)) {
+      track(ctx, logEvent("rate_limited", {
+        level: "warn", rid, ip, status: 429, retry_after: RATE_WINDOW_MS / 1000,
+      }, env));
       return json(
         { error: "Too many requests" },
         429,
-        { ...cors, "Retry-After": String(RATE_WINDOW_MS / 1000) },
+        { ...rh, "Retry-After": String(RATE_WINDOW_MS / 1000) },
       );
     }
 
     /* 3. Size — exact byte count when the client declared one. */
     const declared = Number(request.headers.get("Content-Length"));
     if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
-      return json({ error: "Request body too large" }, 413, cors);
+      return reject(413, "Request body too large", "body_too_large");
     }
 
     /* 4. Content type — JSON, or absent. Anything else (a form post, a
@@ -109,55 +280,59 @@ export default {
           "; charset=utf-8" suffixes are ignored. */
     const ctype = (request.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
     if (ctype && ctype !== "application/json" && ctype !== "text/plain") {
-      return json({ error: "Content-Type must be application/json" }, 415, cors);
+      return reject(415, "Content-Type must be application/json", "bad_content_type");
     }
 
     if (!env.GEMINI_API_KEY) {
-      return json({ error: "GEMINI_API_KEY is not set" }, 500, cors);
+      return reject(500, "GEMINI_API_KEY is not set", "key_missing", "error");
     }
 
     let raw;
     try {
       raw = await request.text();
     } catch {
-      return json({ error: "Body must be JSON" }, 400, cors);
+      return reject(400, "Body must be JSON", "bad_body");
     }
     /* Read-back size gate for bodies with no usable Content-Length (chunked
        transfer). Character length stands in for bytes: every honest body
        here is ASCII JSON, where the two are equal. */
     if (raw.length > MAX_BODY_BYTES) {
-      return json({ error: "Request body too large" }, 413, cors);
+      return reject(413, "Request body too large", "body_too_large");
     }
 
     let body;
     try {
       body = JSON.parse(raw);
     } catch {
-      return json({ error: "Body must be JSON" }, 400, cors);
+      return reject(400, "Body must be JSON", "bad_json");
     }
     if (body === null || typeof body !== "object" || Array.isArray(body)) {
-      return json({ error: "Body must be a JSON object" }, 400, cors);
+      return reject(400, "Body must be a JSON object", "bad_object");
     }
 
     const parts = [];
     const text = typeof body.text === "string" ? body.text.trim() : "";
     if (text) {
-      if (text.length > MAX_TEXT) return json({ error: "Text is too long" }, 413, cors);
+      if (text.length > MAX_TEXT) return reject(413, "Text is too long", "text_too_long");
+      source = "text";
+      chars = text.length;
       parts.push({ text });
     } else if (typeof body.data === "string" && body.data) {
       const mime = String(body.mime || "");
       if (!MIME_OK.has(mime)) {
-        return json({ error: `Unsupported file type: ${mime || "none"}` }, 415, cors);
+        return reject(415, `Unsupported file type: ${mime || "none"}`, "unsupported_file");
       }
       if (body.data.length * 0.75 > MAX_FILE_BYTES) {
-        return json({ error: "File is too large (3.5 MB max)" }, 413, cors);
+        return reject(413, "File is too large (3.5 MB max)", "file_too_large");
       }
       /* Base64 sanity without a multi-megabyte regex scan: charset of the
          first 4 KB plus the length % 4 rule. btoa() output (what the
          frontend sends) satisfies both; junk never reaches Gemini. */
       if (body.data.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(body.data.slice(0, 4096))) {
-        return json({ error: "File data is not valid base64" }, 400, cors);
+        return reject(400, "File data is not valid base64", "bad_base64");
       }
+      source = "file";
+      chars = body.data.length;
       parts.push({
         inline_data: { mime_type: mime, data: body.data },
       });
@@ -165,7 +340,7 @@ export default {
         text: `Filename: ${String(body.filename || "invoice").slice(0, 120)}`,
       });
     } else {
-      return json({ error: "Send text or a file" }, 400, cors);
+      return reject(400, "Send text or a file", "no_content");
     }
 
     const model = env.GEMINI_MODEL || "gemini-3.5-flash-lite";
@@ -215,9 +390,11 @@ export default {
     } catch {
       clearTimeout(timer);
       if (controller.signal.aborted) {
-        return json({ error: "Gemini timed out" }, 504, cors);
+        upstreamFail("timeout");
+        return json({ error: "Gemini timed out" }, 504, rh);
       }
-      return json({ error: "Could not reach Gemini" }, 502, cors);
+      upstreamFail("unreachable");
+      return json({ error: "Could not reach Gemini" }, 502, rh);
     }
 
     if (!upstream.ok) {
@@ -228,8 +405,10 @@ export default {
         detail = ""; // body read aborted or reset — the status says enough
       }
       clearTimeout(timer);
-      console.log("gemini", upstream.status, detail.slice(0, 400));
-      return json({ error: `Gemini returned ${upstream.status}` }, 502, cors);
+      /* structured + bounded: the logger redacts the configured key by value
+         (upstream error bodies echo it) and caps the detail at 240 chars */
+      upstreamFail("http_status", { status: upstream.status, detail: detail.slice(0, 400) });
+      return json({ error: `Gemini returned ${upstream.status}` }, 502, rh);
     }
 
     let data;
@@ -238,21 +417,25 @@ export default {
     } catch {
       clearTimeout(timer);
       if (controller.signal.aborted) {
-        return json({ error: "Gemini timed out" }, 504, cors);
+        upstreamFail("timeout");
+        return json({ error: "Gemini timed out" }, 504, rh);
       }
-      return json({ error: "Gemini response was unreadable" }, 502, cors);
+      upstreamFail("unreadable");
+      return json({ error: "Gemini response was unreadable" }, 502, rh);
     }
     clearTimeout(timer);
     const reading = data?.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!reading) {
-      return json({ error: "No reading came back" }, 422, cors);
+      upstreamFail("no_reading");
+      return json({ error: "No reading came back" }, 422, rh);
     }
 
     let parsed;
     try {
       parsed = JSON.parse(reading);
     } catch {
-      return json({ error: "The reading was not JSON" }, 422, cors);
+      upstreamFail("bad_payload");
+      return json({ error: "The reading was not JSON" }, 422, rh);
     }
 
     /* Return only the five known fields, coerced to the types the frontend
@@ -264,9 +447,11 @@ export default {
       description: str(parsed.description).slice(0, 200),
       expires_in_hours: num(parsed.expires_in_hours),
     };
-    return json(out, 200, cors);
-  },
-};
+    /* The success line: source/size/latency only — parsed VALUES are payment
+       details and never logged; there is no safe identifier yet at parse time. */
+    logEvent("parse_ok", { rid, ip, source, chars, model, ms: Date.now() - t0 }, env);
+    return json(out, 200, rh);
+  }
 
 const str = (v) => (typeof v === "string" ? v.trim() : v == null ? "" : String(v).trim());
 const num = (v) => {

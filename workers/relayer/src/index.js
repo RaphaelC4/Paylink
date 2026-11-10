@@ -49,8 +49,23 @@
  * many IPs). Testnet NEAR only, so nothing of value is at stake; this is a
  * demo guard, not a security guarantee.
  *
+ * Observability (M-01): every operational event is one structured JSON line
+ * ({ts, svc, build, level, event, ...}) greppable in Workers → Logs or
+ * `wrangler tail` — submission outcomes (submit_ok, submit_rejected with a
+ * reason code, rate_limited, service_error), volume and error-burst alerts,
+ * limiter-backend trouble. Each /submit carries an X-Request-Id that is
+ * echoed on the response and stamped on every log line for that request.
+ * Never logged: key material (scrubbed by pattern inside the logger), the
+ * signed delegate, request bodies, amounts — only link ids, tx hashes,
+ * account ids (public on chain), the rate-limit key IP and bounded error
+ * text. GET / reports per-isolate counters for health checks. Alert
+ * delivery is optional: set the ALERT_WEBHOOK_URL secret and level=alert
+ * events are POSTed there (best-effort, never fatal); unset, alerts are
+ * log-only. Full event catalog and thresholds: workers/OPERATIONS.md.
+ *
  * Secrets:  wrangler secret put RELAYER_KEY     (ed25519, matches RELAYER_ACCOUNT)
  *           wrangler secret put TICK_SECRET     (unused; kept for symmetry)
+ *           wrangler secret put ALERT_WEBHOOK_URL (optional — where level=alert events go)
  * Vars:     RPC_URL, CONTRACT_ID, TOKEN_ID, RELAYER_ACCOUNT, ALLOWED_ORIGIN
  * Binding:  RATE_LIMITER (optional — durable burst cap, setup in README.md)
  *
@@ -95,6 +110,12 @@ const BINDING_PERIOD_S = 60; // Retry-After for a binding refusal; matches the [
    headroom. Invalid or oversized bodies then cost one bounded read + parse —
    no decode, no signature work, no RPC. */
 const MAX_BODY_BYTES = 64 * 1024;
+/* M-01 alert thresholds, per isolate (see workers/OPERATIONS.md): 120
+   /submit requests in one minute is far above organic demo traffic, and five
+   5xx in five minutes means something is broken rather than one bad request. */
+const VOLUME_ALERT_PER_MIN = 120;
+const ERROR_BURST_WINDOW_MS = 5 * 60_000;
+const ERROR_BURST_MAX = 5;
 /* A payee's expiry must be comfortably in the future: the contract compares
    against its own clock, so a stale delegate would fail on chain (gas burned). */
 const EXPIRY_MARGIN_MS = 30_000;
@@ -442,6 +463,123 @@ function failureReason(f) {
   try { return JSON.stringify(f); } catch { return "transaction failed"; }
 }
 
+/* ────────────────────────────────────────── structured logging (M-01) ── */
+
+const SVC = "paylink-relayer";
+
+/* Correlation id for one request: 8 hex chars, no user data in it. */
+const newRid = () => {
+  const b = new Uint8Array(4);
+  crypto.getRandomValues(b);
+  return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+};
+
+/* Belt-and-braces redaction applied to EVERY string that reaches a log line
+   or an alert webhook, so no caller can leak key material even by mistake:
+   ed25519 private keys (and their public halves), Google API keys, bearer
+   tokens. Call-site discipline still applies — nobody passes the delegate or
+   a request body — this is the backstop, and long strings are bounded so a
+   log line can never carry a full signed delegate or blow the log budget. */
+function scrub(v) {
+  if (typeof v !== "string") return v;
+  return v
+    .replace(/ed25519:[1-9A-HJ-NP-Za-km-z]{32,}/g, "ed25519:[redacted]")
+    .replace(/AIza[0-9A-Za-z_-]{16,}/g, "[redacted-key]")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [redacted]")
+    .slice(0, 240);
+}
+const scrubDeep = (o) => {
+  if (typeof o === "string") return scrub(o);
+  if (Array.isArray(o)) return o.map(scrubDeep);
+  if (o && typeof o === "object") {
+    const out = {};
+    for (const [k, val] of Object.entries(o)) out[k] = scrubDeep(val);
+    return out;
+  }
+  return o;
+};
+
+/* Optional alert delivery: POST level=alert events to ALERT_WEBHOOK_URL.
+   Off unless the secret is set; best-effort with a short timeout; failures
+   are swallowed (a dead webhook must never break a request) and the URL is
+   never logged — it may embed the destination's token. */
+async function notifyAlert(env, payload) {
+  const url = env && env.ALERT_WEBHOOK_URL;
+  if (!url || typeof url !== "string") return false;
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 3_000);
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: ctl.signal,
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/* One event = one JSON line. level: info | warn | error | alert. Only
+   level=alert is webhook-eligible (so warnings never spam a channel), and
+   the returned promise is the delivery — callers may ignore it. Exported
+   for test/parse.test.mjs. */
+export function logEvent(event, detail = {}, env) {
+  const level = detail.level || "info";
+  const record = scrubDeep({ ts: new Date().toISOString(), svc: SVC, build: BUILD, level, event, ...detail });
+  console.log(JSON.stringify(record));
+  if (level === "alert") {
+    const delivered = notifyAlert(env, record);
+    return delivered;
+  }
+  return null;
+}
+
+/* Per-isolate counters behind GET / (health checks). Isolate-local by
+   nature: each instance has its own, documented in OPERATIONS.md. */
+const stats = { started: new Date().toISOString(), submit: 0, ok: 0, rejected: 0, rate_limited: 0, errors: 0 };
+
+/* Unusual volume: /submit requests per 60 s, alert once per window. */
+let volStart = 0;
+let volCount = 0;
+let volAlerted = false;
+function noteVolume(env, rid) {
+  const now = Date.now();
+  if (now - volStart >= 60_000) {
+    volStart = now;
+    volCount = 0;
+    volAlerted = false;
+  }
+  volCount++;
+  if (!volAlerted && volCount >= VOLUME_ALERT_PER_MIN) {
+    volAlerted = true;
+    return logEvent("volume_anomaly", { level: "alert", rid, count: volCount, window_s: 60 }, env);
+  }
+  return null;
+}
+
+/* Error burst: 5xx per 5 minutes, alert once per window. */
+let errStart = 0;
+let errCount = 0;
+let errAlerted = false;
+function noteErrorBurst(env, rid, status, reason) {
+  const now = Date.now();
+  if (now - errStart >= ERROR_BURST_WINDOW_MS) {
+    errStart = now;
+    errCount = 0;
+    errAlerted = false;
+  }
+  errCount++;
+  if (!errAlerted && errCount >= ERROR_BURST_MAX) {
+    errAlerted = true;
+    return logEvent("error_burst", { level: "alert", rid, count: errCount, window_s: ERROR_BURST_WINDOW_MS / 1000, last_status: status, last_reason: reason }, env);
+  }
+  return null;
+}
+
 /* ───────────────────────────────────────────────── rate limit ── */
 
 /* Composite limiter (M-07) — two layers, both per IP, no global bucket, so
@@ -501,7 +639,7 @@ async function rateLimited(env, ip) {
   if (list.length >= RATE_LIMIT) {
     hits.set(key, list);
     const retryAfter = Math.max(1, Math.ceil((list[0] + RATE_WINDOW_MS - now) / 1000));
-    return { limited: true, retryAfter };
+    return { limited: true, retryAfter, layer: "local" };
   }
   list.push(now);
   hits.set(key, list);
@@ -511,21 +649,22 @@ async function rateLimited(env, ip) {
     try {
       const res = await limiter.limit({ key });
       if (res && res.success === false) {
-        return { limited: true, retryAfter: BINDING_PERIOD_S };
+        return { limited: true, retryAfter: BINDING_PERIOD_S, layer: "binding" };
       }
       if (!res || typeof res.success !== "boolean") {
-        console.log("rate limiter: unexpected limit() result — enforcing local window only");
+        logEvent("limiter_backend_error", { level: "warn", error: "rate limiter: unexpected limit() result — enforcing local window only" });
       }
     } catch (e) {
-      console.log("rate limiter unavailable:", String((e && e.message) || e).slice(0, 200));
+      logEvent("limiter_backend_error", { level: "warn", error: `rate limiter unavailable: ${String((e && e.message) || e)}` });
     }
   }
-  return { limited: false, retryAfter: 0 };
+  return { limited: false, retryAfter: 0, layer: "none" };
 }
 
 /* ─────────────────────────────────────────────────── submit ── */
 
-export async function submit(env, body, ip) {
+export async function submit(env, body, ip, rid = "-") {
+  const t0 = Date.now();
   /* First check, before base64 decode, signature verification or any RPC:
      a rejected or malformed request costs only this call (no network). */
   const rl = await rateLimited(env, ip);
@@ -533,6 +672,7 @@ export async function submit(env, body, ip) {
     const err = new Error("rate limit: try again later");
     err.status = 429;
     err.retryAfter = rl.retryAfter;
+    err.rlLayer = rl.layer;
     throw err;
   }
 
@@ -540,6 +680,7 @@ export async function submit(env, body, ip) {
   if (!b64) {
     const err = new Error('body must be { "signedDelegateAction": "<base64>" }');
     err.status = 400;
+    err.reason = "bad_request";
     throw err;
   }
 
@@ -549,6 +690,7 @@ export async function submit(env, body, ip) {
   } catch {
     const err = new Error("signedDelegateAction is not valid base64");
     err.status = 400;
+    err.reason = "bad_base64";
     throw err;
   }
 
@@ -558,6 +700,7 @@ export async function submit(env, body, ip) {
   } catch (e) {
     const err = new Error(String(e.message || e));
     err.status = 400;
+    err.reason = "invalid_delegate";
     throw err;
   }
 
@@ -566,6 +709,7 @@ export async function submit(env, body, ip) {
   if (!(await verifyDelegate(parsed))) {
     const err = new Error("signature does not verify under the sender's public key");
     err.status = 400;
+    err.reason = "bad_signature";
     throw err;
   }
 
@@ -585,11 +729,13 @@ export async function submit(env, body, ip) {
       ? new Error(`${parsed.sender_id} does not own ${senderKeyB58}`)
       : new Error("could not verify the sender's access key — try again");
     err.status = known ? 400 : 503;
+    err.reason = known ? "unknown_sender_key" : "rpc_access_key";
     throw err;
   }
   if (parsed.nonce <= BigInt(senderKey.nonce)) {
     const err = new Error(`delegate nonce ${parsed.nonce} must exceed key nonce ${senderKey.nonce}`);
     err.status = 400;
+    err.reason = "stale_nonce";
     throw err;
   }
 
@@ -599,6 +745,7 @@ export async function submit(env, body, ip) {
   if (BigInt(height) >= parsed.max_block_height) {
     const err = new Error("delegate action has expired (max_block_height behind chain)");
     err.status = 400;
+    err.reason = "expired_delegate";
     throw err;
   }
 
@@ -611,6 +758,7 @@ export async function submit(env, body, ip) {
   if (BigInt(acct.amount) < BALANCE_FLOOR_YOCTO) {
     const err = new Error("relayer balance too low — fund the relayer account");
     err.status = 503;
+    err.reason = "balance_low";
     throw err;
   }
 
@@ -618,6 +766,7 @@ export async function submit(env, body, ip) {
   if (!env.RELAYER_KEY) {
     const err = new Error("RELAYER_KEY is not set");
     err.status = 500;
+    err.reason = "config_key_missing";
     throw err;
   }
   const secret = parseSecretKey(env);
@@ -628,6 +777,7 @@ export async function submit(env, body, ip) {
   } catch {
     const err = new Error("could not reach the relayer's access key — try again");
     err.status = 503;
+    err.reason = "rpc_relayers_key";
     throw err;
   }
   const txB64 = await signDelegateTx({
@@ -643,8 +793,15 @@ export async function submit(env, body, ip) {
   if (!res.ok) {
     const err = new Error(failureReason(res.status) || "broadcast failed");
     err.status = 502;
+    err.reason = "broadcast_failed";
     throw err;
   }
+  /* The creation event: safe identifiers only (link id, tx hash, sender
+     account — all public on chain), never the delegate, args or amounts. */
+  logEvent("submit_ok", {
+    rid, ip, link_id: parsed.args.link_id, sender_id: parsed.sender_id, hash: res.hash,
+    ms: Date.now() - t0,
+  }, env);
   return { ok: true, hash: res.hash };
 }
 
@@ -668,17 +825,29 @@ function corsHeaders(env) {
 /* Build stamp returned by GET / — bump this string on every dashboard paste
    so the deployed code can be identified remotely (the Worker exposes no
    other version signal). Same convention as the frontend's ?v= param. */
-const BUILD = "20261110b";
+const BUILD = "20261110c";
+
+/* Attach an alert delivery to the invocation when a ctx exists (it does in
+   production); tests call the handler without ctx and get a floating promise
+   that cannot break the response either way. */
+const track = (ctx, p) => {
+  if (p && ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
+};
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const cors = corsHeaders(env);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
+      /* Health signal for uptime checks: identity, build and per-isolate
+         counters — aggregate numbers only, never log content or user data. */
       return json(
-        { ok: true, service: "paylink-relayer", contract: env.CONTRACT_ID, account: env.RELAYER_ACCOUNT, build: BUILD },
+        {
+          ok: true, service: "paylink-relayer", contract: env.CONTRACT_ID, account: env.RELAYER_ACCOUNT,
+          build: BUILD, stats: { ...stats },
+        },
         200,
         cors,
       );
@@ -686,42 +855,69 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/submit") {
       const ip = request.headers.get("cf-connecting-ip") || "unknown";
+      const rid = newRid();
+      /* Echoed to the client and stamped on every log line for this request,
+         so a support "it failed" message maps onto exactly one trace. */
+      const rh = { ...cors, "X-Request-Id": rid };
+      stats.submit++;
+      track(ctx, noteVolume(env, rid));
 
       /* Size gates before anything reads the body (the limiter inside
          submit() then runs before decode/signature/RPC), so an invalid
          request costs at most one bounded read + parse. */
       const declared = Number(request.headers.get("Content-Length"));
       if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
-        return json({ error: "request body too large" }, 413, cors);
+        stats.rejected++;
+        logEvent("submit_rejected", { rid, ip, status: 413, reason: "body_too_large", error: "request body too large" }, env);
+        return json({ error: "request body too large" }, 413, rh);
       }
       let raw;
       try {
         raw = await request.text();
       } catch {
-        return json({ error: "invalid JSON body" }, 400, cors);
+        stats.rejected++;
+        logEvent("submit_rejected", { rid, ip, status: 400, reason: "bad_json", error: "invalid JSON body" }, env);
+        return json({ error: "invalid JSON body" }, 400, rh);
       }
       if (raw.length > MAX_BODY_BYTES) {
-        return json({ error: "request body too large" }, 413, cors);
+        stats.rejected++;
+        logEvent("submit_rejected", { rid, ip, status: 413, reason: "body_too_large", error: "request body too large" }, env);
+        return json({ error: "request body too large" }, 413, rh);
       }
       let body;
       try {
         body = JSON.parse(raw);
       } catch {
-        return json({ error: "invalid JSON body" }, 400, cors);
+        stats.rejected++;
+        logEvent("submit_rejected", { rid, ip, status: 400, reason: "bad_json", error: "invalid JSON body" }, env);
+        return json({ error: "invalid JSON body" }, 400, rh);
       }
 
       try {
-        const out = await submit(env, body, ip);
-        return json(out, 200, cors);
+        const out = await submit(env, body, ip, rid);
+        stats.ok++;
+        return json(out, 200, rh);
       } catch (err) {
         const status = err.status || 500;
-        if (status >= 500) console.log("submit error", String(err.message || err));
+        const message = String(err.message || err).slice(0, 300);
+        const reason = err.reason || (status >= 500 ? "internal" : "bad_request");
+        if (status === 429) {
+          stats.rate_limited++;
+          track(ctx, logEvent("rate_limited", { level: "warn", rid, ip, status, retry_after: err.retryAfter, layer: err.rlLayer || "local" }, env));
+        } else if (status >= 500) {
+          stats.errors++;
+          track(ctx, logEvent("service_error", { level: "error", rid, ip, status, reason, error: message }, env));
+          track(ctx, noteErrorBurst(env, rid, status, reason));
+        } else {
+          stats.rejected++;
+          logEvent("submit_rejected", { rid, ip, status, reason, error: message }, env);
+        }
         /* 429 tells the client exactly how long to back off (sliding-window
            expiry in seconds, or the binding's period). */
         const hdrs = status === 429 && err.retryAfter
-          ? { ...cors, "Retry-After": String(err.retryAfter) }
-          : cors;
-        return json({ error: String(err.message || err).slice(0, 300) }, status, hdrs);
+          ? { ...rh, "Retry-After": String(err.retryAfter) }
+          : rh;
+        return json({ error: message }, status, hdrs);
       }
     }
 

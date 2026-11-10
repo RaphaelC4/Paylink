@@ -142,6 +142,29 @@ cross-isolate burst (a single client hitting one isolate trips the local
 layer first, so the 60-second signature normally appears only under load
 spread across instances).
 
+## Monitoring (M-01)
+
+Every operational event is one structured JSON line
+(`{ts, svc, build, level, event, ...}`, build `20261110c`) on stdout —
+readable in Workers → Logs or `wrangler tail`. Each `/submit` response
+carries an `X-Request-Id` echoed in that request's log lines, so a
+"it failed" message maps onto exactly one trace.
+
+- **Events**: `submit_ok`, `submit_rejected` (reason codes such as
+  `bad_signature`, `expired_delegate`, `balance_low`), `rate_limited`,
+  `service_error`, `limiter_backend_error`, plus two alerts:
+  `volume_anomaly` (≥ 120 requests/60 s) and `error_burst` (5 × 5xx in
+  5 min), each once per window.
+- **Never logged**: the delegate bytes, request bodies, or the relayer key
+  (the logger additionally scrubs `ed25519:`/API-key/bearer shapes and caps
+  strings at 240 chars). `GET /` returns a fixed key allowlist —
+  aggregate counters only.
+- **Alert delivery**: log-only by default; set the optional
+  `ALERT_WEBHOOK_URL` secret to have each `level:"alert"` record POSTed to
+  any JSON webhook (free, best-effort, URL never logged).
+- Full event catalog, thresholds, required Cloudflare configuration and
+  open gaps: [`workers/OPERATIONS.md`](../OPERATIONS.md).
+
 ## What it signs with
 
 WebCrypto Ed25519 — the runtime's own `crypto.subtle`, same as the keeper.
