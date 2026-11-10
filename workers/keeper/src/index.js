@@ -84,7 +84,7 @@ const SCAN_PARTIAL_ALERT = 3; // M-01 pattern: alert on the 3rd consecutive part
 const CLAIM_STRIKE_ALERT = 3;
 const SWEEP_OUTAGE_ALERT = 3;
 const SVC = "paylink-keeper";
-const BUILD = "20261110c";
+const BUILD = "20261110d";
 
 /* ────────────────────────────────────────────────────────────── rpc ── */
 
@@ -256,7 +256,11 @@ export function decodeLink(v) {
   const created_at = takeU64();
   const expires_at = takeOpt(takeU64);
   const statusByte = v[o++];
-  const status = ["OPEN", "PAID", "CLAIMED", "EXPIRED"][statusByte] ?? `UNKNOWN_${statusByte}`;
+  /* L-03: the contract's Status enum is OPEN(0), PAID(1), CLAIMED(2),
+     CANCELLED(3), EXPIRED(4). Byte 3 IS stored (cancel_link writes it);
+     Expired is derived on read and never stored, so byte 4 can only come
+     from a hand-made fixture — kept for layout fidelity, not for lookups. */
+  const status = ["OPEN", "PAID", "CLAIMED", "CANCELLED", "EXPIRED"][statusByte] ?? `UNKNOWN_${statusByte}`;
   const paid_by = takeOpt(takeStr);
   const paid_amount = takeOpt(takeU128);
   const paid_at = takeOpt(takeU64);

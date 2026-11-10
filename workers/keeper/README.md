@@ -97,7 +97,7 @@ For a local run, put `KEEPER_KEY=...` and `TICK_SECRET=...` in `.dev.vars`
 ## Monitoring (M-01)
 
 Every event is one structured JSON line (`{ts, svc, build, level, event,
-...}`, build `20261110a`) on stdout — Workers → Logs or `wrangler tail`.
+...}`, build `20261110d`) on stdout — Workers → Logs or `wrangler tail`.
 All lines of one sweep share a `run_id` (also returned by `/tick`), so
 "did the 14:03 run settle it?" is one query.
 

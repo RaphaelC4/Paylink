@@ -46,7 +46,7 @@ function encodeLink(l) {
     ...strB(l.description || ""),
     ...u64b(l.created_at ?? 0),
     ...opt(l.expires_at == null ? null : u64b(l.expires_at)),
-    l.status, // 0 OPEN, 1 PAID, 2 CLAIMED
+    l.status, // 0 OPEN, 1 PAID, 2 CLAIMED, 3 CANCELLED, 4 EXPIRED (never stored)
     ...opt(l.paid_by == null ? null : strB(l.paid_by)),
     ...opt(l.paid_amount == null ? null : u128b(l.paid_amount)),
     ...opt(l.paid_at == null ? null : u64b(l.paid_at)),
@@ -113,10 +113,12 @@ const link = (id, status, extra = {}) => ({
   description: "test",
   created_at: 1_794_000_000_000,
   expires_at: null,
-  status, // 0 OPEN, 1 PAID, 2 CLAIMED
-  paid_by: status >= 1 ? "bob.testnet" : null,
-  paid_amount: status >= 1 ? 1_000_000 : null,
-  paid_at: status >= 1 ? 1_794_000_100_000 : null,
+  status, // 0 OPEN, 1 PAID, 2 CLAIMED, 3 CANCELLED (L-03), 4 EXPIRED
+  /* payment fields exist only while the link was actually paid: a
+     CANCELLED (3) record has none — cancel is pre-payment only */
+  paid_by: status === 1 || status === 2 ? "bob.testnet" : null,
+  paid_amount: status === 1 || status === 2 ? 1_000_000 : null,
+  paid_at: status === 1 || status === 2 ? 1_794_000_100_000 : null,
   claimed_at: status === 2 ? 1_794_000_200_000 : null,
   ...extra,
 });
@@ -396,7 +398,7 @@ const byEvent = (name) => events().filter((e) => e.event === name);
   const keys = Object.keys(body).sort();
   ok(res.status === 200 && JSON.stringify(keys) === JSON.stringify(["account", "build", "contract", "ok", "service"]),
     "GET / body is a fixed key allowlist (no run or user data)");
-  ok(body.build === "20261110c", "GET / reports the build stamp (bump with BUILD)");
+  ok(body.build === "20261110d", "GET / reports the build stamp (bump with BUILD)");
   ok(!JSON.stringify(body).includes("ed25519"), "health output carries no key material");
 }
 
@@ -421,7 +423,7 @@ const byEvent = (name) => events().filter((e) => e.event === name);
   ok(summary && summary.scanned === 1 && summary.claimed === 1 && summary.over_cap === 0
     && typeof summary.ms === "number",
     "sweep_summary carries the run's aggregate outcome and duration");
-  ok(summary && summary.svc === "paylink-keeper" && summary.build === "20261110c"
+  ok(summary && summary.svc === "paylink-keeper" && summary.build === "20261110d"
     && summary.level === "info" && typeof summary.ts === "string",
     "line carries the ts/svc/build/level envelope");
   ok(!hasEvent("unsettled_paid"), "a fully settled run does not warn unsettled_paid");
@@ -830,6 +832,25 @@ const byEvent = (name) => events().filter((e) => e.event === name);
   ok(report.scanned === 1 && JSON.stringify(report.claimed) === '[{"link_id":"good1","hash":"Hash1"}]',
     "the malformed record is skipped; the good PAID link still settles");
   ok(report.failed.length === 0, "a bad value never fails the sweep");
+}
+
+/* 34. L-03 status labels: stored byte 3 is CANCELLED, never EXPIRED */
+{
+  const d3 = decodeLink(encodeLink(link("cxl1", 3)));
+  ok(d3.status === "CANCELLED", "stored byte 3 decodes as CANCELLED (not EXPIRED)");
+  ok(d3.paid_by === null && d3.paid_amount === null && d3.paid_at === null && d3.claimed_at === null,
+    "a cancelled record carries no payment fields");
+  ok(decodeLink(encodeLink(link("exp1", 4))).status === "EXPIRED",
+    "byte 4 keeps the Expired label for enum fidelity (the contract never stores it)");
+  ok(decodeLink(encodeLink(link("unk1", 7))).status === "UNKNOWN_7",
+    "a byte outside the enum still surfaces as UNKNOWN_n");
+
+  reset([link("open3", 0), link("paid3", 1), link("cxl3", 3)], "ok");
+  const report = await captureLogs(() => sweep(ENV));
+  ok(JSON.stringify(report.paid) === '["paid3"]',
+    "a CANCELLED link is scanned but never a claim candidate");
+  ok(broadcasts.length === 1, "cancelled links are never broadcast to");
+  ok(report.scanned === 3, "the cancelled record still decodes cleanly during the scan");
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
