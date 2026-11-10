@@ -17,8 +17,10 @@ POST https://<worker>/submit
      body: { "signedDelegateAction": "<base64 SignedDelegateAction>" }
        -> { "ok": true, "hash": "<transaction hash>" }
        -> { "error": "..." } with 400 (bad input / bad signature),
-          429 (10 per IP per hour), 503 (balance floor or RPC trouble),
-          502 (broadcast rejected)
+          413 (body over 64 KB, rejected before parsing),
+          429 (10 per IP per hour + a durable 10-per-60s burst cap when the
+          RATE_LIMITER binding is provisioned — carries Retry-After),
+          503 (balance floor or RPC trouble), 502 (broadcast rejected)
 ```
 
 Measured on testnet: the payee's balance does not move by one yocto per
@@ -86,6 +88,59 @@ npx wrangler login
 npx wrangler deploy
 npx wrangler secret put RELAYER_KEY    # paste from the keychain file
 ```
+
+## Rate limiting (M-07) — composite, two layers
+
+Every `POST /submit` must pass **both** layers, keyed on the same client IP:
+
+1. **Local sliding window — 10 submissions per IP per hour.** Lives in the
+   Worker's code, needs no service, and always runs: no binding outage or
+   misconfiguration can switch it off (a failure logs and keeps enforcing).
+   It is per isolate, so until layer 2 exists two isolates each allow the
+   hour's quota.
+2. **`RATE_LIMITER` binding — a durable 10-per-60-second burst cap** counted
+   by Cloudflare across isolates (GA; docs call it eventually-consistent
+   *within one location*, so a burst can slightly overshoot). This is the
+   cross-isolate bound the local window cannot provide. It requires a
+   **wrangler deploy** — a dashboard code paste cannot attach bindings, and
+   rate-limit bindings are not visible in the dashboard.
+
+Setup (when you want layer 2 — not required for the Worker to work):
+
+```toml
+# wrangler.toml next to src/index.js — wrangler >= 4.36
+[[ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "2002"   # must be unique per account policy:
+                        # workers sharing a namespace share one counter.
+                        # workers/parse uses 2001 — do NOT reuse it here.
+
+  [ratelimits.simple]
+  limit = 10
+  period = 60           # Cloudflare allows only 10 or 60 seconds —
+                        # a durable "10 per hour" is not expressible,
+                        # which is why layer 1 owns the hourly policy.
+```
+
+Then `npx wrangler deploy` (it will prompt for the vars currently set in the
+dashboard — mirror them exactly — and the `RELAYER_KEY` secret is re-set with
+`npx wrangler secret put RELAYER_KEY`). Until then the paste deployment runs
+layer 1 alone.
+
+Client identity: the `cf-connecting-ip` header, which Cloudflare sets at the
+edge (clients cannot forge it on `workers.dev`); `X-Forwarded-For` and
+friends are ignored on purpose. A missing/blank header shares one `"unknown"`
+bucket — every such request counts against the same 10/hour, so absence can
+never mint a fresh bucket. 429 responses carry `Retry-After` in seconds
+(time until the oldest hour-window hit expires; 60 for a binding refusal).
+
+Verify after provisioning: POST `{}` to `/submit` 11 times in a row — the
+first ten answer 400 (they pass the limiter and fail at body validation,
+touching no RPC) and the 11th answers 429. `Retry-After` near 3600 means the
+hourly local layer capped you; `60` means the durable binding refused a
+cross-isolate burst (a single client hitting one isolate trips the local
+layer first, so the 60-second signature normally appears only under load
+spread across instances).
 
 ## What it signs with
 

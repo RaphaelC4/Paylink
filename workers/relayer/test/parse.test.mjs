@@ -356,7 +356,289 @@ throwsWith(() => parseSignedDelegate(withDeposit(rawCli, 2n ** 128n - 1n), env),
   const res = await worker.fetch(new Request("https://relayer.test/"), env);
   const body = await res.json();
   ok(res.status === 200 && body.ok === true, "GET / still answers ok");
-  ok(body.build === "20261110a", "GET / reports the build stamp (bump with BUILD)");
+  ok(body.build === "20261110b", "GET / reports the build stamp (bump with BUILD)");
+}
+
+/* ═════════════════════════════ M-07: composite rate limiting ═══════
+   Layer 1 = local 10/hour sliding window (always on). Layer 2 = the
+   RATE_LIMITER binding — a durable 10/60s burst cap counted across
+   isolates — when provisioned. Identity = cf-connecting-ip (edge-set);
+   X-Forwarded-For deliberately ignored; missing/blank collapses into the
+   shared "unknown" bucket. Binding denial -> Retry-After 60 (its period);
+   local denial -> seconds until the hour window expires. */
+
+const capture = async (fn) => {
+  try {
+    return { ok: true, value: await fn() };
+  } catch (e) {
+    return { ok: false, err: e };
+  }
+};
+
+const postSubmit = (body, env2, headers = {}) =>
+  worker.fetch(
+    new Request("https://relayer.test/submit", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: typeof body === "string" ? body : JSON.stringify(body),
+    }),
+    env2,
+  );
+
+/* ── below / at / over the local limit, via submit() and via the handler ── */
+{
+  const ip = "203.0.113.60";
+  const statuses = [];
+  for (let i = 0; i < 11; i++) {
+    const r = await capture(() => submit(env, {}, ip));
+    statuses.push(r.ok ? 200 : r.err.status);
+  }
+  ok(statuses.slice(0, 10).every((s) => s === 400),
+    "below the limit: the first 10 pass the limiter (then fail at body validation)");
+  ok(statuses[10] === 429, "the 11th request from one IP -> 429");
+
+  const r11 = await capture(() => submit(env, {}, ip));
+  ok(r11.err && r11.err.status === 429, "429 repeats while the window holds");
+  ok(r11.err && typeof r11.err.retryAfter === "number" && r11.err.retryAfter > 0 && r11.err.retryAfter <= 3600,
+    "429 carries a bounded Retry-After (seconds until window expiry)");
+  ok(r11.err && String(r11.err.message).includes("try again later"),
+    "429 message is generic — no internals");
+
+  const res = await postSubmit({}, env, { "cf-connecting-ip": ip });
+  ok(res.status === 429, "handler surfaces the 429");
+  const ra = Number(res.headers.get("retry-after"));
+  ok(Number.isFinite(ra) && ra > 0 && ra <= 3600, "429 response carries Retry-After in seconds");
+  const b429 = await res.json();
+  ok(typeof b429.error === "string" && !b429.error.includes(ip), "429 body is a safe generic message");
+
+  /* window expiry — advance the clock instead of waiting an hour */
+  const realNow = Date.now;
+  try {
+    Date.now = () => realNow() + 60 * 60 * 1000 + 5_000;
+    const after = await capture(() => submit(env, {}, ip));
+    ok(after.ok === false && after.err.status === 400,
+      "expired window: the same IP is allowed again after an hour (fails only at body validation)");
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+/* ── missing / invalid client identifiers ── */
+{
+  const statuses = [];
+  for (let i = 0; i < 11; i++) {
+    const res = await postSubmit({}, env, {}); // no cf-connecting-ip at all
+    statuses.push(res.status);
+  }
+  ok(statuses.slice(0, 10).every((s) => s === 400) && statuses[10] === 429,
+    "missing client id: one shared unknown bucket, 11th -> 429");
+
+  const blank = await postSubmit({}, env, { "cf-connecting-ip": "   " });
+  ok(blank.status === 429, "blank client id shares that bucket (no fresh bucket per request)");
+}
+
+/* ── spoofing: rotating alternate identity headers cannot mint buckets ── */
+{
+  const ip = "203.0.113.77";
+  const xffs = ["1.1.1.1", "2.2.2.2", "9.9.9.9"];
+  const statuses = [];
+  for (let i = 0; i < 11; i++) {
+    const res = await postSubmit({}, env, {
+      "cf-connecting-ip": ip,
+      "x-forwarded-for": xffs[i % 3],
+      "x-real-ip": `10.0.0.${i}`,
+    });
+    statuses.push(res.status);
+  }
+  ok(statuses.slice(0, 10).every((s) => s === 400) && statuses[10] === 429,
+    "rotating X-Forwarded-For/X-Real-IP cannot mint fresh buckets — one edge IP, one bucket");
+}
+
+/* ── binding layer: refusal, health, keying ── */
+{
+  const denyEnv = { ...env, RATE_LIMITER: { limit: async () => ({ success: false }) } };
+  let r = await capture(() => submit(denyEnv, {}, "203.0.113.61"));
+  ok(r.err && r.err.status === 429 && r.err.retryAfter === 60,
+    "binding refusal -> 429 with the binding's period as Retry-After");
+
+  const keys = [];
+  const goodEnv = {
+    ...env,
+    RATE_LIMITER: {
+      limit: async ({ key }) => {
+        keys.push(key);
+        return { success: true };
+      },
+    },
+  };
+  r = await capture(() => submit(goodEnv, {}, "203.0.113.62"));
+  ok(r.err && r.err.status === 400, "healthy binding never blocks a normal request");
+  ok(keys[0] === "203.0.113.62", "binding is keyed by the same client IP");
+
+  /* The refusal must also reach the WIRE with its header — err.retryAfter ->
+     Retry-After is a handler-level seam submit() alone cannot prove. */
+  const wire = await postSubmit(
+    {},
+    { ...env, RATE_LIMITER: { limit: async () => ({ success: false }) } },
+    { "cf-connecting-ip": "203.0.113.68" },
+  );
+  ok(wire.status === 429, "handler: a binding refusal surfaces as HTTP 429");
+  ok(wire.headers.get("retry-after") === "60",
+    "handler: the binding 429 carries Retry-After: 60 (its period)");
+}
+
+/* ── across separate instances: the durable layer holds where memory cannot
+      (each dynamic import is a fresh module = a simulated second isolate) ── */
+{
+  let n = 0;
+  const sharedKeys = [];
+  const shared = {
+    limit: async ({ key }) => {
+      n++;
+      sharedKeys.push(key);
+      return { success: n <= 10, limit: 10, remaining: Math.max(0, 10 - n) };
+    },
+  };
+  const isoA = await import(new URL("../src/index.js?iso=a", import.meta.url).href);
+  const isoB = await import(new URL("../src/index.js?iso=b", import.meta.url).href);
+  const isoC = await import(new URL("../src/index.js?iso=c", import.meta.url).href);
+  const ipX = "203.0.113.90";
+  const xEnv = { ...env, RATE_LIMITER: shared };
+
+  const aStatuses = [];
+  for (let i = 0; i < 10; i++) {
+    const r = await capture(() => isoA.submit(xEnv, {}, ipX));
+    aStatuses.push(r.ok ? 200 : r.err.status);
+  }
+  ok(aStatuses.every((s) => s === 400), "instance A: its 10 requests pass both layers");
+  ok(sharedKeys.length === 10 && sharedKeys.every((k) => k === ipX),
+    "the shared binding counted every one, keyed by the IP");
+
+  const rB = await capture(() => isoB.submit(xEnv, {}, ipX));
+  ok(rB.err && rB.err.status === 429,
+    "instance B (fresh memory, same binding) is refused — durable across instances");
+
+  const rC = await capture(() => isoC.submit({ ...env }, {}, ipX));
+  ok(rC.err && rC.err.status === 400,
+    "control: without the binding a fresh instance starts a new local window (the gap layer 2 closes)");
+}
+
+/* ── binding backend failure: local layer still caps, loudly ── */
+{
+  const logged = [];
+  const realLog = console.log;
+  console.log = (...args) => {
+    const line = args.join(" ");
+    /* Capture only the Worker's rate-limiter log lines for assertion; let
+       everything else (ok/FAIL lines) print normally. */
+    if (line.includes("rate limiter")) logged.push(line);
+    else realLog(...args);
+  };
+  try {
+    const brokenEnv = {
+      ...env,
+      RATE_LIMITER: {
+        limit: async () => {
+          throw new Error("backend down");
+        },
+      },
+    };
+    const statuses = [];
+    for (let i = 0; i < 11; i++) {
+      const r = await capture(() => submit(brokenEnv, {}, "203.0.113.63"));
+      statuses.push(r.ok ? 200 : r.err.status);
+    }
+    ok(statuses.slice(0, 10).every((s) => s === 400) && statuses[10] === 429,
+      "binding backend down: the local window still caps at 10 — never unlimited");
+    ok(logged.some((l) => l.includes("rate limiter unavailable")),
+      "the binding failure is logged, not silent");
+
+    const weirdEnv = { ...env, RATE_LIMITER: { limit: async () => ({ note: "no success field" }) } };
+    const r = await capture(() => submit(weirdEnv, {}, "203.0.113.64"));
+    ok(r.err && r.err.status === 400,
+      "unexpected binding shape degrades to the local layer (no blanket 429)");
+    ok(logged.some((l) => l.includes("unexpected limit() result")),
+      "the odd shape is logged too");
+  } finally {
+    console.log = realLog;
+  }
+}
+
+/* ── invalid/oversized requests are cheap and clearly rejected ── */
+{
+  let res = await postSubmit({ signedDelegateAction: "A".repeat(70_000) }, env,
+    { "cf-connecting-ip": "203.0.113.65" });
+  ok(res.status === 413, "70 KB body -> 413 before any parsing");
+
+  res = await worker.fetch(
+    new Request("https://relayer.test/submit", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": "99999999",
+        "cf-connecting-ip": "203.0.113.65",
+      },
+      body: "{}",
+    }),
+    env,
+  );
+  ok(res.status === 413, "declared Content-Length over the cap -> 413 before the body is read");
+
+  res = await postSubmit("this is not json", env, { "cf-connecting-ip": "203.0.113.66" });
+  const b = await res.json();
+  ok(res.status === 400 && b.error === "invalid JSON body",
+    "malformed JSON still 400 with the original message");
+}
+
+/* ── legitimate payment creation under the composite limiter ── */
+{
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    throw new Error("network disabled in test");
+  };
+  try {
+    const goodEnv = { ...env, RATE_LIMITER: { limit: async () => ({ success: true }) } };
+    let r = null;
+    try {
+      await submit(goodEnv, { signedDelegateAction: FIX_CLI }, "203.0.113.67");
+    } catch (e) {
+      r = e;
+    }
+    ok(calls >= 1, "legitimate payment creation passes both limiter layers and reaches the RPC");
+    ok(r === null || r.status !== 429, "and is never the request that gets rate-limited");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+/* ── Map overflow: fewest-hit eviction, never a wholesale clear() ──
+   Runs LAST — it permanently fills this module's Map past the 10k bound.
+   The single prune pass (throttled to once a minute) finds every key still
+   live in-window and must evict only the 1-hit flood keys: the heavy
+   10-hit client stays capped. The old hits.clear() rearm'd its full quota,
+   which is the defect this replaced — clear-all fails the last assertion. */
+{
+  const heavy = "198.51.100.200";
+  const setup = [];
+  for (let i = 0; i < 10; i++) {
+    const r = await capture(() => submit(env, {}, heavy));
+    setup.push(r.ok ? 200 : r.err.status);
+  }
+  ok(setup.every((s) => s === 400), "overflow setup: the heavy client spends its full 10/hour");
+
+  const flood = [];
+  for (let i = 0; i < 10_010; i++) {
+    const r = await capture(() => submit(env, {}, `flood-${i}`));
+    flood.push(r.ok ? 200 : r.err.status);
+  }
+  ok(flood.every((s) => s === 400),
+    "10_010 fresh keys push the Map past 10k and fire the throttled prune");
+
+  const after = await capture(() => submit(env, {}, heavy));
+  ok(after.err && after.err.status === 429,
+    "after the prune the heavy client is still capped — eviction, not clear-all");
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

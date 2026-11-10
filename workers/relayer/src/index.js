@@ -27,22 +27,32 @@
  *   - the sender must exist and own the public key that signed, the delegate's
  *     nonce must beat that key's nonce, and max_block_height must still be
  *     ahead of the chain — each of these failing on chain costs us gas.
- * Abuse control, stated at its real strength: a per-IP sliding window
- * (RATE_LIMIT per RATE_WINDOW_MS) and a balance floor — below
+ * Abuse control (M-07), a composite per-IP limiter with no code path around
+ * it: a 10-per-hour sliding window in this isolate's memory (always on) AND,
+ * when the RATE_LIMITER binding is provisioned (setup in README.md), a durable
+ * 10-per-60-second burst cap that Cloudflare counts across isolates. The
+ * binding's period can only be 10 or 60 seconds, which is why the hourly
+ * policy lives in code: the binding bounds bursts across isolates, the local
+ * window bounds the hour per isolate. A missing binding, a throwing binding
+ * or a malformed binding result all degrade to layer 1 with a log line —
+ * bounded and visible, never silently unlimited. Client identity is the
+ * edge-set cf-connecting-ip header (Cloudflare overwrites it at the edge, so
+ * a client cannot forge it on workers.dev; X-Forwarded-For is deliberately
+ * ignored), and a missing or blank header falls into one shared "unknown"
+ * bucket — collision makes the limit stricter, never looser. Below
  * BALANCE_FLOOR_NEAR the Worker refuses rather than spend its last NEAR.
- * Both guards are best-effort, not a hard bound: the per-IP count lives in
- * one isolate's memory, so a second instance allows the full RATE_LIMIT and
- * any restart clears the count, and ALLOWED_ORIGIN only constrains browsers —
- * a script ignores it entirely. The balance floor is therefore the real
- * limit on worst-case drain: an attacker with many free testnet accounts
- * could spend the relayer down to BALANCE_FLOOR_NEAR — several hundred
- * relayed links from a 10 NEAR balance — before it refuses anything. Testnet
- * NEAR only, so nothing of value is at stake; this is a demo guard, not a
- * security guarantee.
+ * ALLOWED_ORIGIN still only constrains browsers — a script ignores it — so
+ * the balance floor remains the real limit on worst-case drain: an attacker
+ * with many free testnet accounts could spend the relayer down to
+ * BALANCE_FLOOR_NEAR — several hundred relayed links from a 10 NEAR balance —
+ * before it refuses anything (per-IP limits cannot bound an attacker who owns
+ * many IPs). Testnet NEAR only, so nothing of value is at stake; this is a
+ * demo guard, not a security guarantee.
  *
  * Secrets:  wrangler secret put RELAYER_KEY     (ed25519, matches RELAYER_ACCOUNT)
  *           wrangler secret put TICK_SECRET     (unused; kept for symmetry)
  * Vars:     RPC_URL, CONTRACT_ID, TOKEN_ID, RELAYER_ACCOUNT, ALLOWED_ORIGIN
+ * Binding:  RATE_LIMITER (optional — durable burst cap, setup in README.md)
  *
  * No Node APIs and no dependencies: one file, deployable straight from the
  * Cloudflare dashboard — same shape as workers/keeper/src/index.js, which is
@@ -80,6 +90,11 @@ const DESC_MAX = 280; // bytes, mirror lib.rs (Rust String::len is bytes)
 const BALANCE_FLOOR_YOCTO = 1_000_000_000_000_000_000_000n; // 1 NEAR
 const RATE_LIMIT = 10;
 const RATE_WINDOW_MS = 60 * 60 * 1000; // 10 submissions per IP per hour
+const BINDING_PERIOD_S = 60; // Retry-After for a binding refusal; matches the [[ratelimits]] period
+/* A signed delegate is ~1 KB of base64; 64 KB is two orders of magnitude of
+   headroom. Invalid or oversized bodies then cost one bounded read + parse —
+   no decode, no signature work, no RPC. */
+const MAX_BODY_BYTES = 64 * 1024;
 /* A payee's expiry must be comfortably in the future: the contract compares
    against its own clock, so a stale delegate would fail on chain (gas burned). */
 const EXPIRY_MARGIN_MS = 30_000;
@@ -429,30 +444,95 @@ function failureReason(f) {
 
 /* ───────────────────────────────────────────────── rate limit ── */
 
-/* Sliding window kept per isolate (Maps die with it). Two isolates each allow
-   the full RATE_LIMIT — acceptable: the balance floor is the hard stop. */
-const hits = new Map();
+/* Composite limiter (M-07) — two layers, both per IP, no global bucket, so
+   no single counter gates every user:
 
-function rateLimited(ip) {
+   1. Local sliding window: RATE_LIMIT per RATE_WINDOW_MS, always enforced —
+      this function is the only caller-visible gate and it cannot be turned
+      off. Entries die with their window; the Map is bounded by an
+      expired-window sweep plus fewest-hit eviction (at most once a minute,
+      against the 10 ms CPU budget) — never a wholesale clear(), so no
+      overflow can hand capped clients their quota back.
+   2. RATE_LIMITER binding ([[ratelimits]] in wrangler.toml, README): a
+      durable 10-per-60s burst cap counted by Cloudflare across isolates —
+      the cross-isolate bound layer 1 cannot provide (its policy window is
+      an hour; the binding's period may only be 10 or 60 seconds, so the
+      hourly policy stays here and the binding caps bursts there). Same key
+      in both layers: one IP is one bucket everywhere.
+
+   Failure semantics: layer 1 needs no service, so limiting is never
+   skipped. A throwing binding logs and continues on layer 1 (bounded, not
+   silently unlimited); an unexpected result shape does the same instead of
+   blanket-429ing every user. Layer 2 only consults after layer 1 passes,
+   so locally-refused requests never consume binding quota. */
+
+const hits = new Map();
+let lastPrune = 0; // throttle: one prune pass at most every PRUNE_INTERVAL_MS
+const PRUNE_INTERVAL_MS = 60_000;
+
+async function rateLimited(env, ip) {
+  /* Normalize at the single choke point (handler and direct submit() callers
+     share it): trim + cap so whitespace/padding variants cannot mint extra
+     buckets, and blank collapses into the shared "unknown" bucket — which is
+     stricter (everyone collides), never looser. */
+  const key = (typeof ip === "string" ? ip : "unknown").trim().slice(0, 64) || "unknown";
+
   const now = Date.now();
-  let list = hits.get(ip) || [];
+  if (hits.size > 10_000 && now - lastPrune >= PRUNE_INTERVAL_MS) {
+    lastPrune = now;
+    /* First drop windows that have already expired — free, exact. */
+    for (const [k, list] of hits) {
+      if (now - list[list.length - 1] >= RATE_WINDOW_MS) hits.delete(k);
+    }
+    /* Still over the bound means >10k genuinely live keys. Evict the
+       fewest-hit ones: rearming one 1-hit key costs at most 1 request of
+       budget, while clear() rearm'd every capped client's full quota. Ties
+       break on the least-recently-hit key, so quiet buckets yield first. */
+    if (hits.size > 10_000) {
+      const overflow = hits.size - 10_000;
+      const order = [...hits.entries()]
+        .sort((a, b) => (a[1].length - b[1].length) || (a[1][a[1].length - 1] - b[1][b[1].length - 1]));
+      for (let i = 0; i < overflow; i++) hits.delete(order[i][0]);
+    }
+  }
+
+  let list = hits.get(key) || [];
   list = list.filter((t) => now - t < RATE_WINDOW_MS);
   if (list.length >= RATE_LIMIT) {
-    hits.set(ip, list);
-    return true;
+    hits.set(key, list);
+    const retryAfter = Math.max(1, Math.ceil((list[0] + RATE_WINDOW_MS - now) / 1000));
+    return { limited: true, retryAfter };
   }
   list.push(now);
-  hits.set(ip, list);
-  if (hits.size > 10_000) hits.clear(); // bound memory; a flood restarts the window
-  return false;
+  hits.set(key, list);
+
+  const limiter = env && env.RATE_LIMITER;
+  if (limiter && typeof limiter.limit === "function") {
+    try {
+      const res = await limiter.limit({ key });
+      if (res && res.success === false) {
+        return { limited: true, retryAfter: BINDING_PERIOD_S };
+      }
+      if (!res || typeof res.success !== "boolean") {
+        console.log("rate limiter: unexpected limit() result — enforcing local window only");
+      }
+    } catch (e) {
+      console.log("rate limiter unavailable:", String((e && e.message) || e).slice(0, 200));
+    }
+  }
+  return { limited: false, retryAfter: 0 };
 }
 
 /* ─────────────────────────────────────────────────── submit ── */
 
 export async function submit(env, body, ip) {
-  if (rateLimited(ip)) {
+  /* First check, before base64 decode, signature verification or any RPC:
+     a rejected or malformed request costs only this call (no network). */
+  const rl = await rateLimited(env, ip);
+  if (rl.limited) {
     const err = new Error("rate limit: try again later");
     err.status = 429;
+    err.retryAfter = rl.retryAfter;
     throw err;
   }
 
@@ -588,7 +668,7 @@ function corsHeaders(env) {
 /* Build stamp returned by GET / — bump this string on every dashboard paste
    so the deployed code can be identified remotely (the Worker exposes no
    other version signal). Same convention as the frontend's ?v= param. */
-const BUILD = "20261110a";
+const BUILD = "20261110b";
 
 export default {
   async fetch(request, env) {
@@ -606,19 +686,42 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/submit") {
       const ip = request.headers.get("cf-connecting-ip") || "unknown";
-      let body;
+
+      /* Size gates before anything reads the body (the limiter inside
+         submit() then runs before decode/signature/RPC), so an invalid
+         request costs at most one bounded read + parse. */
+      const declared = Number(request.headers.get("Content-Length"));
+      if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+        return json({ error: "request body too large" }, 413, cors);
+      }
+      let raw;
       try {
-        body = await request.json();
+        raw = await request.text();
       } catch {
         return json({ error: "invalid JSON body" }, 400, cors);
       }
+      if (raw.length > MAX_BODY_BYTES) {
+        return json({ error: "request body too large" }, 413, cors);
+      }
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return json({ error: "invalid JSON body" }, 400, cors);
+      }
+
       try {
         const out = await submit(env, body, ip);
         return json(out, 200, cors);
       } catch (err) {
         const status = err.status || 500;
         if (status >= 500) console.log("submit error", String(err.message || err));
-        return json({ error: String(err.message || err).slice(0, 300) }, status, cors);
+        /* 429 tells the client exactly how long to back off (sliding-window
+           expiry in seconds, or the binding's period). */
+        const hdrs = status === 429 && err.retryAfter
+          ? { ...cors, "Retry-After": String(err.retryAfter) }
+          : cors;
+        return json({ error: String(err.message || err).slice(0, 300) }, status, hdrs);
       }
     }
 

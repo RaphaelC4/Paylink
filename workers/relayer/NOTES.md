@@ -81,7 +81,12 @@ before spending relayer gas.
   e2e attempt; the second attempt passed.
 - **Balance floor**: below 1 NEAR the Worker answers 503 rather than spending
   its last NEAR on a link nobody can fund twice.
-- **Rate limit**: 10 submissions per IP per hour, 429 beyond it.
+- **Rate limit** (M-07, composite): local **10 submissions per IP per hour**
+  (always on) **plus** — when the `RATE_LIMITER` binding is provisioned (see
+  README) — a durable **10-per-60s burst cap** Cloudflare counts across
+  isolates. 429 carries `Retry-After`. A missing/throwing/malformed binding
+  degrades to the local window with a log line; there is no path that skips
+  limiting entirely.
 - **Expired delegate** (`max_block_height` behind chain): 400 — caught
   pre-broadcast because a doomed delegate still burns relayer gas.
 - The CLI's default testnet RPC (`rpc.testnet.near.org`) no longer resolves in
@@ -95,8 +100,12 @@ The relayer does not re-check on-chain state (link id unused, payee
 registration) beyond the access-key/nonce/expiry checks — those two checks
 exist because they fail *before* execution and still cost gas; a duplicate
 link id fails *inside* `create_link` at the same gas cost as any other panic,
-and the 400/429/503 bounds are best-effort rather than a hard cap: the
-per-IP count is held in one isolate's memory (a second instance allows the
-full quota, a restart clears it) and `ALLOWED_ORIGIN` does not bind
-non-browser clients, so the balance floor — not the rate limit — is what
-actually bounds worst-case drain.
+and the 400/429/503 bounds are layered rather than absolute: since M-07 the
+per-IP limit is a composite — a local 10-per-hour window per isolate (always
+on, no code path skips it) plus a durable 10-per-60s burst cap across
+isolates when the RATE_LIMITER binding is provisioned (README) — so a second
+instance no longer hands out a full fresh hourly quota *when the binding
+exists*, though without it the hourly count is still per isolate, and
+`ALLOWED_ORIGIN` does not bind non-browser clients. Per-IP keys also cannot
+bound an attacker who owns many IPs, so the balance floor — not the rate
+limit — is what actually bounds worst-case drain.
