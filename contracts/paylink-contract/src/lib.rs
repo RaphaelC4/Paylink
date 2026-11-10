@@ -11,6 +11,11 @@
 //! the frontend trigger it the moment a link is paid, so the payee does
 //! nothing.
 //!
+//! Cancellation (L-03): the payee may cancel their own link, but only while it
+//! has never been paid — one status write, no promises, no transfers, no
+//! deposit, no admin. `PAID` and `CLAIMED` links are never cancellable, so
+//! cancellation stays disjoint from settlement and cannot race the keeper.
+//!
 //! Units: all timestamps are **milliseconds since the Unix epoch**. Nanoseconds
 //! (NEAR's native `env::block_timestamp()` unit) overflow JavaScript's
 //! `Number`, which every browser caller would hit, so the boundary converts
@@ -57,6 +62,12 @@ const MIN_LINK_ID_LEN: usize = 4;
 /// `Expired` is never stored: it is derived on read from `expires_at`, so a
 /// link that quietly ages out is reported honestly without a background job
 /// having to rewrite it.
+///
+/// `Cancelled` (L-03) IS stored — written exactly once by
+/// [`Contract::cancel_link`], terminal, reachable only from `Open`. Stored
+/// statuses are therefore 0..=3 (Open, Paid, Claimed, Cancelled); `Expired`
+/// never appears at rest, so records written before L-03 decode
+/// byte-identically and no state migration is needed.
 #[near(serializers = [json, borsh])]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "UPPERCASE")]
@@ -64,6 +75,7 @@ pub enum Status {
     Open,
     Paid,
     Claimed,
+    Cancelled,
     Expired,
 }
 
@@ -259,6 +271,52 @@ impl Contract {
             .entry(creator)
             .or_default()
             .push(link_id.clone());
+        self.links.insert(link_id, link.clone());
+
+        link
+    }
+
+    /// Cancel an unpaid link (L-03). Callable only by the link's creator.
+    ///
+    /// Three guards, in order: the link must exist, the caller must be
+    /// `link.creator` (read from storage, never from arguments), and the
+    /// *stored* status must still be `Open` — so `Paid`, `Claimed` and
+    /// `Cancelled` all panic with `link is not open`, while a link whose
+    /// `expires_at` has passed but which was never paid stays cancellable
+    /// (it still holds no funds).
+    ///
+    /// Deliberately moves no money and schedules no work: non-payable (takes
+    /// no deposit — the record is already paid for and only the creator can
+    /// call this, so there is nothing to spam), no promise, no transfer. The
+    /// 0.01 NEAR creation stake is not returned: refunding it would give the
+    /// contract its first-ever NEAR outflow and let anyone mint stake back
+    /// out of the relayer by create→cancel loops. `Cancelled` is terminal —
+    /// the existing `ft_on_transfer` guard rejects later payments with a
+    /// full refund, and `claim` refuses anything not `Paid`.
+    ///
+    /// Racing the keeper is impossible by construction: the keeper only ever
+    /// claims links whose status is `Paid`, and `Paid` can never reach this
+    /// method (single-receipt execution serialises a contract's receipts, so
+    /// of {cancel, pay} exactly one wins — cancel first and the payment is
+    /// refunded in full, pay first and this call panics).
+    pub fn cancel_link(&mut self, link_id: String) -> Link {
+        let mut link = self
+            .links
+            .get(&link_id)
+            .cloned()
+            .unwrap_or_else(|| env::panic_str("link not found"));
+
+        let predecessor = env::predecessor_account_id();
+        require!(
+            predecessor == link.creator,
+            "only the creator can cancel"
+        );
+        // Stored status, not `effective_status`: an expired-but-unpaid link
+        // is still safe to cancel, and every paid/claimed/cancelled state
+        // is refused here before anything else can happen.
+        require!(link.status == Status::Open, "link is not open");
+
+        link.status = Status::Cancelled;
         self.links.insert(link_id, link.clone());
 
         link
@@ -566,6 +624,13 @@ mod tests {
                 .build()
         );
         let _ = contract.claim(id.to_string());
+    }
+
+    /// Drive `cancel_link` as `caller` would — no deposit: the method is
+    /// non-payable and adds no storage.
+    fn cancel_as(contract: &mut Contract, caller: &str, id: &str) -> Link {
+        testing_env!(ctx(caller).build());
+        contract.cancel_link(id.to_string())
     }
 
     /// Every `(function, json args)` the contract queued toward `receiver`,
@@ -1117,6 +1182,343 @@ mod tests {
     fn claiming_a_missing_link_panics() {
         let mut c = setup();
         claim_as(&mut c, "alice.near", "nope");
+    }
+
+    // ── cancellation (L-03) ──────────────────────────────────────────────
+
+    #[test]
+    fn the_creator_cancels_an_unpaid_link() {
+        let mut c = setup();
+        open_link(&mut c, "alice.near", "lnk-byee");
+
+        let cancelled = cancel_as(&mut c, "alice.near", "lnk-byee");
+        assert_eq!(cancelled.status, Status::Cancelled);
+
+        let fetched = c.get_link("lnk-byee".into()).unwrap();
+        assert_eq!(fetched.status, Status::Cancelled);
+        assert_eq!(
+            fetched.creator,
+            "alice.near".parse::<AccountId>().unwrap(),
+            "cancellation must not rewrite the creator"
+        );
+        assert_eq!(fetched.amount, U128(100), "the amount is untouched");
+        assert!(fetched.paid_by.is_none());
+        assert!(fetched.paid_amount.is_none());
+        assert!(fetched.paid_at.is_none());
+        assert!(fetched.claimed_at.is_none());
+
+        // Over the wire it keeps the existing UPPERCASE convention.
+        let json = near_sdk::serde_json::to_value(&fetched).unwrap();
+        assert_eq!(json["status"], "CANCELLED");
+
+        // The record survives — the contract never deletes, so the creator's
+        // ledger and counts still show it, exactly as they do expired links.
+        let ledger = c.get_links_by_creator("alice.near".parse().unwrap());
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].link_id, "lnk-byee");
+        assert_eq!(ledger[0].status, Status::Cancelled);
+        assert_eq!(c.link_count_by_creator("alice.near".parse().unwrap()), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "only the creator can cancel")]
+    fn an_unrelated_account_cannot_cancel() {
+        let mut c = setup();
+        open_link(&mut c, "alice.near", "lnk-priv");
+        cancel_as(&mut c, "mallory.near", "lnk-priv");
+    }
+
+    #[test]
+    #[should_panic(expected = "only the creator can cancel")]
+    fn the_payer_cannot_cancel_the_link() {
+        let mut c = setup();
+        open_link(&mut c, "alice.near", "lnk-payer");
+        // Bob is the one about to pay this invoice — he still may not cancel it.
+        cancel_as(&mut c, "bob.near", "lnk-payer");
+    }
+
+    #[test]
+    #[should_panic(expected = "only the creator can cancel")]
+    fn the_keeper_cannot_cancel_the_link() {
+        let mut c = setup();
+        open_link(&mut c, "alice.near", "lnk-kpr");
+        cancel_as(&mut c, "keeper.testnet", "lnk-kpr");
+    }
+
+    #[test]
+    #[should_panic(expected = "only the creator can cancel")]
+    fn the_relayer_cannot_cancel_the_link() {
+        let mut c = setup();
+        open_link(&mut c, "alice.near", "lnk-rlr");
+        cancel_as(&mut c, "relayer.testnet", "lnk-rlr");
+    }
+
+    #[test]
+    #[should_panic(expected = "only the creator can cancel")]
+    fn the_fee_account_cannot_cancel() {
+        // No admin path: even the account that collects the fee is nobody here.
+        let mut c = setup();
+        open_link(&mut c, "alice.near", "lnk-fee-no");
+        cancel_as(&mut c, FEE_ACCOUNT, "lnk-fee-no");
+    }
+
+    #[test]
+    #[should_panic(expected = "only the creator can cancel")]
+    fn the_contract_account_cannot_cancel_a_link_it_does_not_own() {
+        // The deployer's account gets no cancellation privilege either.
+        let mut c = setup();
+        open_link(&mut c, "alice.near", "lnk-admin-no");
+        cancel_as(&mut c, CONTRACT, "lnk-admin-no");
+    }
+
+    #[test]
+    #[should_panic(expected = "link not found")]
+    fn cancelling_a_missing_link_panics() {
+        let mut c = setup();
+        cancel_as(&mut c, "alice.near", "nope");
+    }
+
+    #[test]
+    #[should_panic(expected = "link is not open")]
+    fn cancelling_a_second_time_is_refused() {
+        let mut c = setup();
+        open_link(&mut c, "alice.near", "lnk-twice");
+
+        let first = cancel_as(&mut c, "alice.near", "lnk-twice");
+        assert_eq!(first.status, Status::Cancelled, "first cancel succeeds");
+        assert_eq!(
+            c.get_link("lnk-twice".into()).unwrap().status,
+            Status::Cancelled
+        );
+
+        // Terminal: the repeat panics before it can touch anything, so a
+        // double-cancel can never produce a second effect of any kind.
+        cancel_as(&mut c, "alice.near", "lnk-twice");
+    }
+
+    #[test]
+    #[should_panic(expected = "link is not open")]
+    fn a_paid_link_cannot_be_cancelled_before_settlement() {
+        let mut c = setup();
+        open_link(&mut c, "alice.near", "lnk-paid");
+        assert_eq!(pay(&mut c, "bob.near", 100, "lnk-paid"), U128(0));
+
+        // PAID, and nobody has claimed yet — this is exactly the state the
+        // keeper will settle within a minute, and it must be unreachable
+        // by cancellation. (Guards run: creator check passes, status fails.)
+        cancel_as(&mut c, "alice.near", "lnk-paid");
+    }
+
+    #[test]
+    #[should_panic(expected = "link is not open")]
+    fn a_claimed_link_cannot_be_cancelled() {
+        let mut c = setup();
+        open_link(&mut c, "alice.near", "lnk-clmd");
+        pay(&mut c, "bob.near", 100, "lnk-clmd");
+        claim_as(&mut c, "alice.near", "lnk-clmd");
+        cancel_as(&mut c, "alice.near", "lnk-clmd");
+    }
+
+    #[test]
+    #[should_panic(expected = "link is not paid")]
+    fn a_cancelled_link_cannot_be_claimed() {
+        let mut c = setup();
+        open_link(&mut c, "alice.near", "lnk-dead");
+        cancel_as(&mut c, "alice.near", "lnk-dead");
+
+        // `claim` is permissionless, so anyone may try — the status guard
+        // refuses it: a cancelled link is never claimable by anyone.
+        claim_as(&mut c, "keeper.testnet", "lnk-dead");
+    }
+
+    #[test]
+    fn a_cancelled_link_refuses_payment_and_refunds_in_full() {
+        let mut c = setup();
+        open_link(&mut c, "alice.near", "lnk-late");
+        cancel_as(&mut c, "alice.near", "lnk-late");
+
+        // Exact amount: every unit comes straight back to the payer.
+        assert_eq!(pay(&mut c, "bob.near", 100, "lnk-late"), U128(100));
+        // Overpayment too — nothing is ever credited to a cancelled link.
+        assert_eq!(pay(&mut c, "bob.near", 250, "lnk-late"), U128(250));
+
+        let link = c.get_link("lnk-late".into()).unwrap();
+        assert_eq!(link.status, Status::Cancelled, "still cancelled, not paid");
+        assert!(link.paid_by.is_none());
+        assert!(link.paid_amount.is_none());
+    }
+
+    #[test]
+    fn cancellation_moves_no_money_and_schedules_no_promises() {
+        let mut c = setup();
+        open_link_for(&mut c, "alice.near", "lnk-silent", 10_000);
+
+        // Fresh context drops the storage_deposit receipt from create_link,
+        // so anything present afterwards was queued by cancel_link itself.
+        testing_env!(ctx("alice.near").build());
+        let cancelled = c.cancel_link("lnk-silent".into());
+
+        assert!(
+            get_created_receipts().is_empty(),
+            "cancel_link must create no receipts at all — no transfer, \
+             no promise, no storage call"
+        );
+        assert_eq!(cancelled.status, Status::Cancelled);
+        // The record still holds nothing: no payment fields were invented.
+        assert_eq!(cancelled.amount, U128(10_000));
+        assert!(cancelled.paid_by.is_none());
+        assert!(cancelled.paid_amount.is_none());
+        assert!(cancelled.paid_at.is_none());
+        assert!(cancelled.claimed_at.is_none());
+        // The 0.01 NEAR stake is not returned (that would be a NEAR outflow),
+        // and the record is not deleted — the count proves it.
+        assert_eq!(c.link_count_by_creator("alice.near".parse().unwrap()), 1);
+    }
+
+    #[test]
+    fn cancellation_leaves_the_fee_split_untouched() {
+        let mut c = setup();
+
+        // Cancel one invoice first…
+        open_link_for(&mut c, "alice.near", "lnk-f1", 10_000);
+        cancel_as(&mut c, "alice.near", "lnk-f1");
+
+        // …the fee knobs are exactly what they were…
+        assert_eq!(c.fee_bps(), 50);
+        assert_eq!(c.fee_account(), fee_account());
+
+        // …and the very next invoice settles on the old 99.5% / 0.5% maths.
+        open_link_for(&mut c, "alice.near", "lnk-f2", 10_000);
+        pay(&mut c, "bob.near", 10_000, "lnk-f2");
+        claim_as(&mut c, "alice.near", "lnk-f2");
+
+        let transfers: Vec<_> = calls_to(TOKEN)
+            .into_iter()
+            .filter(|(f, _)| f == "ft_transfer")
+            .collect();
+        assert_eq!(transfers.len(), 2, "payout and fee");
+        assert_eq!(transfers[0].1["receiver_id"], "alice.near");
+        assert_eq!(transfers[0].1["amount"], "9950");
+        assert_eq!(transfers[1].1["receiver_id"], FEE_ACCOUNT);
+        assert_eq!(transfers[1].1["amount"], "50");
+    }
+
+    #[test]
+    fn an_expired_but_unpaid_link_can_still_be_cancelled() {
+        let mut c = setup();
+        testing_env!(
+            ctx("alice.near")
+                .attached_deposit(CREATE_STORAGE_STAKE)
+                .block_timestamp(1_000_000_000) // 1000 s, in ns
+                .build()
+        );
+        c.create_link(
+            "lnk-old".into(),
+            U128(100),
+            token(),
+            "late".into(),
+            Some(1_500), // expires at 1500 ms
+        );
+
+        // Past the deadline the link *reports* EXPIRED (derived on read)…
+        testing_env!(ctx("alice.near").block_timestamp(9_000_000_000).build());
+        assert_eq!(
+            c.get_link("lnk-old".into()).unwrap().status,
+            Status::Expired
+        );
+
+        // …but its *stored* status is still Open — never paid, so the
+        // creator may cancel it. The guard reads storage, not the derived view.
+        let cancelled = c.cancel_link("lnk-old".into());
+        assert_eq!(cancelled.status, Status::Cancelled);
+
+        // Reads now report CANCELLED (cancellation outranks the derived
+        // EXPIRED), and a payment arriving afterwards is refunded all the same.
+        testing_env!(ctx("alice.near").block_timestamp(9_000_000_000).build());
+        assert_eq!(
+            c.get_link("lnk-old".into()).unwrap().status,
+            Status::Cancelled
+        );
+
+        testing_env!(ctx(TOKEN).block_timestamp(9_000_000_000).build());
+        assert_eq!(
+            c.ft_on_transfer("bob.near".parse().unwrap(), U128(100), "lnk-old".into()),
+            U128(100)
+        );
+        assert_eq!(
+            c.get_link("lnk-old".into()).unwrap().status,
+            Status::Cancelled
+        );
+    }
+
+    #[test]
+    fn the_settlement_callback_cannot_resurrect_a_cancelled_link() {
+        let mut c = setup();
+        open_link(&mut c, "alice.near", "lnk-res");
+        cancel_as(&mut c, "alice.near", "lnk-res");
+
+        // on_claimed runs as this contract after a claim batch fails. Its
+        // revert branch only fires for a link sitting in Claimed — a
+        // cancelled link was never claimed, so the callback must leave it
+        // dead instead of dragging it back to PAID.
+        testing_env!(ctx(CONTRACT).build());
+        assert!(!c.on_claimed("lnk-res".into(), Err(PromiseError::Failed)));
+        assert_eq!(
+            c.get_link("lnk-res".into()).unwrap().status,
+            Status::Cancelled,
+            "the callback must never move a cancelled link back to PAID"
+        );
+    }
+
+    #[test]
+    fn cancel_and_pay_settle_exactly_one_winner_in_either_order() {
+        let mut c = setup();
+
+        // Order A — cancel first: the later payment is refused wholesale,
+        // and the refund neither reopens nor credits the link.
+        open_link(&mut c, "alice.near", "lnk-race-a");
+        cancel_as(&mut c, "alice.near", "lnk-race-a");
+        assert_eq!(pay(&mut c, "bob.near", 100, "lnk-race-a"), U128(100));
+        assert_eq!(
+            c.get_link("lnk-race-a".into()).unwrap().status,
+            Status::Cancelled
+        );
+
+        // Order B — payment first: the cancel panics, corrupts nothing, and
+        // the link stays exactly as the keeper expects to find it.
+        open_link_for(&mut c, "alice.near", "lnk-race-b", 10_000);
+        assert_eq!(pay(&mut c, "bob.near", 10_000, "lnk-race-b"), U128(0));
+
+        let settled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut c2 = c;
+            testing_env!(ctx("alice.near").build());
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                c2.cancel_link("lnk-race-b".into())
+            }));
+            assert!(
+                attempt.is_err(),
+                "cancel after payment must panic, not win"
+            );
+            assert_eq!(
+                c2.get_link("lnk-race-b".into()).unwrap().status,
+                Status::Paid,
+                "the failed cancel must leave no trace"
+            );
+            c2
+        }));
+        let mut c = settled.expect("only the inner cancel panics, and it is caught");
+
+        // …and it still settles normally: two transfers, 99.5% / 0.5%.
+        claim_as(&mut c, "alice.near", "lnk-race-b");
+        let transfers: Vec<_> = calls_to(TOKEN)
+            .into_iter()
+            .filter(|(f, _)| f == "ft_transfer")
+            .collect();
+        assert_eq!(transfers.len(), 2);
+        assert_eq!(transfers[0].1["receiver_id"], "alice.near");
+        assert_eq!(transfers[0].1["amount"], "9950");
+        assert_eq!(transfers[1].1["receiver_id"], FEE_ACCOUNT);
+        assert_eq!(transfers[1].1["amount"], "50");
     }
 
     // ── reads ────────────────────────────────────────────────────────────

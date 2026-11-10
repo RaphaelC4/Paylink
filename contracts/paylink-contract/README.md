@@ -29,7 +29,7 @@ link fails on undefined references.
 
 ```bash
 cargo test --lib
-#   test result: ok. 38 passed; 0 failed; 0 ignored
+#   test result: ok. 56 passed; 0 failed; 0 ignored
 ```
 
 ## Deploy and initialise
@@ -76,6 +76,7 @@ transfer leg will fail.
 | --- | --- | --- | --- |
 | `new(allowed_tokens, fee_account)` | yes | ≥ 0.02 NEAR per token | the contract account, once |
 | `create_link(link_id, amount, token, description, expires_at)` | yes | ≥ 0.01 NEAR | payee |
+| `cancel_link(link_id)` | no | — (0 yocto) | **the link's creator only** |
 | `ft_on_transfer(sender_id, amount, msg)` | yes | 0 or 1 yocto | **the token contract** |
 | `claim(link_id)` | yes | exactly 1 yocto | anyone |
 | `on_claimed(link_id, result)` | no | — | this contract (private callback) |
@@ -122,6 +123,21 @@ transfer leg will fail.
 - **The payee cannot pay their own link.** When `sender_id` is the link's
   creator, `ft_on_transfer` returns the full amount: the self-payment is
   refunded and the link stays `OPEN` until somebody else pays it.
+- **`cancel_link` is creator-only and pre-payment only (L-03).** The caller
+  must be the stored `creator` (read from state, never from arguments) and the
+  *stored* status must still be `OPEN` — so `PAID`, `CLAIMED` and `CANCELLED`
+  all panic with `link is not open`, while an expired-but-unpaid link (stored
+  `OPEN`, reported `EXPIRED`) can still be cancelled. There is no admin,
+  fee-account, payer, keeper or relayer escape hatch.
+- **Cancellation moves no money and no promises.** The method is non-payable,
+  creates no receipts, transfers nothing, and does not return the 0.01 NEAR
+  creation stake (that would be the contract's first-ever NEAR outflow).
+  `CANCELLED` is terminal: a late payment is refused and refunded in full by
+  the existing `ft_on_transfer` guard, `claim` rejects it, `on_claimed`
+  cannot resurrect it, and the record is kept — not deleted — so counts and
+  keeper scans stay exactly as they were. Because the keeper only ever claims
+  links sitting in `PAID`, cancel and settlement live in disjoint states and
+  cannot race each other.
 
 ## Useful Links
 
