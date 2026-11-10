@@ -65,7 +65,8 @@ jobs:
             frontend/config.js \
             frontend/test/one-approval.test.mjs \
             frontend/test/parse-errors.test.mjs \
-            frontend/test/rpc-retry.test.mjs
+            frontend/test/rpc-retry.test.mjs \
+            frontend/test/relayer-fallback.test.mjs
           do
             if node --check "$f"; then
               echo "ok  node --check $f"
@@ -190,6 +191,9 @@ jobs:
 
       - name: node frontend/test/rpc-retry.test.mjs
         run: node frontend/test/rpc-retry.test.mjs
+
+      - name: node frontend/test/relayer-fallback.test.mjs
+        run: node frontend/test/relayer-fallback.test.mjs
 
   # ── item 9 (parse worker tests) ──────────────────────────────────────────
   parse:

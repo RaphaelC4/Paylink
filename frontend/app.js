@@ -497,7 +497,11 @@ async function callViaRelayer(methodName, args, { deposit = "0", gas = GAS_DEFAU
   /* A POST failure surfaces as an error rather than silently retrying the
      direct path: the signature already exists, and making the payee pay is a
      decision, not a fallback. The Worker answers 400/429/503 with a message
-     that `friendly()` can render as-is. */
+     that `friendly()` can render as-is. The reply's status and message ride
+     along on the error (relayerStatus / relayerMessage) so the create flow
+     can tell a decline from an unconfirmed outcome and ask for consent
+     before any direct transaction (L-08 P5). relayerStatus 0 means no reply
+     arrived at all. */
   let r;
   try {
     r = await fetch(CONFIG.relayer.endpoint, {
@@ -506,12 +510,17 @@ async function callViaRelayer(methodName, args, { deposit = "0", gas = GAS_DEFAU
       body: JSON.stringify({ signedDelegateAction: signed }),
     });
   } catch {
-    throw new Error("Could not reach the relayer. Nothing was sent — your NEAR is untouched.");
+    const e = new Error("Could not reach the relayer. Nothing was sent — your NEAR is untouched.");
+    e.relayerStatus = 0;
+    throw e;
   }
   let j = null;
   try { j = await r.json(); } catch { /* non-JSON reply falls through */ }
   if (!r.ok || !j?.ok) {
-    throw new Error(j?.error || `The relayer replied ${r.status}. Nothing was sent.`);
+    const e = new Error(j?.error || `The relayer replied ${r.status}. Nothing was sent.`);
+    e.relayerStatus = r.status;
+    e.relayerMessage = j?.error || null;
+    throw e;
   }
   return j.hash;
 }
@@ -612,6 +621,249 @@ function paintPayTo() {
   }
 }
 
+/* ── relayer outage → chain check → consent → direct fallback (L-08 P5) ── */
+
+/* What a failed relayer POST proves about the request. A 4xx is the relayer
+   DECIDING about it — validation, signature, nonce, rate limit — so the
+   request never got near a broadcast, but a direct retry would repeat
+   whatever was wrong (and a 429 must never be bypassed): declined outright.
+   A "balance too low" 503 is the relayer's own funding, not the creator's —
+   also declined, because insufficient balance is not a fallback trigger.
+   Everything else — a dropped connection, any other 5xx, an unreadable
+   body — proves nothing about whether the transaction was broadcast: those
+   outcomes are resolved against the chain before anything is offered. */
+function relayerEligibility(err) {
+  const status = err?.relayerStatus;
+  if (typeof status !== "number") return "unconfirmed"; // no reply arrived
+  if (status >= 400 && status < 500) return "declined";
+  if (status >= 500 && /balance too low/.test(String(err.relayerMessage || err.message || ""))) {
+    return "declined";
+  }
+  return "unconfirmed";
+}
+
+/* The chain is the only authority on whether the link exists. One read at
+   finality through the existing view path — absent / ours / someone else's
+   / unreadable — and it never writes anything. "ours" means the relayer's
+   transaction DID land and only its response was lost. */
+async function checkCreated(linkId) {
+  try {
+    const link = await V.getLink(linkId);
+    if (!link) return "absent";
+    return link.creator === accountId ? "ours" : "occupied";
+  } catch {
+    return "unknown";
+  }
+}
+
+/* The consent dialog. Resolves true only for an explicit "Create directly"
+   click; false for Cancel, the veil or Escape; null when the dialog itself
+   is unavailable. Only true may ever lead to a direct transaction — false
+   means stop, null means the outcome stays unknown (P5 §2: never switch
+   to direct creation automatically). */
+function askDirectCreate() {
+  return new Promise((resolve) => {
+    const sheet = $("#fallbackSheet");
+    if (!sheet) return resolve(null);
+    const answer = (v) => {
+      sheet.hidden = true;
+      $("#fallbackDirect")?.removeEventListener("click", yes);
+      $("#fallbackCancel")?.removeEventListener("click", no);
+      sheet.removeEventListener("click", outside);
+      document.removeEventListener("keydown", esc);
+      resolve(v);
+    };
+    const yes = () => answer(true);
+    const no = () => answer(false);
+    const outside = (e) => { if (e.target === sheet) answer(false); };
+    const esc = (e) => { if (e.key === "Escape") answer(false); };
+    $("#fallbackDirect").addEventListener("click", yes);
+    $("#fallbackCancel").addEventListener("click", no);
+    sheet.addEventListener("click", outside);
+    document.addEventListener("keydown", esc);
+    sheet.hidden = false;
+    $("#fallbackDirect")?.focus();
+  });
+}
+
+/* An outcome the chain could not confirm: say so plainly and offer a
+   re-check — never a second transaction. The context is kept so "Check
+   again" resumes exactly where the flow stopped, with the SAME link id and
+   the same parameters. */
+let unresolvedCreate = null;
+
+function showUnknown(line) {
+  line.className = "tx-line pending";
+  line.innerHTML =
+    "We could not confirm whether your link was created — nothing new was sent. " +
+    `<button class="btn btn-sm" type="button" data-recheck-create><span>Check again</span></button>`;
+}
+
+/* The success state, shared by a fresh create and a resumed check: no hash
+   is ever fabricated — when the chain (not a relayer reply) confirmed the
+   creation, the line says so without a fake explorer link. */
+async function finishCreated(hash, ctx) {
+  unresolvedCreate = null;
+  ctx.line.className = "tx-line ok";
+  ctx.line.innerHTML = hash
+    ? `created · <a class="mono" href="${CONFIG.explorer}/transactions/${hash}" target="_blank" rel="noopener">${truncate(hash, 12, 8)}</a>`
+    : "created · your link is ready";
+  toast("Link created");
+  ctx.form.reset();
+  paintPayTo();
+  await openReady(ctx.linkId);
+}
+
+function renderCreateError(err, ctx) {
+  const msg = friendly(err);
+  ctx.line.className = "tx-line err";
+  ctx.line.textContent = msg;
+  toast(msg);
+}
+
+/* "Check again": re-check the SAME link id against the chain — no relayer
+   re-POST, no new id, no transaction unless the creator is asked again. */
+function retryUnknownCreate() {
+  if (!unresolvedCreate) return null;
+  const ctx = unresolvedCreate;
+  unresolvedCreate = null;
+  return resumeUnconfirmed(ctx);
+}
+
+async function resumeUnconfirmed(ctx) {
+  try {
+    const outcome = await resolveRelayerFailure(new Error("outcome unconfirmed"), ctx);
+    if (outcome === "pending" || outcome === "cancelled") return outcome;
+    await finishCreated(outcome, ctx);
+    return outcome;
+  } catch (err) {
+    renderCreateError(err, ctx);
+    return "error";
+  } finally {
+    ctx.label.textContent = "Create link";
+    if (!unresolvedCreate) ctx.btn.disabled = false;
+  }
+}
+
+/* A failed relayer request, resolved to a terminal state:
+   "pending"   — the outcome is unknown; "Check again" owns the line and no
+                 transaction has been made;
+   "cancelled" — the creator declined; nothing was created;
+   <hash|null> — a transaction hash, or null when the chain itself confirmed
+                 the creation (the relayer's reply was simply lost). */
+async function resolveRelayerFailure(err, ctx) {
+  const { line } = ctx;
+  if (relayerEligibility(err) === "declined") throw err; // rendered by performCreate, exactly as before
+
+  /* Ambiguous outcome: establish the truth on chain first (P5 §3-4). The
+     contract refuses a duplicate link id ("link id already used"), so even
+     the race where the relayer's broadcast lands while this dialog is open
+     cannot produce a second invoice — at worst the direct transaction
+     reverts and the chain check below turns it into the true outcome. */
+  const state = await checkCreated(ctx.linkId);
+  if (state === "ours") return null;      // the relayer DID create it
+  if (state === "occupied") throw new Error("link id already used — that id belongs to a different link");
+  if (state === "unknown") {
+    unresolvedCreate = ctx;
+    showUnknown(line);
+    return "pending";
+  }
+
+  /* The chain proves no link exists: now — and only now — may the creator
+     choose the direct route, with the cost spelled out in the dialog. */
+  const consent = await askDirectCreate();
+  if (consent === null) {
+    /* No dialog: the outcome can never be established safely this way, so
+       it stays unknown — an automatic direct switch is exactly what P5
+       forbids. */
+    unresolvedCreate = ctx;
+    showUnknown(line);
+    return "pending";
+  }
+  if (!consent) {
+    line.className = "tx-line";
+    line.textContent = "Creation cancelled — nothing was sent. This link was not created.";
+    toast("Creation cancelled");
+    return "cancelled";
+  }
+  /* The dialog is a multi-second window: the relayer's broadcast may have
+     landed while the creator was deciding. Re-check now — catching it here
+     turns the likely race into a free success instead of a reverted tx and
+     wasted gas. The contract's duplicate refusal stays the backstop for
+     anything that lands after this line (P5 §4). */
+  const settled = await checkCreated(ctx.linkId);
+  if (settled === "ours") return null;
+  if (settled === "occupied") throw new Error("link id already used — that id belongs to a different link");
+  if (settled === "unknown") {
+    unresolvedCreate = ctx;
+    showUnknown(line);
+    return "pending";
+  }
+  try {
+    return await call("create_link", ctx.args, { deposit: CREATE_STAKE });
+  } catch (directErr) {
+    if (/link id already used/.test(String(directErr?.message || directErr))) {
+      /* The relayer's transaction landed while we were deciding. The
+         contract's duplicate refusal is what keeps this safe; re-read so the
+         user sees what actually happened instead of a false failure. */
+      const after = await checkCreated(ctx.linkId);
+      if (after === "ours") return null;
+      if (after === "unknown") {
+        unresolvedCreate = ctx;
+        showUnknown(line);
+        return "pending";
+      }
+      throw new Error("link id already used — that id belongs to a different link");
+    }
+    throw directErr;
+  }
+}
+
+/* One creation attempt from the pending line onward — called by handleCreate.
+   ("Check again" does NOT come back here: it re-checks the chain through
+   resumeUnconfirmed, so an unresolved outcome can never re-POST to the
+   relayer or mint a new link id.) */
+async function performCreate(ctx) {
+  const { args, linkId, line, btn, label, form } = ctx;
+  line.hidden = false;
+  line.className = "tx-line pending";
+  line.textContent = `signing create_link(${linkId})…`;
+  btn.disabled = true;
+  label.textContent = "Creating link…";
+
+  try {
+    let hash;
+    /* Relayer first, gated on deploy state (empty endpoint = direct, exactly
+       as before). The wallet must advertise signDelegateActions — wallets
+       that cannot sign delegates fall back to the direct transaction, where
+       the payee pays gas + stake (the corner case, not the default). */
+    if (CONFIG.relayer.endpoint) {
+      const relayerWallet = await connector.wallet();
+      if (typeof relayerWallet.signDelegateActions === "function") {
+        try {
+          hash = await callViaRelayer("create_link", args, { deposit: CREATE_STAKE });
+        } catch (relayerErr) {
+          const outcome = await resolveRelayerFailure(relayerErr, ctx);
+          if (outcome === "pending" || outcome === "cancelled") return;
+          hash = outcome; // hash, or null when the chain confirmed creation
+        }
+      } else {
+        hash = await call("create_link", args, { deposit: CREATE_STAKE });
+      }
+    } else {
+      hash = await call("create_link", args, { deposit: CREATE_STAKE });
+    }
+    await finishCreated(hash, ctx);
+  } catch (err) {
+    renderCreateError(err, ctx);
+  } finally {
+    label.textContent = "Create link";
+    /* While an outcome is unresolved the create button stays disabled: the
+       way forward is "Check again" with the same id, not a new link. */
+    if (!unresolvedCreate) btn.disabled = false;
+  }
+}
+
 async function handleCreate(e) {
   e.preventDefault();
   const form = e.currentTarget;
@@ -649,44 +901,14 @@ async function handleCreate(e) {
     expires_at: expiresAt,
   };
 
-  const line = $("#createResult");
-  const btn = $("#createBtn");
-  const label = btn.querySelector("span");
-  line.hidden = false;
-  line.className = "tx-line pending";
-  line.textContent = `signing create_link(${linkId})…`;
-  btn.disabled = true;
-  label.textContent = "Creating link…";
-
-  try {
-    /* Relayer first, gated on deploy state (empty endpoint = direct, exactly
-       as before). The wallet must advertise signDelegateActions — wallets
-       that cannot sign delegates fall back to the direct transaction, where
-       the payee pays gas + stake (the corner case, not the default). */
-    let hash;
-    if (CONFIG.relayer.endpoint) {
-      const relayerWallet = await connector.wallet();
-      hash = typeof relayerWallet.signDelegateActions === "function"
-        ? await callViaRelayer("create_link", args, { deposit: CREATE_STAKE })
-        : await call("create_link", args, { deposit: CREATE_STAKE });
-    } else {
-      hash = await call("create_link", args, { deposit: CREATE_STAKE });
-    }
-    line.className = "tx-line ok";
-    line.innerHTML = `created · <a class="mono" href="${CONFIG.explorer}/transactions/${hash}" target="_blank" rel="noopener">${truncate(hash, 12, 8)}</a>`;
-    toast("Link created");
-    form.reset();
-    paintPayTo();
-    await openReady(linkId);
-  } catch (err) {
-    const msg = friendly(err);
-    line.className = "tx-line err";
-    line.textContent = msg;
-    toast(msg);
-  } finally {
-    btn.disabled = false;
-    label.textContent = "Create link";
-  }
+  await performCreate({
+    args,
+    linkId,
+    line: $("#createResult"),
+    btn: $("#createBtn"),
+    label: $("#createBtn").querySelector("span"),
+    form,
+  });
 }
 
 /* ─────────────────────────────────────────────────── share / ready page ── */
@@ -2222,6 +2444,11 @@ function wire() {
 
     const retryReady = e.target.closest("[data-retry-ready]");
     if (retryReady) { renderReady(retryReady.dataset.retryReady); return; }
+
+    /* Unresolved create outcome (L-08 P5): re-check the SAME link id —
+       never start a new one. */
+    const recheck = e.target.closest("[data-recheck-create]");
+    if (recheck) { retryUnknownCreate(); return; }
 
     const payBtn = e.target.closest("[data-pay]");
     if (payBtn) { payLink(payBtn.dataset.pay); return; }

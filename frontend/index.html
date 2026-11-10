@@ -400,9 +400,30 @@
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
+<!-- Relayer-outage consent (L-08 P5): shown ONLY after a relayer request
+     failed and the chain confirmed the link was not created. The direct
+     route is never taken silently — here the creator's wallet pays the
+     0.01 NEAR stake and the gas, so the creator decides. app.js wires the
+     two buttons in askDirectCreate(); Cancel (or veil/Escape) ends the
+     attempt without any transaction. -->
+<div class="sheet" id="fallbackSheet" role="dialog" aria-modal="true" aria-labelledby="fallbackTitle" hidden>
+  <div class="sheet-panel">
+    <div class="sheet-head">
+      <h3 id="fallbackTitle">Create this link directly?</h3>
+    </div>
+    <div class="tech-body">
+      <p>Paylink's relayer is temporarily unavailable. You can still create this payment link directly with your NEAR wallet. Your wallet will pay the required 0.01 NEAR stake and transaction gas. Would you like to continue?</p>
+      <div class="pay-actions">
+        <button class="btn" type="button" id="fallbackDirect"><span>Create directly</span></button>
+        <button class="btn ghost" type="button" id="fallbackCancel"><span>Cancel</span></button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- defer keeps it off the critical path but preserves execution order ahead
      of the module below, so window.qrcode exists when app.js renders. -->
 <script defer src="vendor/qrcode.js"></script>
-<script type="module" src="app.js?v=20261109a"></script>
+<script type="module" src="app.js?v=20261110a"></script>
 </body>
 </html>

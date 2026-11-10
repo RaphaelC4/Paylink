@@ -274,9 +274,14 @@ creator is the payee exactly as with a direct transaction — no contract change
 Measured on testnet: the payee's balance does not move by one yocto; the relayer
 pays the stake and gas. The frontend takes this path whenever
 `CONFIG.relayer.endpoint` is set and the wallet offers `signDelegateActions`
-(Meteor Wallet does); otherwise it falls back to the direct transaction, and a
-failed relayer POST surfaces as an error rather than silently making the payee
-pay. `workers/relayer/test/parse.test.mjs` (173 assertions) runs the parser,
+(Meteor Wallet does); otherwise it falls back to the direct transaction. A
+failed relayer POST never switches paths silently: the flow first confirms
+against the chain that the link was not created, then offers an explicit
+choice — **Create directly** (the creator's wallet pays the 0.01 NEAR stake
+and the gas) or **Cancel** — and an outcome the chain cannot confirm shows
+*Check again* instead of a second transaction, reusing the original link id
+so a late-landing relayer transaction can never become a duplicate invoice.
+`workers/relayer/test/parse.test.mjs` (173 assertions) runs the parser,
 validator and tx builder against the two real signed fixtures.
 
 ---
@@ -515,6 +520,7 @@ node workers/keeper/test/sweep.test.mjs     # 178 assertions: settlement, retry,
 node frontend/test/one-approval.test.mjs    # 26 assertions: one payer approval only
 node frontend/test/parse-errors.test.mjs    # 48 assertions: parse errors + L-06 timeout
 node frontend/test/rpc-retry.test.mjs       # 23 assertions: one read retry, never for writes
+node frontend/test/relayer-fallback.test.mjs # 120 assertions: relayer outage → chain check → consent → direct
 
 # build the wasm with its NEP-330 ABI embedded
 cargo near build non-reproducible-wasm --abi-features near-sdk/unit-testing
