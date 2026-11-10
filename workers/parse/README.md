@@ -11,10 +11,27 @@ POST https://<worker>/
 
 200 { "amount": "400", "token": "USDC", "payee": "chidi.testnet",
       "description": "Logo work", "expires_in_hours": 72 }
-400/413/415/422/502 { "error": "..." }
+400/403/404/405/413/415/422/429/502/504 { "error": "..." }
 ```
 
-Limits: 4,000 characters of text, or a 3.5 MB file (PDF, PNG, JPEG, WebP).
+Limits: 4,000 characters of text, or a 3.5 MB file (PDF, PNG, JPEG, WebP);
+5.5 MB request body; **10 requests/minute per IP** (then `429` with
+`Retry-After`); a present `Origin` header must equal `ALLOWED_ORIGIN` (`403`);
+the Gemini call is aborted after 15 s (`504`).
+
+Status codes: `400` malformed input (bad JSON, non-object body, missing
+text/file, junk base64) · `403` origin mismatch · `404` wrong path · `405`
+not POST · `413` body/text/file too large · `415` wrong content type or file
+type · `422` unusable model reading · `429` rate limited · `502` Gemini
+unreachable/bad response · `504` Gemini timed out. Every one of them is a
+JSON `{ "error": "..." }` string that never contains the API key, the prompt
+or a stack trace.
+
+Rate limiting is durable via the `RATE_LIMITER` binding declared in
+`wrangler.toml`. If you deploy by **pasting the code in the dashboard**, the
+binding cannot attach — the Worker then uses its in-code per-isolate window
+(same 10/min policy, ceiling multiplied by isolate count). Run
+`npx wrangler deploy` to get the Cloudflare-counted version.
 
 ## Deploy without installing anything
 

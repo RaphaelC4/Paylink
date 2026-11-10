@@ -12,3 +12,16 @@ GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 # The key itself is a secret, never a var:
 #   npx wrangler secret put GEMINI_API_KEY
+
+# Durable rate limiting (M-02): 10 requests / 60 s per IP, counted by
+# Cloudflare across isolates (the in-code window is only the fallback for
+# dashboard-paste deploys, which cannot attach bindings). Applied by
+# `wrangler deploy` only — the name must match env.RATE_LIMITER in the code,
+# and namespace_id must be unique within the account. period must be 10 or 60.
+[[ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "2001"
+
+  [ratelimits.simple]
+  limit = 10
+  period = 60
