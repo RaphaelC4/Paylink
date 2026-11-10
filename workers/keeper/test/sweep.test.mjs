@@ -8,7 +8,7 @@
  */
 
 import { generateKeyPairSync } from "node:crypto";
-import worker, { sweep, decodeLink, parseSecretKey, logEvent } from "../src/index.js";
+import worker, { sweep, decodeLink, parseSecretKey, logEvent, formatYoctoNEAR } from "../src/index.js";
 
 let passed = 0;
 let failed = 0;
@@ -241,7 +241,13 @@ function parseTx(b64tx) {
   const argsLen = b.readUInt32LE(o); o += 4;
   const args = b.subarray(o, o + argsLen).toString("utf8"); o += argsLen;
   const gas = Number(b.readBigUInt64LE(o)); o += 8;
-  const deposit = b.readBigUInt64LE(o); o += 16;
+  /* deposit is a borsh u128: LOW limb then HIGH limb (L-02 — reading one
+     limb would truncate anything >= 2^64; the keeper only ever attaches
+     1 yocto, but the reader must be correct regardless) */
+  const depositLo = b.readBigUInt64LE(o);
+  const depositHi = b.readBigUInt64LE(o + 8);
+  o += 16;
+  const deposit = depositLo + (depositHi << 64n);
   return { signer, nonce, receiver, nActions, actionTag, method, args, gas, deposit };
 }
 
@@ -390,7 +396,7 @@ const byEvent = (name) => events().filter((e) => e.event === name);
   const keys = Object.keys(body).sort();
   ok(res.status === 200 && JSON.stringify(keys) === JSON.stringify(["account", "build", "contract", "ok", "service"]),
     "GET / body is a fixed key allowlist (no run or user data)");
-  ok(body.build === "20261110b", "GET / reports the build stamp (bump with BUILD)");
+  ok(body.build === "20261110c", "GET / reports the build stamp (bump with BUILD)");
   ok(!JSON.stringify(body).includes("ed25519"), "health output carries no key material");
 }
 
@@ -415,7 +421,7 @@ const byEvent = (name) => events().filter((e) => e.event === name);
   ok(summary && summary.scanned === 1 && summary.claimed === 1 && summary.over_cap === 0
     && typeof summary.ms === "number",
     "sweep_summary carries the run's aggregate outcome and duration");
-  ok(summary && summary.svc === "paylink-keeper" && summary.build === "20261110b"
+  ok(summary && summary.svc === "paylink-keeper" && summary.build === "20261110c"
     && summary.level === "info" && typeof summary.ts === "string",
     "line carries the ts/svc/build/level envelope");
   ok(!hasEvent("unsettled_paid"), "a fully settled run does not warn unsettled_paid");
@@ -728,6 +734,102 @@ const byEvent = (name) => events().filter((e) => e.event === name);
   ok(parseTx(broadcasts[1]).nonce === 43, "the recovery claim uses the fresh nonce");
   ok(hasEvent("claim_failed", "i1") && hasEvent("claim_successful", "i2"),
     "both outcomes logged");
+}
+
+/* ════════════════════ L-02: u128 decode + yoctoNEAR display ═══════════
+   borsh u128 = 16 bytes little-endian, LOW limb first — confirmed against
+   live view_state bytes (demo-004's amount sits at offset 37 as 25000000
+   with a zeroed high limb) and it is the layout the relayer's ru128
+   already reads. Pre-L-02 takeU128 returned only the low limb, so any
+   value >= 2^64 decoded as its low 64 bits. Field offsets, the claim path
+   and settlement are untouched: only the decoded value and its display
+   are corrected. */
+
+/* 29. both limbs decode: zero, small, the 2^64 boundary, u128::MAX */
+{
+  const U128_MAX = (1n << 128n) - 1n;
+  const cases = [
+    ["zero", 0n, "0"],
+    ["one", 1n, "1"],
+    ["the live amount (high limb zero)", 25000000n, "25000000"],
+    ["2^64-1 (top of the low limb)", (1n << 64n) - 1n, "18446744073709551615"],
+    ["2^64 (first value needing the high limb)", 1n << 64n, "18446744073709551616"],
+    ["2^64+7 (pre-L-02 showed just 7)", (1n << 64n) + 7n, "18446744073709551623"],
+    ["10^30", 10n ** 30n, "1000000000000000000000000000000"],
+    ["u128::MAX", U128_MAX, "340282366920938463463374607431768211455"],
+  ];
+  for (const [label, amount, want] of cases) {
+    const d = decodeLink(encodeLink(link("amt1", 0, { amount })));
+    ok(d.amount === want, `amount ${label} decodes exactly: ${want}`);
+  }
+  const paid = decodeLink(encodeLink(link("amt2", 1, { amount: 1n, paid_amount: U128_MAX })));
+  ok(paid.paid_amount === "340282366920938463463374607431768211455",
+    "the optional paid_amount path reads both limbs too");
+  ok(paid.amount === "1" && paid.status === "PAID" && paid.paid_by === "bob.testnet",
+    "field alignment after a full-width u128 is intact (status/paid_by land right)");
+}
+
+/* 30. wire format: low limb first, high limb second — the exact RPC bytes */
+{
+  const raw = encodeLink(link("amt3", 0, { amount: (1n << 64n) + 7n }));
+  const off = 4 + te.encode("amt3").length + 4 + te.encode("alice.testnet").length;
+  const dv = new DataView(raw.buffer, raw.byteOffset, raw.length);
+  ok(dv.getBigUint64(off, true) === 7n, "bytes 0..8 of the u128 are the LOW limb (7)");
+  ok(dv.getBigUint64(off + 8, true) === 1n, "bytes 8..16 are the HIGH limb (1) — order is lo-then-hi");
+  const live = Uint8Array.from(Buffer.from(PROD_VAL, "base64"));
+  const ldv = new DataView(live.buffer, live.byteOffset, live.length);
+  const loff = 4 + "demo-004".length + 4 + "paylink-payee.testnet".length;
+  ok(ldv.getBigUint64(loff, true) === 25000000n, "live view_state record: low limb = 25000000");
+  ok(ldv.getBigUint64(loff + 8, true) === 0n, "live view_state record: high limb = 0 (RPC serves lo-then-hi)");
+}
+
+/* 31. settlement preserved with a > 2^64 amount: discovered, claimed once, 1 yocto */
+{
+  reset([link("bigamt", 1, { amount: (1n << 64n) + 7n })], "ok");
+  const report = await captureLogs(() => sweep(ENV));
+  ok(report.scanned === 1 && JSON.stringify(report.claimed) === '[{"link_id":"bigamt","hash":"Hash1"}]',
+    "a PAID link with a >2^64 amount is discovered and claimed exactly once");
+  ok(parseTx(broadcasts[0]).deposit === 1n, "settlement unchanged: the claim still attaches exactly 1 yoctoNEAR");
+}
+
+/* 32. formatYoctoNEAR: zero, one yocto, one NEAR, >64-bit, u128::MAX, junk */
+{
+  const U128_MAX = (1n << 128n) - 1n;
+  ok(formatYoctoNEAR(0n) === "0", "0 yocto -> \"0\"");
+  ok(formatYoctoNEAR(1n) === "0.000000000000000000000001", "one yoctoNEAR -> all 24 decimal places");
+  ok(formatYoctoNEAR(10n ** 24n) === "1", "exactly one NEAR");
+  ok(formatYoctoNEAR(10n ** 24n + 1n) === "1.000000000000000000000001", "one NEAR + one yocto");
+  ok(formatYoctoNEAR(15n * 10n ** 23n) === "1.5", "1.5 NEAR — trailing zeros trimmed");
+  ok(formatYoctoNEAR(10n ** 30n) === "1000000", "10^30 yocto = 1 000 000 NEAR");
+  ok(formatYoctoNEAR(1n << 64n) === "0.000018446744073709551616", "2^64 yocto formats exactly (past 2^53)");
+  ok(formatYoctoNEAR((1n << 64n) + 7n) === "0.000018446744073709551623", "2^64+7 yocto — no Number rounding");
+  ok(formatYoctoNEAR("1000000000000000000000000") === "1", "canonical RPC decimal-string input");
+  ok(formatYoctoNEAR(U128_MAX) === "340282366920938.463463374607431768211455",
+    "u128::MAX yocto -> the full-supply NEAR figure, exact");
+  const throws = (fn) => { try { fn(); return false; } catch { return true; } };
+  ok(throws(() => formatYoctoNEAR("abc")) && throws(() => formatYoctoNEAR("-1")) && throws(() => formatYoctoNEAR("007")),
+    "malformed strings are rejected, never guessed");
+  ok(throws(() => formatYoctoNEAR(1.5)) && throws(() => formatYoctoNEAR(100)) && throws(() => formatYoctoNEAR(null)),
+    "Numbers are rejected outright — no silent precision loss");
+  ok(throws(() => formatYoctoNEAR(U128_MAX + 1n)) && throws(() => formatYoctoNEAR(-1n)),
+    "values outside 0..u128::MAX are rejected");
+}
+
+/* 33. malformed RPC values: truncated or garbage records are skipped, never claimed */
+{
+  const full = encodeLink(link("cut1", 1, { amount: (1n << 64n) + 7n }));
+  const cutAt = 4 + te.encode("cut1").length + 4 + te.encode("alice.testnet").length + 10; // inside the amount
+  ok(cutAt < full.length, "fixture truncates inside the u128 amount");
+  let threw = false;
+  try { decodeLink(full.subarray(0, cutAt)); } catch { threw = true; }
+  ok(threw, "a record cut inside the u128 throws instead of decoding garbage");
+
+  reset([link("good1", 1)], "ok");
+  injections.set(pfx(0x6c), [{ key: keyFor("bad1"), value: btoa("AQID") }]); // 3 raw bytes on the same page
+  const report = await captureLogs(() => sweep(ENV));
+  ok(report.scanned === 1 && JSON.stringify(report.claimed) === '[{"link_id":"good1","hash":"Hash1"}]',
+    "the malformed record is skipped; the good PAID link still settles");
+  ok(report.failed.length === 0, "a bad value never fails the sweep");
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

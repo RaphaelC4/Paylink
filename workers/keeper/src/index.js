@@ -84,7 +84,7 @@ const SCAN_PARTIAL_ALERT = 3; // M-01 pattern: alert on the 3rd consecutive part
 const CLAIM_STRIKE_ALERT = 3;
 const SWEEP_OUTAGE_ALERT = 3;
 const SVC = "paylink-keeper";
-const BUILD = "20261110b";
+const BUILD = "20261110c";
 
 /* ────────────────────────────────────────────────────────────── rpc ── */
 
@@ -207,24 +207,46 @@ const concat = (...parts) => {
  */
 export function decodeLink(v) {
   let o = 0;
+  /* L-02: bounds-check every field first — a truncated or malformed
+     record must throw deterministically (decodeEntries skips it) instead
+     of decoding misaligned bytes as if they were a link. */
+  const need = (n) => {
+    if (o + n > v.length) throw new Error("truncated link record");
+  };
   const takeStr = () => {
+    need(4);
     const n = new DataView(v.buffer, v.byteOffset + o, 4).getUint32(0, true);
     o += 4;
+    need(n);
     const s = utf8.decode(v.subarray(o, o + n));
     o += n;
     return s;
   };
   const takeU64 = () => {
+    need(8);
     const x = new DataView(v.buffer, v.byteOffset + o, 8).getBigUint64(0, true);
     o += 8;
     return x;
   };
   const takeU128 = () => {
-    const lo = new DataView(v.buffer, v.byteOffset + o, 8).getBigUint64(0, true);
-    o += 16; // amounts stay under 2^64: the low limb is the value
-    return lo;
+    /* L-02: borsh u128 = 16 bytes little-endian — LOW limb first (bytes
+       0..8), HIGH limb second (bytes 8..16). Confirmed on live view_state
+       bytes: the demo-004 amount sits at offset 37 as 25000000 with a
+       zeroed high limb; same layout the relayer's ru128 reads. Reading
+       only the low limb silently truncated anything >= 2^64 to its low
+       64 bits. Both limbs, BigInt end to end — no Number, no precision
+       loss. */
+    need(16);
+    const dv = new DataView(v.buffer, v.byteOffset + o, 16);
+    const lo = dv.getBigUint64(0, true);
+    const hi = dv.getBigUint64(8, true);
+    o += 16;
+    return lo + (hi << 64n);
   };
-  const takeOpt = (fn) => (v[o++] === 1 ? fn() : null);
+  const takeOpt = (fn) => {
+    need(1);
+    return v[o++] === 1 ? fn() : null;
+  };
 
   const link_id = takeStr();
   const creator = takeStr();
@@ -254,6 +276,40 @@ export function decodeLink(v) {
     paid_at: paid_at ? paid_at.toString() : null,
     claimed_at: claimed_at ? claimed_at.toString() : null,
   };
+}
+
+/* ────────────────────────────────── display: yoctoNEAR → NEAR (L-02) ── */
+
+const YOCTO_PER_NEAR = 10n ** 24n; // 1 NEAR = 10^24 yocto
+const U128_MAX = (1n << 128n) - 1n;
+
+/**
+ * Format a yoctoNEAR amount as a NEAR string, exactly (L-02).
+ *
+ * All arithmetic is BigInt: one NEAR is 10^24 yocto, far past Number's
+ * 2^53 safe-integer range, so any Number path would silently round.
+ * Canonical decimal strings are accepted (that is how the RPC serves
+ * balances); plain numbers are rejected outright rather than converted,
+ * so a caller can never introduce precision loss by passing one.
+ *
+ * The fractional part is padded to 24 places then trimmed:
+ *   0 yocto        -> "0"
+ *   1 yocto        -> "0.000000000000000000000001"
+ *   10^24          -> "1"
+ *   u128::MAX      -> "340282366920938.463463374607431768211455"
+ * Anything outside 0..u128::MAX or malformed throws: a display helper
+ * must never render a wrong number quietly.
+ */
+export function formatYoctoNEAR(value) {
+  let n;
+  if (typeof value === "bigint") n = value;
+  else if (typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value)) n = BigInt(value);
+  else throw new Error("formatYoctoNEAR: expected a bigint or a canonical decimal string (never a Number)");
+  if (n < 0n || n > U128_MAX) throw new Error("formatYoctoNEAR: value outside 0..u128::MAX");
+  const whole = n / YOCTO_PER_NEAR;
+  const frac = n % YOCTO_PER_NEAR;
+  if (frac === 0n) return String(whole);
+  return `${whole}.${frac.toString().padStart(24, "0").replace(/0+$/, "")}`;
 }
 
 /* Entries as the node returns them; tolerates the documented dialects

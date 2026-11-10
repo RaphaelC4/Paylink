@@ -257,6 +257,7 @@ Ordered as we hit them. This is the section that saves the next person a day.
 | 9 | worker signs with wrong identity | stale `KEEPER_ACCOUNT` var | set `KEEPER_ACCOUNT=paylink-keeper.testnet`, redeploy |
 | 10 | secret rejected / unparsable paste | key pasted as JSON / labelled / quoted | tolerant `parseSecretKey` (scan for `ed25519:` + 64-byte decode) |
 | 11 | `InvalidNonce` under load | cron and manual tick both signed n+1 | accept: loser rejected at validation, no gas, next sweep settles (§7) |
+| 12 | link amount decoded wrong above 2^64 (L-02) | `takeU128` read only the low 64-bit limb and assumed "amounts stay under 2^64" | read both 16 bytes lo-then-hi into one BigInt; bounds-check every field so a truncated record throws (and is skipped) instead of decoding garbage; `formatYoctoNEAR` renders yoctoNEAR with pure BigInt arithmetic |
 
 ---
 
