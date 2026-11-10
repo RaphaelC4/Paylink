@@ -34,9 +34,10 @@ Alternatives considered:
 | Contract-side auto-claim | Would mean redeploying `paylink-v2.testnet` and re-testing the whole payment flow late in the build. |
 
 **Chosen: scan-and-claim, no memory at all.** The Worker cron runs every minute, does a
-single `view_state` prefix read of key `"l"` on the contract account, borsh-decodes every
-`Link`, and claims each one whose status is `PAID`. State on chain is the only registry.
-Consequences we rely on:
+`view_state` prefix read of key `"l"` on the contract account (one call while state fits in
+one response; disjoint sub-pages when it doesn't — see [§2, M-06](#m-06-2026-11-10-bounded-fail-soft-pagination-for-the-scan)),
+borsh-decodes every `Link`, and claims each one whose status is `PAID`. State on chain is the
+only registry. Consequences we rely on:
 
 - **The keeper can be wiped and redeployed from scratch with zero data migration.** There is
   nothing to restore.
@@ -51,18 +52,58 @@ verify the wrangler vars took effect without opening the dashboard.
 ## 2. Sweep: reading all links from contract state
 
 Contract stores links under the prefix `"l"` (borsh `String` key = `u32 len` + bytes, so the
-scan range is `"l"` … `"m"`). One `view_state` call returns everything; the Worker decodes each
-value in-process. No pagination, no retries beyond the policy in §6.
+scan range is `"l"` … `"m"`). The Worker decodes each value in-process. No registry, no
+memory of its own.
 
 Caps and filters:
 
 - **max 10 claims per sweep** — bounds per-tick gas/time; the next minute's cron picks up the
-  rest. On testnet with a handful of links this has never been a bottleneck (10 links scanned
-  per tick currently).
+  rest. On testnet with a handful of links this has never been a bottleneck.
 - Only `status === PAID` is actionable. `OPEN` (e.g. the deliberate fixture `demo-004`) and
   already-`CLAIMED` links are skipped.
 - Decoding a malformed entry must never kill the sweep: a bad value is logged and skipped, the
   rest still process.
+
+### M-06 (2026-11-10): bounded, fail-soft pagination for the scan
+
+**Why.** Status lives in the value, so every link must be read each sweep; state grows
+monotonically (the contract never deletes), so the single whole-state `view_state` call was a
+growing cliff — one day the response would be too large or time out, and pre-M-06 that meant
+*every* sweep failed (`sweep_failed` → `sweep_outage`) until someone intervened.
+
+**How it works now** — the fast path is unchanged and still the only path taken while state
+fits in one response:
+
+1. **Fast path:** one `view_state(prefix="l")`, exactly as before.
+2. **Fallback** (only when the fast path fails after its `rpc` retry): walk disjoint
+   sub-prefixes — root → the **61 `link_id` length buckets** (4..64, mirroring
+   `l || u32-LE length || bytes`; verified against live key `bAgAAABkZW1vLTAwNA==` =
+   `"l" || u32(8) || "demo-004"`) → generic next-byte children (0..255) up to
+   `MAX_PREFIX_BYTES = 72`. Children are disjoint by construction, so coverage can only be
+   lost (recorded), never doubled (belt-and-braces dedup by key on top).
+3. **Fail-soft:** pages already read are kept and their PAID links claimed;
+   `scan_partial` (warn) + `sweep_summary.partial/pages` say the run saw less than all
+   state. The next sweep starts over from scratch and re-covers the gap — discovery is
+   stateless, which is what keeps a failed run from losing a settlement. Only when *zero*
+   pages are readable does the scan throw (same `sweep_failed` / `sweep_outage` contract
+   as before).
+4. **Guards:** `KEEPER_MAX_PAGE_QUERIES` (default 512) and `KEEPER_SCAN_BUDGET_MS`
+   (default 45 s, leaving the rest of the 60 s cron window for claims). Whichever trips
+   first marks the untouched prefixes unvisited (`failedPages`) and the run continues.
+   A third consecutive partial scan fires `scan_degraded` (alert); one full-coverage scan
+   resets the streak.
+5. **Nonce hoisting (same sweep):** one `view_access_key` read per sweep instead of per
+   claim; the cursor walks sequential nonces and is nulled (re-read) on any unknown
+   broadcast outcome and on an `InvalidNonce` rejection.
+
+**Alternatives considered and why not** (evidence, not preference):
+
+| Option | Why not |
+| --- | --- |
+| nearcore `continuation_token` pagination | **Not served by either production endpoint.** Probed live 2026-11-10 on `test.rpc.fastnear.com` and `rpc.testnet.near.org`: a bogus token is silently ignored, the response top keys are only `block_hash/block_height/values`, no token ever comes back. |
+| Incremental cursor scan (remember last key) | Unsafe: status lives in the value, there is no key on status and no contract events, so a stateless keeper cannot know which old links changed without re-reading them — and a checkpoint would break the "wipe and redeploy with zero migration" property (§1). |
+| Contract-side paid-index / events | Requires a contract deploy (out of scope for M-06) and changes storage economics; the contract also never deletes state, so an index would only add growth. |
+| External indexer (NEAR indexer, subgraph) | Documented in the M-06 report as infra cost, deliberately not implemented: it adds a service to host, monitor and pay for — against the $0 constraint in §1. |
 
 ## 3. Signing: WebCrypto Ed25519, zero dependencies
 
@@ -110,7 +151,10 @@ Everything below is settled and production-proven (all 5 keeper txs landed):
 - **`AccessKeyPermission` is FullAccess (`1`)** — the keeper uses a full-access key on its own
   account, so no access-key delegation plumbing.
 - **Nonce** comes from `view_access_key` for (keeper account, pubkey) **+ 1** right before
-  signing; a concurrently landed tx invalidates it (see §7).
+  signing; a concurrently landed tx invalidates it (see §7). Since M-06 the read happens
+  **once per sweep**: every executed claim advances the nonce by exactly one, so the keeper
+  walks a cursor from that single read and only re-reads when an outcome leaves the nonce
+  unknown (dropped connection) or the node answers `InvalidNonce`.
 - **Block hash** is the latest finality block from the RPC at sign time (never cached across
   sweeps — old hashes fail validation).
 
@@ -157,6 +201,9 @@ Why this is acceptable (and was proven live as `keeper-004`):
   winner already flipped it to `CLAIMED`.
 - On `InvalidNonce`, the loser does **not** loop-and-retry within the same tick; it just
   reports. The next sweep has a fresh nonce. (A retry loop here would re-create the race.)
+  Since M-06 it also **nulls its nonce cursor**, so the *remaining* claims of that same
+  sweep re-read the chain instead of building on the rejected nonce — the failed claim is
+  still only reported, never re-attempted.
 
 ## 8. Key custody
 

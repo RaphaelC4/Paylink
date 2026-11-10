@@ -24,9 +24,16 @@
  * level=alert events are POSTed there (best-effort, never fatal). Event
  * catalog, thresholds and required config: workers/OPERATIONS.md.
  *
- * Discovery needs no registry: `view_state` with prefix "l" returns every
- * link the contract stores (LookupMap key = b"l" + borsh(link_id)), and the
- * value borsh-decodes to the Link struct. One RPC call sees all of them.
+ * Discovery needs no registry: `view_state` with prefix "l" lists every
+ * link the contract stores (LookupMap key = b"l" + borsh(link_id), value =
+ * the borsh Link struct). One RPC call serves it while state fits in one
+ * response. Status lives in the value, so every link must be read to find
+ * the PAID ones — but the read never has to ARRIVE as one response: if the
+ * whole-prefix read fails (timeout, oversized response), scanLinks falls
+ * back to disjoint sub-prefixes (M-06), keeps whatever it could read,
+ * claims those links anyway (fail-soft) and starts over from scratch next
+ * minute — discovery is stateless, so a partial or crashed run loses
+ * nothing.
  *
  * Secrets:  wrangler secret put KEEPER_KEY      (ed25519, matches KEEPER_ACCOUNT)
  *           wrangler secret put TICK_SECRET     (for POST /tick)
@@ -46,13 +53,38 @@ const GAS_CLAIM = 150_000_000_000_000; // 150 Tgas — claim queues 2 transfers 
 const ONE_YOCTO = 1n; // claim requires exactly 1 yoctoNEAR
 const MAX_CLAIMS_PER_SWEEP = 10; // bound one sweep's runtime and spend
 
+/* M-06 scan bounds. Discovery must read every link (status is in the
+   VALUE, not the key), but it never has to arrive as ONE response: when
+   the single prefix="l" read fails after its retry, scanLinks falls back
+   to querying disjoint sub-prefixes until coverage is complete. Both
+   guards below bound that fallback — whichever trips first marks the
+   untouched prefixes unvisited, and the run continues fail-soft with what
+   it already read. Nothing is checkpointed: discovery is stateless, so
+   the next minute's sweep starts over from scratch and re-covers any
+   skipped region (that is what keeps a failed run from losing a PAID
+   link). Tunable per environment for tests. */
+const MAX_PAGE_QUERIES = 512; // fallback query ceiling per sweep
+const SCAN_BUDGET_MS = 45_000; // leave the rest of the 60 s cron window for claims
+const LINK_PREFIX = 0x6c; // b"l" — the contract's links LookupMap namespace
+/* Mirror of the contract's create_link link_id bounds: keys are
+   l || borsh(String) = l || u32-LE length || bytes, so a failed root read
+   splits into these 61 length buckets. Verified against live testnet
+   state: key bAgAAABkZW1vLTAwNA== = "l" || u32(8) || "demo-004". */
+const LINK_ID_MIN_BYTES = 4;
+const LINK_ID_MAX_BYTES = 64;
+/* Deeper splits enumerate the next byte (0..255): every key under prefix p
+   starts with p || c for exactly one byte c, so children are disjoint and
+   their union is complete — coverage can only be lost, never doubled. */
+const MAX_PREFIX_BYTES = 72; // 1 + 4 length + 64 id + slack; beyond, a failed page stays lost (recorded, alerted)
+const SCAN_PARTIAL_ALERT = 3; // M-01 pattern: alert on the 3rd consecutive partial scan
+
 /* M-01 alert thresholds (see workers/OPERATIONS.md): three failed claims in
    a row for one link, or three consecutive sweeps unable to scan at all,
    mean the trouble is systemic — one bad transaction never trips either. */
 const CLAIM_STRIKE_ALERT = 3;
 const SWEEP_OUTAGE_ALERT = 3;
 const SVC = "paylink-keeper";
-const BUILD = "20261110a";
+const BUILD = "20261110b";
 
 /* ────────────────────────────────────────────────────────────── rpc ── */
 
@@ -224,17 +256,14 @@ export function decodeLink(v) {
   };
 }
 
-/** Every link in contract state: one view_state call, prefix "l". */
-export async function scanLinks(env) {
-  const res = await rpc(env, "query", {
-    request_type: "view_state",
-    finality: "final",
-    account_id: env.CONTRACT_ID,
-    prefix_base64: btoa("l"),
-  });
-  const entries = Array.isArray(res.values)
+/* Entries as the node returns them; tolerates the documented dialects
+   ({values:[{key,value}]} from nearcore/FastNEAR, or a keys/values zip). */
+const entriesOf = (res) =>
+  Array.isArray(res.values)
     ? res.values
-    : (res.keys || []).map((key, i) => ({ key, value: res.values[i] }));
+    : (Array.isArray(res.keys) ? res.keys.map((key, i) => ({ key, value: res.values[i] })) : []);
+
+const decodeEntries = (entries) => {
   const links = [];
   for (const e of entries) {
     try {
@@ -243,7 +272,117 @@ export async function scanLinks(env) {
       /* an undecodable record is skipped, never fatal to the sweep */
     }
   }
-  return { links, blockHash: res.block_hash };
+  return links;
+};
+
+const b64fromBytes = (bytes) => {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+};
+
+const viewState = (env, prefixBytes) => rpc(env, "query", {
+  request_type: "view_state",
+  finality: "final",
+  account_id: env.CONTRACT_ID,
+  prefix_base64: b64fromBytes(prefixBytes),
+});
+
+/* Children of a failed prefix: the root splits into the 61 link_id length
+   buckets the contract can produce (layout above); any deeper prefix
+   splits generically over the next byte. Both keep the walk disjoint. */
+const splitRoot = () => {
+  const out = [];
+  for (let n = LINK_ID_MIN_BYTES; n <= LINK_ID_MAX_BYTES; n++) out.push([LINK_PREFIX, n]);
+  return out;
+};
+const splitByte = (prefix) => {
+  const out = [];
+  for (let b = 0; b <= 0xff; b++) out.push([...prefix, b]);
+  return out;
+};
+const intEnv = (v, dflt, min, max) => {
+  const n = Number.parseInt(String(v ?? ""), 10);
+  return Number.isFinite(n) && n >= min && n <= max ? n : dflt;
+};
+
+/**
+ * Every link in contract state, as `{links, blockHash, pages, partial,
+ * failedPages}` (M-06).
+ *
+ * Fast path: one `view_state` with prefix "l" — exactly the pre-M-06
+ * behavior, and still the only path taken while state fits in one
+ * response. Fallback: when that read fails after its retry (timeout or a
+ * response the node won't serve), the same coverage is fetched as
+ * disjoint sub-prefix pages — root → length buckets → next-byte children
+ * — each page retried by `rpc`, failures recorded, siblings still
+ * fetched. Pages already read are kept (fail-soft): `partial:true` with
+ * `failedPages` says the run saw less than all state, and the next sweep
+ * starts over from scratch to re-cover it. Throws only when NOTHING was
+ * readable — the pre-M-06 "scan failed" contract, so sweep_failed /
+ * sweep_outage semantics are unchanged. No continuation tokens: neither
+ * rpc.testnet.near.org nor test.rpc.fastnear.com serves view_state
+ * pagination, so the partitioning is done client-side from returned keys.
+ */
+export async function scanLinks(env) {
+  const maxQueries = intEnv(env.KEEPER_MAX_PAGE_QUERIES, MAX_PAGE_QUERIES, 1, 100_000);
+  const budgetMs = intEnv(env.KEEPER_SCAN_BUDGET_MS, SCAN_BUDGET_MS, 0, 600_000);
+  const t0 = Date.now();
+
+  /* fast path — whole state in one response */
+  let rootError;
+  try {
+    const res = await viewState(env, [LINK_PREFIX]);
+    return {
+      links: decodeEntries(entriesOf(res)),
+      blockHash: res.block_hash,
+      pages: 1,
+      partial: false,
+      failedPages: 0,
+    };
+  } catch (err) {
+    rootError = err;
+  }
+
+  /* fallback — disjoint sub-prefix walk (root already burned 2 attempts;
+     the queue starts at its children, never refetches what failed) */
+  const queue = splitRoot();
+  const seen = new Set();
+  const entries = [];
+  let pages = 0;
+  let failed = 0;
+  let blockHash = null;
+  let lastErr = rootError;
+  while (queue.length) {
+    /* either guard exhausted: stop issuing queries, count the rest as
+       unvisited, keep every page already read */
+    if (pages + failed >= maxQueries || Date.now() - t0 >= budgetMs) {
+      failed += queue.length;
+      break;
+    }
+    const prefix = queue.shift();
+    let res;
+    try {
+      res = await viewState(env, prefix);
+    } catch (err) {
+      lastErr = err;
+      failed++;
+      if (prefix.length === 1) queue.push(...splitRoot());
+      else if (prefix.length < MAX_PREFIX_BYTES) queue.push(...splitByte(prefix));
+      continue; // deeper than the ceiling: this page stays lost (partial)
+    }
+    pages++;
+    if (blockHash === null) blockHash = res.block_hash;
+    for (const e of entriesOf(res)) {
+      if (e.key !== undefined) {
+        if (seen.has(e.key)) continue; // pages are disjoint; belt-and-braces
+        seen.add(e.key);
+      }
+      entries.push(e);
+    }
+  }
+  if (pages === 0) throw lastErr ?? rootError;
+  return { links: decodeEntries(entries), blockHash, pages, partial: failed > 0, failedPages: failed };
 }
 
 /* ──────────────────────────────────────────────────── tx signing ── */
@@ -416,9 +555,11 @@ export function logEvent(event, detail = {}, env) {
 /* Failure memory for the alert conditions (module = per isolate; a restart
    clears it, so streaks are per-isolate — documented in OPERATIONS.md):
    claimFails counts consecutive failed claims per link, sweepFails counts
-   consecutive sweeps that could not even scan. */
+   consecutive sweeps that could not even scan, partialFails counts
+   consecutive sweeps that read only PART of state (M-06 fallback). */
 const claimFails = new Map();
 let sweepFails = 0;
+let partialFails = 0;
 
 /**
  * Claim every link sitting in PAID. Idempotent by construction: `claim`
@@ -429,6 +570,9 @@ let sweepFails = 0;
  * unsettled_paid (warn) then sweep_summary; a scan that cannot run logs
  * sweep_failed (+ sweep_outage alert on the third consecutive run) and
  * rethrows so /tick still 500s and the cron's heartbeat reads ok:false.
+ * M-06: a scan that read only PART of state claims what it found, logs
+ * scan_partial (warn) and re-covers the gap next minute; a third
+ * consecutive partial run fires scan_degraded (alert).
  */
 export async function sweep(env, run_id = newRunId()) {
   const t0 = Date.now();
@@ -438,8 +582,11 @@ export async function sweep(env, run_id = newRunId()) {
   const alerts = [];
 
   let links;
+  let pages = 1;
+  let partial = false;
+  let failedPages = 0;
   try {
-    ({ links } = await scanLinks(env));
+    ({ links, pages, partial, failedPages } = await scanLinks(env));
   } catch (err) {
     const msg = scrub(String(err.message || err).slice(0, 200));
     logEvent("sweep_failed", { level: "error", run_id, error: msg }, env);
@@ -451,7 +598,28 @@ export async function sweep(env, run_id = newRunId()) {
     throw err;
   }
   sweepFails = 0; // this run scanned fine — the outage streak is over
+  report.pages = pages;
+  report.partial = partial;
+  report.failedPages = failedPages;
   report.scanned = links.length;
+
+  /* A partial scan (some pages unreadable, M-06) still settles everything
+     it could see — the next sweep re-covers the rest from scratch. It
+     warns every run and alerts only at the third in a row: one bad minute
+     is normal, a persistent hole in discovery is not. */
+  if (partial) {
+    const consecutive = ++partialFails;
+    logEvent("scan_partial", {
+      level: "warn", run_id, pages, failed_pages: failedPages, scanned: report.scanned,
+    }, env);
+    if (consecutive === SCAN_PARTIAL_ALERT) {
+      alerts.push(logEvent("scan_degraded", {
+        level: "alert", run_id, consecutive, pages, failed_pages: failedPages,
+      }, env));
+    }
+  } else {
+    partialFails = 0; // full coverage — the partial streak is over
+  }
 
   const paidAll = links.filter((l) => l.status === "PAID");
   const paid = paidAll.slice(0, MAX_CLAIMS_PER_SWEEP);
@@ -483,6 +651,7 @@ export async function sweep(env, run_id = newRunId()) {
       claimed: report.claimed.length, failed: report.failed.length,
       already_claimed: report.alreadyClaimed.length,
       over_cap: Math.max(0, paidAll.length - paid.length),
+      pages: report.pages, partial: report.partial,
       ms: Date.now() - t0,
     }, env);
     return Promise.all(alerts).then(() => report);
@@ -512,9 +681,23 @@ export async function sweep(env, run_id = newRunId()) {
     }
   };
 
+  /* One access-key read per sweep, not per claim (M-06): broadcasts run
+     sequentially and every executed transaction advances the nonce by
+     exactly one, so the cursor walks on without re-reading. Any outcome
+     that leaves the nonce UNKNOWN — a dropped connection, an InvalidNonce
+     rejection — nulls the cursor so the next claim re-reads the chain
+     instead of building on a guess. */
+  let nonceCursor = null;
+  let blockHash = null;
+
   for (const link of paid) {
     try {
-      const ak = await accessKey(env, env.KEEPER_ACCOUNT, publicKeyB58);
+      if (nonceCursor === null) {
+        const ak = await accessKey(env, env.KEEPER_ACCOUNT, publicKeyB58);
+        nonceCursor = ak.nonce;
+        blockHash = ak.blockHash;
+      }
+      nonceCursor += 1;
       const tx = await signTx({
         secret,
         account: env.KEEPER_ACCOUNT,
@@ -523,8 +706,8 @@ export async function sweep(env, run_id = newRunId()) {
         args: JSON.stringify({ link_id: link.link_id }),
         gas: GAS_CLAIM,
         deposit: ONE_YOCTO,
-        nonce: ak.nonce + 1,
-        blockHash: ak.blockHash,
+        nonce: nonceCursor,
+        blockHash,
       });
       logEvent("claim_submitted", { link_id: link.link_id, run_id }, env);
       const res = await broadcast(env, tx);
@@ -540,12 +723,21 @@ export async function sweep(env, run_id = newRunId()) {
         report.alreadyClaimed.push(entry);
         settled(link.link_id);
       } else {
+        /* An InvalidNonce rejection means the transaction was NOT included
+           — the cursor it was built on is off (an earlier broadcast's
+           outcome was guessed wrong); re-read the chain before the next
+           claim instead of failing every remaining claim in a row. */
+        if (JSON.stringify(res.status ?? "").includes("InvalidNonce")) nonceCursor = null;
         logEvent("claim_failed", { ...entry, status: res.status, run_id }, env);
         report.failed.push({ ...entry, status: res.status });
         logEvent("retry_scheduled", { link_id: link.link_id, reason: "claim failed — next sweep", run_id }, env);
         strike(link, { reason: "claim reverted" });
       }
     } catch (err) {
+      /* The transaction's fate is unknown (signing failed before send, or
+         the connection dropped mid-broadcast): null the cursor so the
+         next claim re-reads nonce + block hash from the chain. */
+      nonceCursor = null;
       const msg = String(err.message || err).slice(0, 200);
       logEvent("claim_failed", { link_id: link.link_id, error: msg, run_id }, env);
       report.failed.push({ link_id: link.link_id, error: msg });

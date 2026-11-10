@@ -71,7 +71,7 @@ cross-contract steps that host tests cannot reach is
 | **Paying twice never double-credits.** A link leaves `OPEN` once; a second payment is returned. | `paying_twice_does_not_double_credit` |
 | **Expiry needs no background job.** `Expired` is derived on read from `expires_at`, never stored, so an aged link reports itself honestly and refuses payment. The same timestamp is also the due date: after it, payment is refused and the tokens return to the payer in the same transaction — a hard cutoff, rather than a late payment accepted and marked late. | `an_expired_invoice_cannot_be_paid`, `an_expired_invoice_is_reported_as_expired_even_unpaid` |
 | **Sharing survives a dead RPC.** The QR code and Copy button are built from the link id alone — a vendored MIT encoder, no image request, no chain round trip. | `frontend/vendor/qrcode.js`, `qrMarkup()` in `frontend/app.js` |
-| **The keeper needs no registry.** One `view_state` call with prefix `l` lists every link; it signs with the runtime's Ed25519 WebCrypto, so it is a single file with no dependencies. | `workers/keeper/src/index.js` |
+| **The keeper needs no registry.** One `view_state` call with prefix `l` lists every link — and if that response ever gets too large or times out, it re-reads the same state as disjoint sub-prefix pages, keeps what it could read and claims it, so discovery scales without an indexer; it signs with the runtime's Ed25519 WebCrypto, so it is a single file with no dependencies. | `workers/keeper/src/index.js` |
 | **Storage is funded up front.** `create_link` requires a 0.01 NEAR stake that covers its own storage and registers the payee on the token — on a delegated creation the relayer attaches it. | `create_link_requires_a_storage_stake`, `the_stake_really_is_ten_millinear` |
 | **Settings are public getters.** The allowlist and both fee settings are readable by anyone, not admin-only views. | `the_allowlist_is_visible_to_callers`, `the_fee_settings_are_visible_to_callers` |
 
@@ -236,7 +236,10 @@ releases paid links from a cron every minute. It exists because the frontend's
 release can fail: the wallet prompt can be rejected, the tab can close, the
 network can drop. Discovery needs no registry — one `view_state` call with
 prefix `l` lists every link the contract stores, and anything sitting in `PAID`
-gets claimed, up to 10 per sweep.
+gets claimed, up to 10 per sweep. That single call is only the fast path: if
+it fails after its retry, the same coverage is fetched as disjoint sub-prefix
+pages, whatever was read is still claimed, and the next sweep re-covers the
+rest from scratch.
 
 It signs with the runtime's own Ed25519 WebCrypto, so the Worker is a single
 file deployable from the dashboard. It pays gas from its own testnet account

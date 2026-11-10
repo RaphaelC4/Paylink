@@ -21,7 +21,7 @@ Every operational event is **one JSON line on stdout**:
 |---------|---------|
 | `ts`    | ISO-8601 UTC timestamp |
 | `svc`   | `paylink-relayer` \| `paylink-keeper` \| `paylink-parse` |
-| `build` | build stamp — relayer `20261110c`, keeper `20261110a`, parse `20261110a` (in log lines only) |
+| `build` | build stamp — relayer `20261110c`, keeper `20261110b`, parse `20261110a` (in log lines only) |
 | `level` | `info` \| `warn` \| `error` \| `alert` |
 | `event` | catalog name from the tables below |
 | …       | event-specific fields, always flat scalars or short string arrays |
@@ -79,8 +79,10 @@ No `rid`, no IP, no key material ever appears in the health body.
 | Event | Level | Meaning / key fields |
 |-------|-------|----------------------|
 | `cron_heartbeat` | info (`error` on failure) | Exactly **one per scheduled run** — `run_id`, `ok`, `claimed`, `failed`, `ms`, `error` when failed. **Missed runs are detected by the absence of this line.** |
-| `sweep_summary` | info | Every healthy run's final line — `run_id`, `scanned`, `paid`, `claimed`, `failed`, `already_claimed`, `over_cap`, `ms`. |
+| `sweep_summary` | info | Every healthy run's final line — `run_id`, `scanned`, `paid`, `claimed`, `failed`, `already_claimed`, `over_cap`, `pages`, `partial`, `ms` (`pages` = view_state calls used by discovery, `partial` = some state unreadable, M-06). |
 | `unsettled_paid` | warn | Links still in PAID when the run ended — `run_id`, `count`, `link_ids` (≤ 10). One link settling next minute is normal ⇒ warn, never alert; **the count is the graphable signal**. |
+| `scan_partial` | warn | Discovery read only **part** of contract state (M-06: sub-prefix fallback, some pages unreadable) — `run_id`, `pages`, `failed_pages`, `scanned`. What was read is still claimed; the next sweep re-covers the gap from scratch. |
+| `scan_degraded` | **alert** | **3rd consecutive** partial scan (exactly at the threshold, once per streak; a full-coverage scan resets it) — `run_id`, `consecutive`, `pages`, `failed_pages`. One bad minute is normal; a persistent hole in discovery is not. |
 | `sweep_failed` | error | Contract scan could not run — `run_id`, `error` (scrubbed). The sweep still rethrows, so `/tick` 500s and the heartbeat reads `ok:false`. |
 | `sweep_outage` | **alert** | **3rd consecutive** failed scan (exactly at the threshold, once per streak; a healthy scan resets it) — `run_id`, `consecutive`, `error`. |
 | `tick_failed` | error | `/tick` failed outside the scan path (e.g. bad `KEEPER_KEY`) — `run_id`, `error`. |
@@ -118,6 +120,7 @@ webhook only if `ALERT_WEBHOOK_URL` is set)
 | relayer | `volume_anomaly` | ≥ 120 `/submit` per 60 s | per-isolate sliding window, once per window |
 | relayer | `error_burst` | 5 × 5xx per 5 min | per-isolate sliding window, once per window |
 | keeper | `sweep_outage` | 3rd consecutive failed scan | streak, resets on one healthy scan |
+| keeper | `scan_degraded` | 3rd consecutive **partial** scan | streak, resets on one full-coverage scan |
 | keeper | `repeated_claim_failure` | 3rd consecutive failure per link | per-link streak, resets on success |
 | parse | `upstream_degraded` | 5 upstream failures per 5 min | per-isolate sliding window, once per window |
 
@@ -138,6 +141,7 @@ implemented in code** (a Worker cannot alert on an event that never happened)
 | **Missed keeper cron** | absence of `event:cron_heartbeat` for > 2 min | alert after 2 consecutive missing minutes |
 | `cron_heartbeat` ok:false | `event:cron_heartbeat AND ok:false` | alert on any (usually already covered by `sweep_outage`) |
 | Unsettled backlog | `event:unsettled_paid` — graph `count` | warn when `count` grows for > 10 min |
+| Partial keeper scans | `event:scan_partial` — graph `failed_pages` | dashboard trend (in-code alert already covers 3 consecutive) |
 | Relayer balance | `event:service_error AND reason:balance_low` | alert on first — account needs funding before payments resume |
 | Relayer key problems | `reason:config_key_missing` OR `rpc_relayers_key` | alert on first |
 | Abuse signal | `event:rate_limited` volume per IP | dashboard trend; the limiter already enforces |
@@ -216,7 +220,7 @@ Nothing above was done for M-01 (no deploy, no push, no account changes).
 | Suite | Result | M-01 coverage |
 |-------|--------|---------------|
 | `node workers/relayer/test/parse.test.mjs` | **145 passed, 0 failed** | envelope + svc/build/level, `X-Request-Id` echo ↔ log `rid` match, `submit_rejected` reason codes, `submit_ok` happy path through an in-process RPC mock (no delegate/key bytes in any line), `rate_limited` layer+retry_after, `volume_anomaly` (fires at threshold, once per window), `error_burst` ×5 with webhook payload assertions, webhook on/off/dead-URL-never-logged plumbing, scrub probe, `GET /` allowlist + stats shape |
-| `node workers/keeper/test/sweep.test.mjs` | **69 passed, 0 failed** | `GET /` allowlist + build, `/tick` run_id correlation, tick 500 → `sweep_failed`+`tick_failed`, `cron_heartbeat` ok true/false (exactly one per run), `unsettled_paid` warn, `repeated_claim_failure` 3-strike + webhook + streak reset, `sweep_outage` 3-strike + scrubbed error + recovery reset, sweep_summary shape, scrub probe |
+| `node workers/keeper/test/sweep.test.mjs` | **115 passed, 0 failed** | `GET /` allowlist + build, `/tick` run_id correlation, tick 500 → `sweep_failed`+`tick_failed`, `cron_heartbeat` ok true/false (exactly one per run), `unsettled_paid` warn, `repeated_claim_failure` 3-strike + webhook + streak reset, `sweep_outage` 3-strike + scrubbed error + recovery reset, sweep_summary shape, scrub probe; **M-06**: live key/value layout fixture, 61-bucket fallback walk (boundaries 4/7/64), transient page retry, unreadable region fail-soft + `scan_partial`/`scan_degraded` streaks + recovery, duplicate key across pages claims once, query ceiling and zero-budget guards, one access-key read per sweep with sequential nonces, nonce re-read after unknown broadcast outcome and `InvalidNonce` |
 | `node workers/parse/test/parse.test.mjs` | **115 passed, 0 failed** | `parse_ok` envelope/no-values/rid, 405 untouched (no rid header), `parse_rejected` reason codes, `rate_limited` (11th request), `upstream_error` kinds + key redacted by value + 240 cap, `upstream_degraded` 5-in-window + webhook delivery, `service_error` generic 500 with no stack, leak sweep over 79 captured bodies |
 
 ---

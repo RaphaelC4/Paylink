@@ -15,6 +15,16 @@ construction: `claim` panics unless the link is still `PAID`, so a link
 released elsewhere in the meantime simply fails its own transaction and is
 reported.
 
+If that whole-state read fails after its retry (a timeout, or a response the
+node won't serve), discovery falls back to querying disjoint sub-prefixes —
+the 61 `link_id` length buckets first, then next-byte children — so one
+oversized or flaky page can never lose the rest of the state. Pages already
+read are kept and claimed anyway (fail-soft, `scan_partial` in the log);
+unvisited prefixes are re-covered from scratch by the next minute's sweep,
+which is what keeps a failed run from missing a settlement. Guards
+`KEEPER_MAX_PAGE_QUERIES` (default 512) and `KEEPER_SCAN_BUDGET_MS`
+(default 45 s) bound the fallback.
+
 ```
 GET  https://<worker>/
        -> { "ok": true, "service": "paylink-keeper", ... }

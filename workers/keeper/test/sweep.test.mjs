@@ -55,6 +55,22 @@ function encodeLink(l) {
 }
 const b64 = (bytes) => Buffer.from(bytes).toString("base64");
 
+/* Production key shape: l || borsh(String) = l || u32-LE length || bytes,
+   verified against live testnet state — bAgAAABkZW1vLTAwNA== decodes to
+   "l" || u32(8) || "demo-004". pfx() builds prefix_base64 the same way
+   the Worker's b64fromBytes does, for knob lookups. */
+const keyFor = (id) => {
+  const b = te.encode(id);
+  return btoa(String.fromCharCode(0x6c, ...u32b(b.length), ...b));
+};
+const pfx = (...bytes) => btoa(String.fromCharCode(...bytes));
+
+/* A REAL record read from paylink-v2.testnet via view_state (M-06 layout
+   fixture): key + value exactly as the node serves them. Status OPEN, so
+   the sweep must scan but never claim it. */
+const PROD_KEY = "bAgAAABkZW1vLTAwNA==";
+const PROD_VAL = "CAAAAGRlbW8tMDA0FQAAAHBheWxpbmstcGF5ZWUudGVzdG5ldEB4fQEAAAAAAAAAAAAAAAAdAAAAdXNkYy50aWRlcG9vbC1zYW5kYm94LnRlc3RuZXQYAAAARGVzaWduIHJldGFpbmVyIC0gd2VlayAxNZaop6EBAAAAAAAAAAA=";
+
 /* A real-shape 32-byte block hash (base58) — signTx decodes it. */
 const BLOCK_HASH = "75xVe8oDH4VV9uKpcGsx7xTQFWtNsbngukNMC8qsqKTw";
 
@@ -76,11 +92,17 @@ const ENV = {
 /* ── RPC mock ── */
 
 let state;          // links currently in contract state
-let broadcastMode;  // "ok" | "generic-fail" | "not-paid-fail" | "throw"
+let broadcastMode;  // "ok" | "generic-fail" | "not-paid-fail" | "throw" | "throw-once" | "invalid-nonce-once"
 let broadcasts;     // captured signed transactions
 let keyQueries;     // captured view_access_key params
 let nonceCounter = 41;
 let scanFail;       // M-01: true -> view_state answers with a fatal query error
+/* M-06 scan knobs — the walk is driven entirely by the mock's view_state: */
+let failRoot = false;       // true -> the whole-state (prefix "l") read fails
+let failPrefixTree = [];    // byte prefixes whose page AND descendants always fail
+let failOnce = new Map();   // Map<prefixB64, remaining> -> fail N attempts, then heal
+let injections = new Map(); // Map<prefixB64, entries> -> extra entries in that page (overlap)
+const onceFlags = { throw: false, nonce: false }; // one-shot broadcast behaviors
 const webhookPosts = []; // M-01: ALERT_WEBHOOK_URL deliveries captured here
 
 const link = (id, status, extra = {}) => ({
@@ -116,12 +138,30 @@ globalThis.fetch = async (_url, opts) => {
         result: { error: `node unreachable — last seen holding ed25519:${"A".repeat(64)}` },
       });
     }
-    return json({
-      result: {
-        values: state.map((l) => ({ key: btoa("l" + l.link_id), value: b64(encodeLink(l)) })),
-        block_hash: BLOCK_HASH,
-      },
-    });
+    /* M-06: prefix-filtered pages over production-shape keys
+       (l || u32-LE length || link_id, exactly as the contract stores
+       them), with per-prefix failure and overlap knobs for the walk. */
+    const p64 = body.params.prefix_base64 || "";
+    const pBytes = Uint8Array.from(atob(p64), (c) => c.charCodeAt(0));
+    const isRoot = pBytes.length === 1 && pBytes[0] === 0x6c;
+    if (isRoot && failRoot) {
+      return json({ result: { error: "node refused the whole-state response (too large)" } });
+    }
+    if (failPrefixTree.some((fp) => fp.length <= pBytes.length && fp.every((b, i) => pBytes[i] === b))) {
+      return json({ result: { error: "page unavailable" } });
+    }
+    if (failOnce.has(p64) && failOnce.get(p64) > 0) {
+      failOnce.set(p64, failOnce.get(p64) - 1);
+      return json({ result: { error: "transient page failure" } });
+    }
+    const values = state
+      .map((l) => ({ key: keyFor(l.link_id), value: b64(encodeLink(l)) }))
+      .filter((e) => {
+        const k = Uint8Array.from(atob(e.key), (c) => c.charCodeAt(0));
+        return pBytes.length <= k.length && pBytes.every((b, i) => k[i] === b);
+      })
+      .concat(injections.get(p64) || []);
+    return json({ result: { values, block_hash: BLOCK_HASH } });
   }
   if (body.method === "query" && body.params.request_type === "view_access_key") {
     keyQueries.push(body.params);
@@ -129,8 +169,29 @@ globalThis.fetch = async (_url, opts) => {
   }
   if (body.method === "broadcast_tx_commit") {
     if (broadcastMode === "throw") throw new Error("network unreachable");
+    if (broadcastMode === "throw-once" && !onceFlags.throw) {
+      onceFlags.throw = true;
+      throw new Error("network unreachable");
+    }
     broadcasts.push(body.params[0]);
     if (broadcastMode === "ok") {
+      return json({ result: { status: "SuccessValue", transaction: { hash: `Hash${broadcasts.length}` } } });
+    }
+    if (broadcastMode === "invalid-nonce-once" && !onceFlags.nonce) {
+      /* executed-but-rejected: the tx was NOT included, so its nonce was
+         not consumed — the keeper must re-read the chain, not continue. */
+      onceFlags.nonce = true;
+      return json({
+        result: {
+          status: { Failure: { ActionError: { kind: { FunctionCallError: { ExecutionError: "Invalid transaction: InvalidNonce Expected 41 but got 42" } } } } },
+          transaction: { hash: `Hash${broadcasts.length}` },
+        },
+      });
+    }
+    /* every mode reaches success here unless it was designed to fail:
+       "ok" plainly, "throw-once"/"invalid-nonce-once" after their one
+       scripted misbehaviour (so claim #2 lands) */
+    if (broadcastMode === "ok" || broadcastMode === "throw-once" || broadcastMode === "invalid-nonce-once") {
       return json({ result: { status: "SuccessValue", transaction: { hash: `Hash${broadcasts.length}` } } });
     }
     if (broadcastMode === "not-paid-fail") {
@@ -191,6 +252,12 @@ const reset = (links, mode) => {
   keyQueries = [];
   nonceCounter = 41;
   scanFail = false;
+  failRoot = false;
+  failPrefixTree = [];
+  failOnce = new Map();
+  injections = new Map();
+  onceFlags.throw = false;
+  onceFlags.nonce = false;
   webhookPosts.length = 0;
 };
 
@@ -292,6 +359,7 @@ const reset = (links, mode) => {
   const report = await captureLogs(() => sweep(ENV));
   ok(report.paid.length === 10, "one sweep caps claims at 10");
   ok(broadcasts.length === 10, "cap bounds the broadcasts too");
+  ok(keyQueries.length === 1, "one access-key read serves all 10 claims (M-06 nonce cursor)");
   const deferred = events().filter((e) => e.event === "retry_scheduled" && /^bulk1[01]$/.test(e.link_id));
   ok(deferred.length === 2, "the 2 over-cap links are logged retry_scheduled for the next run");
 }
@@ -322,7 +390,7 @@ const byEvent = (name) => events().filter((e) => e.event === name);
   const keys = Object.keys(body).sort();
   ok(res.status === 200 && JSON.stringify(keys) === JSON.stringify(["account", "build", "contract", "ok", "service"]),
     "GET / body is a fixed key allowlist (no run or user data)");
-  ok(body.build === "20261110a", "GET / reports the build stamp (bump with BUILD)");
+  ok(body.build === "20261110b", "GET / reports the build stamp (bump with BUILD)");
   ok(!JSON.stringify(body).includes("ed25519"), "health output carries no key material");
 }
 
@@ -347,7 +415,7 @@ const byEvent = (name) => events().filter((e) => e.event === name);
   ok(summary && summary.scanned === 1 && summary.claimed === 1 && summary.over_cap === 0
     && typeof summary.ms === "number",
     "sweep_summary carries the run's aggregate outcome and duration");
-  ok(summary && summary.svc === "paylink-keeper" && summary.build === "20261110a"
+  ok(summary && summary.svc === "paylink-keeper" && summary.build === "20261110b"
     && summary.level === "info" && typeof summary.ts === "string",
     "line carries the ts/svc/build/level envelope");
   ok(!hasEvent("unsettled_paid"), "a fully settled run does not warn unsettled_paid");
@@ -482,6 +550,184 @@ const byEvent = (name) => events().filter((e) => e.event === name);
   ok(p && p.detail.includes("ed25519:[redacted]") && !p.detail.includes("B".repeat(40)),
     "logEvent scrubs ed25519 key shapes");
   ok(p && p.detail.length <= 240, "strings capped at 240 chars — no payload can hide in a log line");
+}
+
+/* ════════════════════ M-06: paginated, fail-soft discovery ═══════════
+   The walk only runs when the whole-state read fails (failRoot), so every
+   test below exercises the fallback: root → 61 length buckets (4..64) →
+   next-byte children. Pages are disjoint by construction; the mock can
+   still inject an overlap, fail a region, burn one attempt or starve the
+   budget, which is what the assertions drive. Sweep-level streaks
+   (partialFails) are module state: each block that breaks coverage ends
+   with a healthy sweep so the next block starts clean. */
+
+/* 18. live production fixture: the key layout the root split mirrors */
+{
+  const kb = Uint8Array.from(atob(PROD_KEY), (c) => c.charCodeAt(0));
+  ok(kb[0] === 0x6c && kb[1] === 8 && kb[2] === 0 && kb[3] === 0 && kb[4] === 0
+    && new TextDecoder().decode(kb.subarray(5)) === "demo-004",
+    "live testnet key = l || u32-LE(8) || \"demo-004\" (documented layout)");
+  ok(kb[1] >= 4 && kb[1] <= 64, "the root split's 4..64 length buckets cover the live key");
+  ok(keyFor("demo-004") === PROD_KEY, "the mock's key builder reproduces the live key byte-for-byte");
+  const d = decodeLink(Uint8Array.from(Buffer.from(PROD_VAL, "base64")));
+  ok(d.link_id === "demo-004" && d.creator === "paylink-payee.testnet"
+    && d.token === "usdc.tidepool-sandbox.testnet" && d.amount === "25000000",
+    "the live value borsh-decodes to its real fields");
+  ok(d.status === "OPEN", "the live record is OPEN — scan it, never claim it");
+}
+
+/* 19. fallback walk discovers and claims, with the live record in-page */
+{
+  reset([link("aaaa", 1)], "ok");
+  failRoot = true;
+  injections.set(pfx(0x6c, 8), [{ key: PROD_KEY, value: PROD_VAL }]);
+  const report = await captureLogs(() => sweep(ENV));
+  ok(report.pages === 61 && report.failedPages === 0,
+    "root refused → all 61 length buckets queried, none failed");
+  ok(report.partial === false, "complete coverage is not reported partial");
+  ok(report.scanned === 2, "both the state link and the live record decoded");
+  ok(JSON.stringify(report.paid) === '["aaaa"]',
+    "exactly the PAID link discovered; the live OPEN record is never a candidate");
+  ok(broadcasts.length === 1 && report.claimed[0]?.link_id === "aaaa",
+    "one claim, for the PAID link only");
+}
+
+/* 20. bucket boundaries: ids of length 4, 7, 64 and a CLAIMED neighbour */
+{
+  reset([link("aaaa", 1), link("bbbbbbb", 0), link("c".repeat(64), 1), link("done", 2)], "ok");
+  failRoot = true;
+  const report = await captureLogs(() => sweep(ENV));
+  ok(report.scanned === 4 && report.partial === false, "every bucket read: 4 scanned, no gap");
+  ok(report.paid.length === 2 && report.paid[0] === "aaaa" && report.paid[1] === "c".repeat(64),
+    "PAID links found across buckets 4 and 64, OPEN/CLAIMED skipped");
+  ok(broadcasts.length === 2, "exactly the two PAID links claimed");
+}
+
+/* 21. a transient page failure is retried by rpc — no partial, no loss */
+{
+  reset([link("r4aa", 1)], "ok");
+  failRoot = true;
+  failOnce.set(pfx(0x6c, 4), 1); // bucket 4 fails its first attempt, heals on retry
+  const report = await captureLogs(() => sweep(ENV));
+  ok(report.partial === false && report.failedPages === 0 && report.pages === 61,
+    "one transient page error leaves no partial: the in-call retry covered it");
+  ok(JSON.stringify(report.claimed) === '[{"link_id":"r4aa","hash":"Hash1"}]',
+    "the link under the flaky page is still settled in the same run");
+}
+
+/* 22. a region that stays unreadable: fail-soft claims, scan_partial warn,
+       scan_degraded alert on the 3rd consecutive, recovery re-covers all */
+{
+  /* ids chosen by bucket: reach6 = 6 chars (healthy bucket 6),
+     stuck888 = 8 chars (bucket 8, the one that stays unreadable) */
+  reset([link("reach6", 1), link("stuck888", 1)], "ok");
+  failRoot = true;
+  failPrefixTree = [[0x6c, 8]]; // bucket 8 AND every descendant never answers
+
+  let r = await captureLogs(() => sweep(ENV));
+  ok(r.partial === true && r.failedPages > 0, "unreadable region → report.partial with failed pages");
+  ok(r.claimed.length === 1 && r.claimed[0].link_id === "reach6",
+    "fail-soft: the readable bucket's PAID link is still settled");
+  ok(!r.paid.includes("stuck888"), "the unreadable link is undiscovered this run (not invented)");
+  ok(hasEvent("scan_partial") && !hasEvent("scan_degraded"),
+    "first partial run warns scan_partial, does not alert");
+
+  await captureLogs(() => sweep(ENV));
+  ok(!hasEvent("scan_degraded"), "second partial run: still under the threshold");
+
+  r = await captureLogs(() => sweep(ENV));
+  const g = byEvent("scan_degraded");
+  ok(g.length === 1 && g[0].level === "alert" && g[0].consecutive === 3,
+    "third consecutive partial scan fires scan_degraded exactly once");
+  ok(r.claimed.length === 1, "every partial run keeps settling what it can read");
+
+  failRoot = false;
+  failPrefixTree = [];
+  r = await captureLogs(() => sweep(ENV));
+  ok(r.partial === false, "one healthy scan clears the partial flag");
+  ok(r.claimed.some((e) => e.link_id === "stuck888"),
+    "the link missed by three partial runs is claimed by the next full scan — no lost settlement");
+
+  failRoot = true;
+  failPrefixTree = [[0x6c, 8]];
+  await captureLogs(() => sweep(ENV));
+  ok(!hasEvent("scan_degraded"), "after the healthy run the partial streak restarted — no stale alert");
+  failRoot = false;
+  failPrefixTree = [];
+  await captureLogs(() => sweep(ENV)); // settle + reset partialFails for the blocks below
+}
+
+/* 23. duplicate processing: the same key arriving on two pages claims once */
+{
+  reset([link("aaaa", 1)], "ok");
+  failRoot = true;
+  injections.set(pfx(0x6c, 8), [{ key: keyFor("aaaa"), value: b64(encodeLink(link("aaaa", 1))) }]);
+  const report = await captureLogs(() => sweep(ENV));
+  ok(report.scanned === 1, "the record seen on two pages is counted once");
+  ok(report.paid.length === 1 && report.paid[0] === "aaaa", "one PAID entry after dedup");
+  ok(broadcasts.length === 1, "exactly one claim — overlap can never double-submit");
+}
+
+/* 24. query ceiling: unvisited prefixes are counted, never silently dropped */
+{
+  reset([link("aaaa", 1), link("z".repeat(64), 1)], "ok");
+  failRoot = true;
+  const report = await captureLogs(() => sweep({ ...ENV, KEEPER_MAX_PAGE_QUERIES: "2" }));
+  ok(report.pages === 2, "the ceiling stops the walk after 2 queries");
+  ok(report.partial === true && report.failedPages === 59,
+    "the 59 unvisited buckets are reported as failed pages");
+  ok(JSON.stringify(report.claimed) === '[{"link_id":"aaaa","hash":"Hash1"}]',
+    "the visited bucket's link is still settled");
+  ok(!report.paid.includes("z".repeat(64)),
+    "the unvisited link is not claimed this run — discovery defers, never guesses");
+  ok(hasEvent("scan_partial"), "partial coverage logged for the operator");
+}
+
+/* 25. scan budget exhausted before any page: same contract as a dead scan */
+{
+  reset([link("aaaa", 1)], "ok");
+  failRoot = true;
+  let threw = false;
+  await captureLogs(() => sweep({ ...ENV, KEEPER_SCAN_BUDGET_MS: "0" }).catch(() => { threw = true; }));
+  ok(threw, "zero budget → nothing readable → sweep rejects (tick 500 / heartbeat ok:false)");
+  ok(hasEvent("sweep_failed"), "and logs sweep_failed, exactly like a dead scan");
+
+  reset([link("heal", 1)], "ok");
+  await captureLogs(() => sweep(ENV)); // healthy run: reset sweepFails for later blocks
+}
+
+/* 26. one access-key read per sweep; nonces walk sequentially from it */
+{
+  reset([link("n1", 1), link("n2", 1), link("n3", 1)], "ok");
+  const report = await captureLogs(() => sweep(ENV));
+  ok(report.claimed.length === 3, "three links claimed");
+  ok(keyQueries.length === 1, "ONE view_access_key read for three claims (was one per claim)");
+  const nonces = broadcasts.map((b) => parseTx(b).nonce);
+  ok(JSON.stringify(nonces) === JSON.stringify([42, 43, 44]),
+    "nonces 42,43,44 derived from the single read (41 + one per executed tx)");
+}
+
+/* 27. unknown broadcast outcome mid-sweep: the cursor is re-read, not guessed */
+{
+  reset([link("t1", 1), link("t2", 1)], "throw-once");
+  const report = await captureLogs(() => sweep(ENV));
+  ok(report.failed.length === 1 && report.claimed.length === 1,
+    "first claim lost to the network, second still lands");
+  ok(keyQueries.length === 2, "the access key is re-read after an unknown outcome");
+  ok(parseTx(broadcasts[0]).nonce === 43,
+    "the second claim was rebuilt on a fresh cursor (42 re-read → 43), not the stale 42");
+}
+
+/* 28. InvalidNonce rejection: the tx was not included, so re-read the chain */
+{
+  reset([link("i1", 1), link("i2", 1)], "invalid-nonce-once");
+  const report = await captureLogs(() => sweep(ENV));
+  ok(report.failed.length === 1 && report.claimed.length === 1,
+    "the rejected claim fails, the next one lands");
+  ok(keyQueries.length === 2, "InvalidNonce nulls the cursor — the chain is re-read");
+  ok(parseTx(broadcasts[1]).nonce === 43, "the recovery claim uses the fresh nonce");
+  ok(hasEvent("claim_failed", "i1") && hasEvent("claim_successful", "i2"),
+    "both outcomes logged");
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
