@@ -18,8 +18,9 @@
  *     of NEP-366's validation list, else the chain rejects with
  *     DelegateActionSenderDoesNotMatchTxReceiver),
  *   - receiver_id must be our contract, the single inner action must be
- *     `create_link` with >= 0.01 NEAR attached and sane arguments (the same
- *     rules the contract enforces, mirrored so bad input never reaches it),
+ *     `create_link` with 0.01-0.02 NEAR attached (MIN_STAKE..MAX_DEPOSIT)
+ *     and sane arguments (the same rules the contract enforces, mirrored so
+ *     bad input never reaches it),
  *   - the signature must verify under the sender's public key using NEP-461's
  *     preimage (sha256 of the NEP-366 discriminant ++ the delegate bytes) —
  *     proven against two fixtures the chain accepted, see test/parse.test.mjs,
@@ -58,6 +59,19 @@ const BROADCAST_TIMEOUT_MS = 30_000;
 const GAS_INNER_MIN = 10_000_000_000_000n; // 10 Tgas — below this the contract cannot run
 const GAS_INNER_MAX = 100_000_000_000_000n; // 100 Tgas cap — nobody needs more for create_link
 const MIN_STAKE = 10_000_000_000_000_000_000_000n; // 0.01 NEAR, CREATE_STORAGE_STAKE
+/* H-01: bound the deposit this Worker will fund, not just its floor. The
+   contract accepts >= 0.01 NEAR with no ceiling, and create_link's excess
+   deposit lands in the contract with no refund path — so above-minimum value
+   in a delegated create can only ever lose THIS account money. Inspection:
+   every legitimate sender attaches exactly MIN_STAKE (frontend CREATE_STAKE,
+   both chain-accepted fixtures, every CLI proof run), and worst-case link
+   storage plus first-time payee registration costs ~0.008 NEAR, already
+   covered by the minimum. 0.02 NEAR = twice the current stake: a 100% margin
+   that still tolerates a contract-side stake increase before this constant is
+   re-synced, while capping one request at 0.02 NEAR instead of the balance
+   floor. Sits below the rate limit and the 1 NEAR floor — it does not
+   replace either. */
+const MAX_DEPOSIT = 20_000_000_000_000_000_000_000n; // 0.02 NEAR, 2 x MIN_STAKE
 const MAX_ARGS_BYTES = 1024; // create_link args are ~200 bytes; 1024 leaves room to grow
 const LINK_ID_MIN = 4, LINK_ID_MAX = 64; // bytes, mirror lib.rs
 const DESC_MAX = 280; // bytes, mirror lib.rs (Rust String::len is bytes)
@@ -249,6 +263,7 @@ export function parseSignedDelegate(raw, env) {
      rejected here instead of on chain at this relayer's expense. */
   if (receiver_id !== env.CONTRACT_ID) fail(`receiver must be ${env.CONTRACT_ID}, got ${receiver_id}`);
   if (deposit < MIN_STAKE) fail(`create_link needs at least 0.01 NEAR attached, got ${deposit} yocto`);
+  if (deposit > MAX_DEPOSIT) fail(`create_link deposit ${deposit} yocto exceeds the 0.02 NEAR maximum this relayer will fund`);
   if (gas < GAS_INNER_MIN || gas > GAS_INNER_MAX) fail(`inner gas ${gas} outside ${GAS_INNER_MIN}..${GAS_INNER_MAX}`);
 
   let args;
@@ -570,6 +585,11 @@ function corsHeaders(env) {
   };
 }
 
+/* Build stamp returned by GET / — bump this string on every dashboard paste
+   so the deployed code can be identified remotely (the Worker exposes no
+   other version signal). Same convention as the frontend's ?v= param. */
+const BUILD = "20261110a";
+
 export default {
   async fetch(request, env) {
     const cors = corsHeaders(env);
@@ -578,7 +598,7 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/") {
       return json(
-        { ok: true, service: "paylink-relayer", contract: env.CONTRACT_ID, account: env.RELAYER_ACCOUNT },
+        { ok: true, service: "paylink-relayer", contract: env.CONTRACT_ID, account: env.RELAYER_ACCOUNT, build: BUILD },
         200,
         cors,
       );

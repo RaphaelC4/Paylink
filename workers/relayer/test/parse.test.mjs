@@ -8,7 +8,8 @@
  */
 
 import { generateKeyPairSync } from "node:crypto";
-import { parseSignedDelegate, signDelegateTx } from "../src/index.js";
+import { readFileSync } from "node:fs";
+import worker, { parseSignedDelegate, signDelegateTx, submit } from "../src/index.js";
 
 const b64decode = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const b64encode = (bytes) => {
@@ -186,6 +187,176 @@ if (!subtle) {
   ok(tx.subarray(o, o + raw.length).every((b, i) => b === raw[i]), "delegate bytes embedded verbatim");
   o += raw.length;
   ok(tx[o] === 0 && tx.length - o === 65, "outer signature tag + 64 bytes tail");
+}
+
+/* ── H-01: deposit ceiling — MIN_STAKE <= deposit <= MAX_DEPOSIT ──
+ *
+ * The contract accepts >= 0.01 NEAR with no ceiling, so an unbounded deposit
+ * in a delegated create is money this relayer funds with no way back (excess
+ * lands in the contract, which has no withdrawal). These tests pin both ends
+ * of the window, the Borsh u128 handling, and — via submit() with fetch
+ * stubbed — that an over-cap delegate dies before any network call. */
+
+const MIN_D = 10_000_000_000_000_000_000_000n;  // 0.01 NEAR, mirrors MIN_STAKE
+const MAX_D = 20_000_000_000_000_000_000_000n;  // 0.02 NEAR, mirrors MAX_DEPOSIT
+
+/* Walk the Borsh layout to the deposit field — sender u32+bytes, receiver
+   u32+bytes, u32 action count, u8 tag, method u32+bytes, u32 args len +
+   args, u64 gas, then the u128 deposit. */
+function depositOffset(raw) {
+  let o = 0;
+  const u32 = () => { const v = new DataView(raw.buffer, raw.byteOffset + o, 4).getUint32(0, true); o += 4; return v; };
+  const skip = (n) => { o += n; };
+  skip(u32()); // sender_id
+  skip(u32()); // receiver_id
+  skip(4);     // actions vector length
+  skip(1);     // FunctionCall tag
+  skip(u32()); // method_name
+  skip(u32()); // args
+  skip(8);     // gas
+  return o;    // deposit: 16-byte LE u128
+}
+
+/* Rewrite the deposit in place, preserving every other byte of the delegate. */
+function withDeposit(raw, value) {
+  const out = Uint8Array.from(raw);
+  const at = depositOffset(out);
+  const dv = new DataView(out.buffer);
+  dv.setBigUint64(at, value & 0xFFFF_FFFF_FFFF_FFFFn, true);
+  dv.setBigUint64(at + 8, value >> 64n, true);
+  return out;
+}
+
+/* Accept-or-report: a parse that should succeed must not abort the run. */
+function parses(raw, name) {
+  try {
+    const p = parseSignedDelegate(raw, env);
+    pass++; console.log("  ok  " + name);
+    return p;
+  } catch (e) {
+    fail++; console.log(`FAIL  ${name} (threw: ${e.message})`);
+    return null;
+  }
+}
+
+/* walker sanity: lands on the fixture's known 0.01 NEAR deposit */
+{
+  const at = depositOffset(rawCli);
+  const dv = new DataView(rawCli.buffer, rawCli.byteOffset + at, 16);
+  const seen = dv.getBigUint64(0, true) + (dv.getBigUint64(8, true) << 64n);
+  ok(seen === MIN_D, "borsh walker lands on the fixture's 0.01 NEAR deposit");
+}
+
+/* 1. below MIN_STAKE — rejected */
+throwsWith(() => parseSignedDelegate(withDeposit(rawCli, MIN_D - 1n), env),
+  "deposit below MIN_STAKE rejected", "at least 0.01 NEAR");
+
+/* 2. exactly MIN_STAKE — accepted (what every real sender attaches) */
+{
+  const p = parses(withDeposit(rawCli, MIN_D), "deposit == MIN_STAKE accepted");
+  ok(p !== null && p.deposit === MIN_D, "parsed deposit is exactly MIN_STAKE");
+}
+
+/* 3. exactly MAX_DEPOSIT — accepted (the ceiling is inclusive) */
+{
+  const p = parses(withDeposit(rawCli, MAX_D), "deposit == MAX_DEPOSIT accepted");
+  ok(p !== null && p.deposit === MAX_D, "parsed deposit is exactly MAX_DEPOSIT");
+}
+
+/* 4. above MAX_DEPOSIT — rejected */
+throwsWith(() => parseSignedDelegate(withDeposit(rawCli, MAX_D + 1n), env),
+  "deposit above MAX_DEPOSIT rejected", "exceeds the 0.02 NEAR maximum");
+
+/* 5. malformed Borsh deposit (truncated inside the u128) — rejected */
+throwsWith(() => parseSignedDelegate(rawCli.subarray(0, depositOffset(rawCli) + 8), env),
+  "malformed (half-written) deposit rejected", "truncated");
+
+/* 6. missing deposit (delegate ends where the u128 should start) — rejected */
+throwsWith(() => parseSignedDelegate(rawCli.subarray(0, depositOffset(rawCli)), env),
+  "missing deposit rejected", "truncated");
+
+/* 7. u128::MAX — rejected with the exact value, no precision loss, no crash */
+throwsWith(() => parseSignedDelegate(withDeposit(rawCli, 2n ** 128n - 1n), env),
+  "u128::MAX deposit rejected", "340282366920938463463374607431768211455");
+/* one yocto over the minimum — inside the window, and the exact value must
+   survive the parse (a float path would flatten 10^22+1 to 10^22) */
+{
+  const p = parses(withDeposit(rawCli, MIN_D + 1n), "deposit == MIN_STAKE + 1 yocto accepted");
+  ok(p !== null && p.deposit === MIN_D + 1n, "1-yocto precision survives the parse");
+}
+
+/* 8. a normal valid Paylink create_link delegate — still accepted */
+{
+  const p = parses(Uint8Array.from(rawCli), "normal valid create_link delegate accepted");
+  ok(p !== null && p.method === "create_link" && p.deposit === MIN_D,
+    "normal delegate keeps method and 0.01 NEAR deposit");
+}
+
+/* ── consistency guard: contract stake vs relayer window ──
+   MIN_STAKE must equal the contract's CREATE_STORAGE_STAKE (the chain
+   rejects below it) and MAX_DEPOSIT must keep a margin above it (once the
+   contract's stake passes the ceiling, every delegated create dies at this
+   relayer). Checked against the Rust source at test time — no RPC, no shared
+   constant, so no runtime coupling; the behavioral tests above already pin
+   src's MIN_STAKE/MAX_DEPOSIT to these literals, closing the loop. */
+{
+  let src = null;
+  try {
+    src = readFileSync(new URL("../../../contracts/paylink-contract/src/lib.rs", import.meta.url), "utf8");
+  } catch (e) {
+    ok(false, `contract source readable for the stake guard (${String(e.message || e)})`);
+  }
+  const m = src === null ? null
+    : src.match(/CREATE_STORAGE_STAKE[^=]*=\s*NearToken::from_millinear\((\d+)\)/);
+  if (src !== null) ok(m !== null, "CREATE_STORAGE_STAKE found in the contract source");
+  if (m) {
+    const stake = BigInt(m[1]) * 1_000_000_000_000_000_000_000n; // millinear -> yocto
+    ok(stake === MIN_D, `relayer MIN_STAKE mirrors the contract stake (${m[1]} millinear NEAR)`);
+    ok(MAX_D >= 2n * stake, "MAX_DEPOSIT keeps at least a 2x margin over the contract stake");
+  }
+}
+
+/* ── proof: rejection happens BEFORE any broadcast ──
+   submit() order is rate limit -> base64 -> parseSignedDelegate -> signature
+   -> RPC -> broadcast. With fetch stubbed, an over-cap delegate must fail at
+   the parse step with zero network calls; a control run proves the stub is
+   live by reaching the RPC with a valid delegate. */
+{
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; throw new Error("network disabled in test"); };
+  try {
+    let over = null;
+    try {
+      await submit(env, { signedDelegateAction: b64encode(withDeposit(rawCli, MAX_D + 1n)) }, "203.0.113.7");
+    } catch (e) { over = e; }
+    ok(over !== null && over.status === 400, "submit answers 400 for an over-cap deposit");
+    ok(over !== null && String(over.message).includes("exceeds the 0.02 NEAR maximum"),
+      "submit fails at the deposit ceiling, not elsewhere");
+    ok(calls === 0, "zero fetch calls — nothing was contacted or broadcast");
+
+    /* control: same stub, valid delegate — the network IS reached */
+    calls = 0;
+    let ctl = null;
+    try {
+      await submit(env, { signedDelegateAction: b64encode(Uint8Array.from(rawCli)) }, "203.0.113.8");
+    } catch (e) { ctl = e; }
+    ok(calls >= 1, "control: a valid delegate reaches the RPC (stub is live)");
+    ok(ctl !== null && ctl.status !== 400, "control fails later than the parse step");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+/* ── build stamp: GET / must say which code is deployed ──
+   The Worker is deployed by dashboard paste, so this field is the only way
+   to answer "which build is live?" remotely. Keep the literal in sync with
+   BUILD in src/index.js — a bump that forgets the test fails here. */
+{
+  const res = await worker.fetch(new Request("https://relayer.test/"), env);
+  const body = await res.json();
+  ok(res.status === 200 && body.ok === true, "GET / still answers ok");
+  ok(body.build === "20261110a", "GET / reports the build stamp (bump with BUILD)");
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
