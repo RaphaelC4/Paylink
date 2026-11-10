@@ -64,7 +64,6 @@
  * log-only. Full event catalog and thresholds: workers/OPERATIONS.md.
  *
  * Secrets:  wrangler secret put RELAYER_KEY     (ed25519, matches RELAYER_ACCOUNT)
- *           wrangler secret put TICK_SECRET     (unused; kept for symmetry)
  *           wrangler secret put ALERT_WEBHOOK_URL (optional — where level=alert events go)
  * Vars:     RPC_URL, CONTRACT_ID, TOKEN_ID, RELAYER_ACCOUNT, ALLOWED_ORIGIN
  * Binding:  RATE_LIMITER (optional — durable burst cap, setup in README.md)

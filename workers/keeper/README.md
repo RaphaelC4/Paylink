@@ -60,7 +60,11 @@ down in [NOTES.md](./NOTES.md).
      the Worker picks the 64-byte key out; a public key (32 bytes) is
      rejected with a message saying so.
    - `TICK_SECRET` — type **Secret**, any long random string you make up.
-     It gates `POST /tick`.
+     It gates `POST /tick` and nothing else: the every-minute cron never
+     reads it, and the check fails closed — with the secret unset,
+     `POST /tick` answers 403 to every request while the cron keeps
+     sweeping normally. Never commit it, never log it; `.dev.vars`
+     (local runs) is gitignored.
    - All type **Text**: `RPC_URL` = `https://test.rpc.fastnear.com`,
      `CONTRACT_ID` = `paylink-v2.testnet`,
      `KEEPER_ACCOUNT` = `paylink-keeper.testnet`, `ALLOWED_ORIGIN` = `*`.
@@ -97,7 +101,7 @@ For a local run, put `KEEPER_KEY=...` and `TICK_SECRET=...` in `.dev.vars`
 ## Monitoring (M-01)
 
 Every event is one structured JSON line (`{ts, svc, build, level, event,
-...}`, build `20261110d`) on stdout — Workers → Logs or `wrangler tail`.
+...}`, build `20261110e`) on stdout — Workers → Logs or `wrangler tail`.
 All lines of one sweep share a `run_id` (also returned by `/tick`), so
 "did the 14:03 run settle it?" is one query.
 

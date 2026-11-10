@@ -216,8 +216,10 @@ Why this is acceptable (and was proven live as `keeper-004`):
   it briefly held the key during workerd testing.
 - `paylink.testnet`'s local key is stale — **never sign with it.** The keeper only ever signs
   as `paylink-keeper.testnet`.
-- `TICK_SECRET` guards `POST /tick` (any other body → 403) so strangers can't drive manual
-  sweeps; `GET /` is intentionally open as a liveness probe and returns no secrets.
+- `TICK_SECRET` guards `POST /tick` (missing or wrong `x-tick-secret` header → 403; with the
+  secret unset the whole route stays closed) so strangers can't drive manual
+  sweeps; the every-minute cron never reads it. `GET /` is intentionally open as a
+  liveness probe and returns no secrets.
 
 ## 9. End-to-end proof log
 

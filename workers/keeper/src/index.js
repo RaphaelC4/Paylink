@@ -84,7 +84,7 @@ const SCAN_PARTIAL_ALERT = 3; // M-01 pattern: alert on the 3rd consecutive part
 const CLAIM_STRIKE_ALERT = 3;
 const SWEEP_OUTAGE_ALERT = 3;
 const SVC = "paylink-keeper";
-const BUILD = "20261110d";
+const BUILD = "20261110e";
 
 /* ────────────────────────────────────────────────────────────── rpc ── */
 
@@ -816,6 +816,42 @@ const json = (obj, status = 200, headers = {}) =>
     headers: { "content-type": "application/json", ...headers },
   });
 
+/* ── manual-trigger auth: constant-time secret comparison (L-05 hardening) ──
+ *
+ * `given !== env.TICK_SECRET` short-circuits at the first differing byte,
+ * which is the textbook timing side-channel. This replaces it without
+ * changing the policy: same header, same endpoint, same 403 boundary.
+ *
+ * Both sides are SHA-256'd to fixed 32-byte digests, then ALL digest bytes
+ * are folded into one XOR accumulator — the loop always runs 32 iterations,
+ * never exits early, and equal-length digests mean the configured secret's
+ * length never branches the comparison. Hashing also means a longer or
+ * shorter supplied value cannot be probed byte-by-byte.
+ *
+ * Fail closed everywhere: missing/empty supplied or configured secret
+ * returns false before any hashing; no Web Crypto (or a digest that
+ * throws) returns false — there is deliberately NO fallback to plain
+ * string equality. Neither value nor any digest is ever logged. */
+export async function secretMatches(given, expected, webcrypto = globalThis.crypto) {
+  if (!expected || !given) return false;
+  const subtle = webcrypto && webcrypto.subtle;
+  if (!subtle || typeof subtle.digest !== "function") return false;
+  try {
+    const enc = new TextEncoder();
+    const [a, b] = await Promise.all([
+      subtle.digest("SHA-256", enc.encode(String(given))),
+      subtle.digest("SHA-256", enc.encode(String(expected))),
+    ]);
+    const va = new Uint8Array(a);
+    const vb = new Uint8Array(b);
+    let diff = 0;
+    for (let i = 0; i < va.length; i++) diff |= va[i] ^ vb[i]; // no early exit
+    return diff === 0;
+  } catch {
+    return false; // fail closed, never fall back to !==
+  }
+}
+
 function corsHeaders(env) {
   const origin = env.ALLOWED_ORIGIN || "*";
   return {
@@ -843,7 +879,7 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/tick") {
       const given = request.headers.get("x-tick-secret") || "";
-      if (!env.TICK_SECRET || given !== env.TICK_SECRET) {
+      if (!(await secretMatches(given, env.TICK_SECRET))) {
         return json({ error: "forbidden" }, 403, cors);
       }
       /* The tick's run_id is passed into the sweep, so the HTTP response and

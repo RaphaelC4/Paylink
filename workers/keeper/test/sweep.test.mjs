@@ -8,7 +8,7 @@
  */
 
 import { generateKeyPairSync } from "node:crypto";
-import worker, { sweep, decodeLink, parseSecretKey, logEvent, formatYoctoNEAR } from "../src/index.js";
+import worker, { sweep, decodeLink, parseSecretKey, logEvent, formatYoctoNEAR, secretMatches } from "../src/index.js";
 
 let passed = 0;
 let failed = 0;
@@ -398,7 +398,7 @@ const byEvent = (name) => events().filter((e) => e.event === name);
   const keys = Object.keys(body).sort();
   ok(res.status === 200 && JSON.stringify(keys) === JSON.stringify(["account", "build", "contract", "ok", "service"]),
     "GET / body is a fixed key allowlist (no run or user data)");
-  ok(body.build === "20261110d", "GET / reports the build stamp (bump with BUILD)");
+  ok(body.build === "20261110e", "GET / reports the build stamp (bump with BUILD)");
   ok(!JSON.stringify(body).includes("ed25519"), "health output carries no key material");
 }
 
@@ -423,7 +423,7 @@ const byEvent = (name) => events().filter((e) => e.event === name);
   ok(summary && summary.scanned === 1 && summary.claimed === 1 && summary.over_cap === 0
     && typeof summary.ms === "number",
     "sweep_summary carries the run's aggregate outcome and duration");
-  ok(summary && summary.svc === "paylink-keeper" && summary.build === "20261110d"
+  ok(summary && summary.svc === "paylink-keeper" && summary.build === "20261110e"
     && summary.level === "info" && typeof summary.ts === "string",
     "line carries the ts/svc/build/level envelope");
   ok(!hasEvent("unsettled_paid"), "a fully settled run does not warn unsettled_paid");
@@ -851,6 +851,78 @@ const byEvent = (name) => events().filter((e) => e.event === name);
     "a CANCELLED link is scanned but never a claim candidate");
   ok(broadcasts.length === 1, "cancelled links are never broadcast to");
   ok(report.scanned === 3, "the cancelled record still decodes cleanly during the scan");
+}
+
+/* 35. L-05: /tick auth fails closed — no TICK_SECRET, no sweep */
+{
+  reset([link("auth1", 1)], "ok"); // a PAID link is waiting: a sweep would claim it
+
+  // Wrong secret: refused before the sweep is ever entered.
+  let res = await worker.fetch(
+    new Request("https://keeper.test/tick", {
+      method: "POST",
+      headers: { "x-tick-secret": "not-the-secret" },
+    }),
+    { ...ENV, TICK_SECRET: "test-tick-secret" },
+  );
+  ok(res.status === 403, "a wrong x-tick-secret is refused with 403");
+  ok(broadcasts.length === 0, "the refused tick never swept — zero broadcasts");
+
+  // Right secret configured, header absent: same refusal.
+  res = await worker.fetch(
+    new Request("https://keeper.test/tick", { method: "POST" }),
+    { ...ENV, TICK_SECRET: "test-tick-secret" },
+  );
+  ok(res.status === 403, "a missing x-tick-secret header is refused with 403");
+
+  // No secret configured at all: the route is disabled, not wide open.
+  res = await worker.fetch(
+    new Request("https://keeper.test/tick", { method: "POST" }),
+    ENV,
+  );
+  ok(res.status === 403 && broadcasts.length === 0,
+    "with TICK_SECRET unset the route answers 403 and never sweeps");
+
+  const body = await res.json();
+  ok(body.error === "forbidden", "the 403 body is generic — no detail leaks");
+}
+
+/* 36. L-05 hardening: constant-time TICK_SECRET comparison (Web Crypto) */
+{
+  const SECRET = "test-tick-secret";
+  const post = (headers, env) => worker.fetch(
+    new Request("https://keeper.test/tick", { method: "POST", headers }),
+    env,
+  );
+  const full = { ...ENV, TICK_SECRET: SECRET };
+
+  // Accepted: the correct secret still runs a sweep end to end.
+  reset([link("ct1", 1)], "ok");
+  let res = await post({ "x-tick-secret": SECRET }, full);
+  ok(res.status === 200 && (await res.json()).claimed.length === 1,
+    "correct secret accepted — endpoint behaviour unchanged");
+
+  // Every rejection shape, through the endpoint — same 403 boundary as before.
+  reset([link("ct2", 1)], "ok"); // a PAID link waits; no refusal may sweep it
+  res = await post({ "x-tick-secret": "not-the-secret" }, full);
+  ok(res.status === 403, "incorrect secret rejected");
+  res = await post({ "x-tick-secret": "" }, full);
+  ok(res.status === 403, "empty supplied secret rejected");
+  res = await post({ "x-tick-secret": SECRET }, ENV); // env carries no TICK_SECRET
+  ok(res.status === 403, "missing configured secret rejected");
+  res = await post({ "x-tick-secret": SECRET + "-extra" }, full);
+  ok(res.status === 403, "different-length (longer) secret rejected");
+  res = await post({ "x-tick-secret": SECRET.slice(0, 5) }, full);
+  ok(res.status === 403, "different-length (shorter) secret rejected");
+  res = await post({ "x-tick-secret": "TEST-tick-SECRET" }, full); // same length, 10 chars differ
+  ok(res.status === 403, "multiple mismatched characters rejected");
+  ok(broadcasts.length === 0, "no refused attempt ever reached the sweep");
+
+  // Fail closed when Web Crypto is unavailable — no plain-string fallback.
+  ok((await secretMatches(SECRET, SECRET, null)) === false,
+    "without crypto.subtle the helper fails closed instead of comparing plainly");
+  ok((await secretMatches(SECRET, SECRET, {})) === false,
+    "an object without digest() also fails closed");
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
