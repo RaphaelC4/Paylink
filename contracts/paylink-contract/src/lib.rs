@@ -20,7 +20,7 @@ use near_sdk::json_types::U128;
 use near_sdk::serde_json::{self, json};
 use near_sdk::store::{LookupMap, LookupSet};
 use near_sdk::{
-    env, near, require, AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseError,
+    AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseError, env, near, require,
 };
 
 /// Storage stake taken when an invoice is created. Covers the state it writes
@@ -499,7 +499,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use near_sdk::test_utils::{accounts, get_created_receipts, VMContextBuilder};
+    use near_sdk::test_utils::{VMContextBuilder, accounts, get_created_receipts};
     use near_sdk::testing_env;
 
     const TOKEN: &str = "usdc.fakes.testnet";
@@ -527,10 +527,12 @@ mod tests {
     fn setup() -> Contract {
         // `new()` is payable: it funds two NEP-145 storage balances per token
         // (this contract and the fee account).
-        testing_env!(VMContextBuilder::new()
-            .current_account_id(CONTRACT.parse().unwrap())
-            .attached_deposit(NearToken::from_yoctonear(STORAGE_DEPOSIT_PER_TOKEN * 2))
-            .build());
+        testing_env!(
+            VMContextBuilder::new()
+                .current_account_id(CONTRACT.parse().unwrap())
+                .attached_deposit(NearToken::from_yoctonear(STORAGE_DEPOSIT_PER_TOKEN * 2))
+                .build()
+        );
         Contract::new(vec![token()], fee_account())
     }
 
@@ -558,9 +560,11 @@ mod tests {
     }
 
     fn claim_as(contract: &mut Contract, caller: &str, id: &str) {
-        testing_env!(ctx(caller)
-            .attached_deposit(NearToken::from_yoctonear(1))
-            .build());
+        testing_env!(
+            ctx(caller)
+                .attached_deposit(NearToken::from_yoctonear(1))
+                .build()
+        );
         let _ = contract.claim(id.to_string());
     }
 
@@ -654,9 +658,11 @@ mod tests {
     #[should_panic(expected = "this token is not accepted")]
     fn create_link_rejects_a_token_that_is_not_allowlisted() {
         let mut c = setup();
-        testing_env!(ctx("alice.near")
-            .attached_deposit(CREATE_STORAGE_STAKE)
-            .build());
+        testing_env!(
+            ctx("alice.near")
+                .attached_deposit(CREATE_STORAGE_STAKE)
+                .build()
+        );
         c.create_link(
             "lnk-x".to_string(),
             U128(100),
@@ -685,9 +691,11 @@ mod tests {
     fn the_old_too_small_stake_is_now_rejected() {
         // The stake used to be 0.001 NEAR while the message promised 0.01.
         let mut c = setup();
-        testing_env!(ctx("alice.near")
-            .attached_deposit(NearToken::from_millinear(1))
-            .build());
+        testing_env!(
+            ctx("alice.near")
+                .attached_deposit(NearToken::from_millinear(1))
+                .build()
+        );
         c.create_link(
             "lnk-z".to_string(),
             U128(100),
@@ -748,10 +756,7 @@ mod tests {
 
         // Somebody else still settles it — and pays themselves back the fee.
         assert_eq!(pay(&mut c, "bob.near", 100, "lnk-self"), U128(0));
-        assert_eq!(
-            c.get_link("lnk-self".into()).unwrap().status,
-            Status::Paid
-        );
+        assert_eq!(c.get_link("lnk-self".into()).unwrap().status, Status::Paid);
     }
 
     #[test]
@@ -812,10 +817,12 @@ mod tests {
     #[test]
     fn an_expired_invoice_cannot_be_paid() {
         let mut c = setup();
-        testing_env!(ctx("alice.near")
-            .attached_deposit(CREATE_STORAGE_STAKE)
-            .block_timestamp(1_000_000_000) // 1000 s, in ns
-            .build());
+        testing_env!(
+            ctx("alice.near")
+                .attached_deposit(CREATE_STORAGE_STAKE)
+                .block_timestamp(1_000_000_000) // 1000 s, in ns
+                .build()
+        );
         c.create_link(
             "lnk-old".into(),
             U128(100),
@@ -838,10 +845,12 @@ mod tests {
     #[test]
     fn an_expired_invoice_is_reported_as_expired_even_unpaid() {
         let mut c = setup();
-        testing_env!(ctx("alice.near")
-            .attached_deposit(CREATE_STORAGE_STAKE)
-            .block_timestamp(1_000_000_000)
-            .build());
+        testing_env!(
+            ctx("alice.near")
+                .attached_deposit(CREATE_STORAGE_STAKE)
+                .block_timestamp(1_000_000_000)
+                .build()
+        );
         c.create_link(
             "lnk-age".into(),
             U128(100),
@@ -875,11 +884,11 @@ mod tests {
         let calls = calls_to(TOKEN);
         // Registration runs first…
         assert_eq!(calls[0].0, "storage_deposit");
-        let transfers: Vec<_> = calls
-            .iter()
-            .filter(|(f, _)| f == "ft_transfer")
-            .collect();
-        assert!(!transfers.is_empty(), "claim must queue transfers to the token");
+        let transfers: Vec<_> = calls.iter().filter(|(f, _)| f == "ft_transfer").collect();
+        assert!(
+            !transfers.is_empty(),
+            "claim must queue transfers to the token"
+        );
         for (_function, args) in transfers {
             let receiver = args["receiver_id"].as_str().unwrap();
             assert!(
@@ -913,11 +922,13 @@ mod tests {
             .into_iter()
             .filter(|r| {
                 r.receiver_id.as_str() == TOKEN
-                    && r.actions.iter().any(|a| matches!(
-                        a,
-                        near_sdk::mock::MockAction::FunctionCallWeight { method_name, .. }
-                            if method_name.as_slice() == b"ft_transfer"
-                    ))
+                    && r.actions.iter().any(|a| {
+                        matches!(
+                            a,
+                            near_sdk::mock::MockAction::FunctionCallWeight { method_name, .. }
+                                if method_name.as_slice() == b"ft_transfer"
+                        )
+                    })
             })
             .count();
         assert_eq!(payout_receipts, 1, "payout and fee must be a single batch");
@@ -937,7 +948,10 @@ mod tests {
             .into_iter()
             .filter(|r| r.receiver_id.as_str() == TOKEN)
             .collect();
-        assert!(to_token.len() >= 2, "registration receipt then payout batch");
+        assert!(
+            to_token.len() >= 2,
+            "registration receipt then payout batch"
+        );
 
         let first: Vec<(String, near_sdk::serde_json::Value)> = to_token[0]
             .actions
@@ -1038,9 +1052,11 @@ mod tests {
         );
 
         // A second claim, by anyone, is refused while the first is in flight.
-        testing_env!(ctx("carol.near")
-            .attached_deposit(NearToken::from_yoctonear(1))
-            .build());
+        testing_env!(
+            ctx("carol.near")
+                .attached_deposit(NearToken::from_yoctonear(1))
+                .build()
+        );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut c2 = c;
             let _ = c2.claim("lnk-claim".into());
@@ -1117,17 +1133,20 @@ mod tests {
 
         assert_eq!(alice.len(), 2);
         assert_eq!(bob.len(), 1);
-        assert!(alice
-            .iter()
-            .all(|l| l.creator == "alice.near".parse::<AccountId>().unwrap()));
+        assert!(
+            alice
+                .iter()
+                .all(|l| l.creator == "alice.near".parse::<AccountId>().unwrap())
+        );
     }
 
     #[test]
     fn unknown_creator_gets_an_empty_ledger_not_an_error() {
         let c = setup();
-        assert!(c
-            .get_links_by_creator("nobody.testnet".parse().unwrap())
-            .is_empty());
+        assert!(
+            c.get_links_by_creator("nobody.testnet".parse().unwrap())
+                .is_empty()
+        );
         assert_eq!(
             c.link_count_by_creator("nobody.testnet".parse().unwrap()),
             0
@@ -1156,9 +1175,11 @@ mod tests {
 
         let calls = calls_to(TOKEN);
         assert_eq!(calls.len(), 2);
-        assert!(calls
-            .iter()
-            .all(|(f, a)| f == "storage_deposit" && a["registration_only"] == true));
+        assert!(
+            calls
+                .iter()
+                .all(|(f, a)| f == "storage_deposit" && a["registration_only"] == true)
+        );
         let who: Vec<_> = calls
             .iter()
             .map(|(_, a)| a["account_id"].as_str().unwrap().to_string())
@@ -1170,19 +1191,23 @@ mod tests {
     #[test]
     #[should_panic(expected = "attach at least 0.02 NEAR per allowlisted token")]
     fn new_requires_a_deposit_to_fund_registration() {
-        testing_env!(VMContextBuilder::new()
-            .current_account_id(CONTRACT.parse().unwrap())
-            .build()); // no deposit attached
+        testing_env!(
+            VMContextBuilder::new()
+                .current_account_id(CONTRACT.parse().unwrap())
+                .build()
+        ); // no deposit attached
         Contract::new(vec![token()], fee_account());
     }
 
     #[test]
     #[should_panic(expected = "attach at least 0.02 NEAR per allowlisted token")]
     fn the_old_one_registration_deposit_is_no_longer_enough() {
-        testing_env!(VMContextBuilder::new()
-            .current_account_id(CONTRACT.parse().unwrap())
-            .attached_deposit(NearToken::from_yoctonear(STORAGE_DEPOSIT_PER_TOKEN))
-            .build());
+        testing_env!(
+            VMContextBuilder::new()
+                .current_account_id(CONTRACT.parse().unwrap())
+                .attached_deposit(NearToken::from_yoctonear(STORAGE_DEPOSIT_PER_TOKEN))
+                .build()
+        );
         Contract::new(vec![token()], fee_account());
     }
 

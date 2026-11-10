@@ -1,0 +1,203 @@
+# Paylink continuous integration — audit finding M-03.
+#
+# Every command here is documented in README.md ("Development") or ships with
+# the Parse Worker: nothing is invented, nothing is skipped, nothing is
+# deployed. All suites are self-contained (mocked RPC, keys generated per
+# run, throwaway literals), so this workflow needs NO repository secrets and
+# no production credentials, and it prints none. Permissions are read-only;
+# there are no wrangler / near / deploy steps anywhere below.
+#
+# Triggers: pull requests targeting master or staging; pushes to staging.
+# Actions are pinned to full commit SHAs; the release tag is kept in a
+# trailing comment so upgrades stay reviewable.
+
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - master
+      - staging
+  push:
+    branches:
+      - staging
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+# One run per branch; a newer push cancels the in-flight run of the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── item 3 (formatting) + item 4 (syntax / static checks) ────────────────
+  static:
+    name: Formatting & syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # nothing after checkout runs git; keep the token off disk
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: JavaScript syntax (node --check)
+        # Parses every worker/frontend source and test file; all failures are
+        # collected and annotated on the PR instead of stopping at the first.
+        run: |
+          set -euo pipefail
+          status=0
+          for f in \
+            workers/relayer/src/index.js \
+            workers/relayer/test/parse.test.mjs \
+            workers/keeper/src/index.js \
+            workers/keeper/test/sweep.test.mjs \
+            workers/parse/src/index.js \
+            workers/parse/test/parse.test.mjs \
+            frontend/app.js \
+            frontend/config.js \
+            frontend/test/one-approval.test.mjs
+          do
+            if node --check "$f"; then
+              echo "ok  node --check $f"
+            else
+              echo "::error file=$f::JavaScript syntax check failed"
+              status=1
+            fi
+          done
+          exit $status
+
+      - name: Rust formatting (cargo fmt --check)
+        # rust-toolchain.toml pins channel=stable; the runner's rustup picks
+        # it up. The crate formats clean as of M-03 — this keeps it clean.
+        working-directory: contracts/paylink-contract
+        run: |
+          set -euo pipefail
+          rustup component add rustfmt
+          cargo fmt --check
+
+  # ── item 5 (contract tests) ──────────────────────────────────────────────
+  contract:
+    name: Contract tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # nothing after checkout runs git; keep the token off disk
+
+      - name: Install nasm (README prerequisite — aws-lc-sys host builds)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y nasm
+
+      - name: Cache Rust registry and build output
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: contracts/paylink-contract
+
+      - name: cargo test --lib (38 host tests)
+        working-directory: contracts/paylink-contract
+        run: cargo test --lib
+
+  # ── item 6 (relayer tests) ───────────────────────────────────────────────
+  relayer:
+    name: Relayer tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # nothing after checkout runs git; keep the token off disk
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      # No install step: README — "the three JS suites — no dependencies,
+      # plain node". There is no node_modules and nothing to cache.
+      - name: node workers/relayer/test/parse.test.mjs
+        run: node workers/relayer/test/parse.test.mjs
+
+  # ── item 7 (keeper tests) ────────────────────────────────────────────────
+  keeper:
+    name: Keeper tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # nothing after checkout runs git; keep the token off disk
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: node workers/keeper/test/sweep.test.mjs
+        run: node workers/keeper/test/sweep.test.mjs
+
+  # ── item 8 (frontend tests and build) ────────────────────────────────────
+  frontend:
+    name: Frontend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # nothing after checkout runs git; keep the token off disk
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: Build check — static site, no bundler (by design)
+        # README: "frontend (static, no build step)". No build command
+        # exists, so CI verifies the files the page loads are all present
+        # rather than inventing a bundler; their syntax is parsed in the
+        # Formatting & syntax job.
+        run: |
+          set -euo pipefail
+          for f in frontend/index.html frontend/app.js frontend/config.js frontend/styles.css; do
+            if [ ! -f "$f" ]; then
+              echo "::error file=$f::required frontend file is missing"
+              exit 1
+            fi
+          done
+          echo "static site files present — no build step exists by design"
+
+      - name: node frontend/test/one-approval.test.mjs
+        run: node frontend/test/one-approval.test.mjs
+
+  # ── item 9 (parse worker tests) ──────────────────────────────────────────
+  parse:
+    name: Parse tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # nothing after checkout runs git; keep the token off disk
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: node workers/parse/test/parse.test.mjs
+        run: node workers/parse/test/parse.test.mjs
