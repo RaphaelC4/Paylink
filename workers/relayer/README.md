@@ -48,6 +48,12 @@ creation; the relayer pays ~0.0105 NEAR (stake + gas) per link. The evidence
      - `ALLOWED_ORIGIN` = `https://paylink-near.vercel.app` (the deployed
        frontend's origin; `*` also works — CORS only constrains browsers, and
        the per-IP rate limit is the real bound)
+      - Optional: `RPC_URLS` — comma-separated read fallbacks (e.g.
+        `https://near-testnet.drpc.org, https://testnet-rpc.intea.rs`).
+        Reads try `RPC_URL` first, then each entry in order, stopping at
+        the first that answers; the broadcast always goes to `RPC_URL`
+        alone, exactly once — never retried, never failed over. Unset =
+        the original behaviour.
 4. **Fund check**: the account must hold more than 1 NEAR (the Worker refuses
    below that floor). It currently holds ~9.98 testnet NEAR from the faucet —
    roughly 950 creations.
@@ -145,7 +151,7 @@ spread across instances).
 ## Monitoring (M-01)
 
 Every operational event is one structured JSON line
-(`{ts, svc, build, level, event, ...}`, build `20261110c`) on stdout —
+(`{ts, svc, build, level, event, ...}`, build `20261110d`) on stdout —
 readable in Workers → Logs or `wrangler tail`. Each `/submit` response
 carries an `X-Request-Id` echoed in that request's log lines, so a
 "it failed" message maps onto exactly one trace.

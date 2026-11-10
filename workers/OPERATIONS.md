@@ -21,7 +21,7 @@ Every operational event is **one JSON line on stdout**:
 |---------|---------|
 | `ts`    | ISO-8601 UTC timestamp |
 | `svc`   | `paylink-relayer` \| `paylink-keeper` \| `paylink-parse` |
-| `build` | build stamp — relayer `20261110c`, keeper `20261110e`, parse `20261110b` (in log lines only) |
+| `build` | build stamp — relayer `20261110d`, keeper `20261110f`, parse `20261110b` (in log lines only) |
 | `level` | `info` \| `warn` \| `error` \| `alert` |
 | `event` | catalog name from the tables below |
 | …       | event-specific fields, always flat scalars or short string arrays |
@@ -219,8 +219,8 @@ Nothing above was done for M-01 (no deploy, no push, no account changes).
 
 | Suite | Result | M-01 coverage |
 |-------|--------|---------------|
-| `node workers/relayer/test/parse.test.mjs` | **145 passed, 0 failed** | envelope + svc/build/level, `X-Request-Id` echo ↔ log `rid` match, `submit_rejected` reason codes, `submit_ok` happy path through an in-process RPC mock (no delegate/key bytes in any line), `rate_limited` layer+retry_after, `volume_anomaly` (fires at threshold, once per window), `error_burst` ×5 with webhook payload assertions, webhook on/off/dead-URL-never-logged plumbing, scrub probe, `GET /` allowlist + stats shape |
-| `node workers/keeper/test/sweep.test.mjs` | **170 passed, 0 failed** | `GET /` allowlist + build, `/tick` run_id correlation, tick 500 → `sweep_failed`+`tick_failed`, `cron_heartbeat` ok true/false (exactly one per run), `unsettled_paid` warn, `repeated_claim_failure` 3-strike + webhook + streak reset, `sweep_outage` 3-strike + scrubbed error + recovery reset, sweep_summary shape, scrub probe; **M-06**: live key/value layout fixture, 61-bucket fallback walk (boundaries 4/7/64), transient page retry, unreadable region fail-soft + `scan_partial`/`scan_degraded` streaks + recovery, duplicate key across pages claims once, query ceiling and zero-budget guards, one access-key read per sweep with sequential nonces, nonce re-read after unknown broadcast outcome and `InvalidNonce`; **L-02**: u128 both-limb decode (zero → u128::MAX, the 2^64 boundary, optional paid_amount path), lo-then-hi byte order incl. the live view_state record, settlement unchanged for a >2^64 amount (still 1 yocto), `formatYoctoNEAR` (0/1 yocto/1 NEAR/1.5/10^30/2^64/u128::MAX + malformed strings/Numbers/out-of-range rejected), truncated and garbage records skipped without failing the sweep; **L-03**: status byte 3 decodes `CANCELLED` (never `EXPIRED`), a cancelled record carries no payment fields, and a cancelled link is scanned but never a claim candidate; **L-05**: `/tick` fails closed — wrong secret, missing header and unset `TICK_SECRET` each answer 403 with zero broadcasts; the comparison itself is constant-time (SHA-256 digests, XOR accumulator, no plain-string fallback) |
+| `node workers/relayer/test/parse.test.mjs` | **173 passed, 0 failed** | envelope + svc/build/level, `X-Request-Id` echo ↔ log `rid` match, `submit_rejected` reason codes, `submit_ok` happy path through an in-process RPC mock (no delegate/key bytes in any line), `rate_limited` layer+retry_after, `volume_anomaly` (fires at threshold, once per window), `error_burst` ×5 with webhook payload assertions, webhook on/off/dead-URL-never-logged plumbing, scrub probe, `GET /` allowlist + stats shape; **L-08**: reads fail over primary → `RPC_URLS` in order (the flow reaches the broadcast only because the fallback answered), the broadcast goes only to the primary exactly once — with a dead primary *and* with a healthy fallback configured — no pointless failover while the primary is healthy, and without `RPC_URLS` a query still retries the same endpoint while the fallback is never contacted |
+| `node workers/keeper/test/sweep.test.mjs` | **178 passed, 0 failed** | `GET /` allowlist + build, `/tick` run_id correlation, tick 500 → `sweep_failed`+`tick_failed`, `cron_heartbeat` ok true/false (exactly one per run), `unsettled_paid` warn, `repeated_claim_failure` 3-strike + webhook + streak reset, `sweep_outage` 3-strike + scrubbed error + recovery reset, sweep_summary shape, scrub probe; **M-06**: live key/value layout fixture, 61-bucket fallback walk (boundaries 4/7/64), transient page retry, unreadable region fail-soft + `scan_partial`/`scan_degraded` streaks + recovery, duplicate key across pages claims once, query ceiling and zero-budget guards, one access-key read per sweep with sequential nonces, nonce re-read after unknown broadcast outcome and `InvalidNonce`; **L-02**: u128 both-limb decode (zero → u128::MAX, the 2^64 boundary, optional paid_amount path), lo-then-hi byte order incl. the live view_state record, settlement unchanged for a >2^64 amount (still 1 yocto), `formatYoctoNEAR` (0/1 yocto/1 NEAR/1.5/10^30/2^64/u128::MAX + malformed strings/Numbers/out-of-range rejected), truncated and garbage records skipped without failing the sweep; **L-03**: status byte 3 decodes `CANCELLED` (never `EXPIRED`), a cancelled record carries no payment fields, and a cancelled link is scanned but never a claim candidate; **L-05**: `/tick` fails closed — wrong secret, missing header and unset `TICK_SECRET` each answer 403 with zero broadcasts; the comparison itself is constant-time (SHA-256 digests, XOR accumulator, no plain-string fallback); **L-08**: reads fail over primary → `RPC_URLS` in order (primary first, the nonce read completes on the fallback), the broadcast is attempted exactly once on the primary and never fails over (dead-primary and healthy-fallback cases), the fallback never receives a broadcast, and without `RPC_URLS` a query still retries the same endpoint |
 | `node workers/parse/test/parse.test.mjs` | **136 passed, 0 failed** | `parse_ok` envelope/no-values/rid, 405 untouched (no rid header), `parse_rejected` reason codes, `rate_limited` (11th request), `upstream_error` kinds + key redacted by value + 240 cap, `upstream_degraded` 5-in-window + webhook delivery, `service_error` generic 500 with no stack, leak sweep over 86 captured bodies; **L-06**: slow-in-budget response still parses (timer cleared — no late abort), stalled success body → 504 `kind=timeout`, stalled **error** body → 504 `kind=timeout` (was 502 `http_status`), upstream 429/400 → 502 status-only with no key/detail leak, network failure → 502 `kind=unreachable`, invalid JSON → 502 `kind=unreadable` (never a timeout) |
 
 ---
@@ -245,3 +245,41 @@ Nothing above was done for M-01 (no deploy, no push, no account changes).
    structured pipeline; contract emits events on chain, readable via RPC).
 8. **Other audit findings untouched by design**: M-03 – M-06 and L-01 – L-08
    remain open; M-01 changed no contract economics, payment flow, or H-01.
+
+---
+
+## 9. Service quotas & assumptions (L-08 P3 — verified 10 Nov 2026)
+
+Every external service the project runs on, its published free-tier limit,
+and our headroom. Each number is quoted from the source linked beneath the
+table — none assumed — and re-verified on the date above. Free tiers change
+without notice: re-check before relying on any of these for mainnet.
+
+| Service | Free-tier limit (verified) | Our usage / headroom | If it runs out |
+| --- | --- | --- | --- |
+| **NEAR RPC** `test.rpc.fastnear.com` — frontend, keeper, relayer | **No published numeric quota.** Key-free public endpoint; NEAR's provider table lists "Not published" for FastNEAR's free tier. Paid plans from $69/mo (10M req/mo). Archival listed paid-only | Keeper: ~1 whole-state read (+1 retry) per minute ≈ 1.5–3k req/day plus per-claim broadcasts; frontend/relayer only on demand. No ceiling exists to budget against | 429/network error → frontend: one automatic read retry, then *Could not read the chain* + Try again; workers: query retried once, `sweep_outage` alert after 3 consecutive minutes, automatic recovery |
+| **Cloudflare Workers** (keeper, relayer, parse) + **Cron** | **100,000 requests/day** across all Workers (reset midnight UTC; over-limit → Error 1027, per-route fail-open/fail-closed). **10 ms CPU/invocation** (network waits don't count). **5 cron triggers/account**, finest interval **1 minute** (we use 1 trigger at exactly that), cron CPU 10 ms, wall 15 min. Subrequests 50/invocation | Keeper ≈ 1,440 scheduled runs/day + ≤10 claims/sweep + health pings; relayer/parse on demand ⇒ realistically **<10 % of the daily cap**. The binding risk is a runaway code loop, not traffic | Over cap: cron stops until UTC midnight (settlement stalls; manual Release + funds-in-contract keep money safe). CPU over: invocation aborted → next minute's sweep retries |
+| **Workers Logs** | **200,000 events/day, 3-day retention** (free). **Pricing changes 1 Dec 2026** to Cloudflare Observability pricing — re-verify after that date | Keeper ≈ 2 lines/run (`sweep_summary` + `cron_heartbeat`) + per-claim events + warns ⇒ ~5–10k/day, ≪ 200k | Over cap: lines stop being stored (alerts already sent are unaffected); detection degrades to dashboard-only |
+| **Gemini** `gemini-3.5-flash-lite` (parse Worker) | **15 RPM / 250K TPM / 500 RPD per project per model** (observed values; Google publishes no per-model table — the project's live numbers are in AI Studio; the `…FreeTier` daily quota = 500 confirmed in Google's forum for this model, 2026-11-02). RPD resets **midnight Pacific** (reset can lag a few minutes). Free tier also serves 503 "high demand" spikes | Parse's own limiter is **10 req/min per IP** (enforced before Gemini is called) — a per-minute, *not* per-day, bound, so one aggressive client could in theory exhaust the project-wide 500 RPD for everyone. Demo usage is tens/day | 429/503 → Worker answers 429/502 with a JSON error, key never leaked; paste block shows the error. **Payment flow unaffected** (parsing is optional) |
+| **Vercel** (frontend static host) | Hobby: **100 GB** Fast Data Transfer/mo, **1M** CDN requests/mo, **100 deployments/day**. Exceeding usage → **503 `DEPLOYMENT_PAUSED`, typically up to 30 days wait** | A static page (no functions, few hundred KB) — demo traffic is a tiny fraction of 100 GB | Site down; **on-chain state and keeper unaffected**. Recovery: redeploy (drag-drop, no build step) or host the same folder elsewhere |
+| **Tidepool sandbox** (faucet + 1Click swap) | Keyless, free community testnet sandbox; no published quota (per repo docs) | Only used to *acquire* test USDC; in-flight swaps have a timeout + refund path | Faucet/swap unavailable → message points at the other path; **payers who already hold USDC are unaffected** |
+| **open.er-api.com** (NGN display line) | Keyless public reference; no documented quota | Display-only, one fetch per quote | Line silently hidden by design; flow never notices |
+| **`ALERT_WEBHOOK_URL`** (optional) | Whatever the target webhook allows | One POST per `level=alert` event, 3 s best-effort budget | Failure swallowed; alerts degrade to log-only (§4) |
+
+**Assumptions of record:** all limits are per-plan/per-project and may change
+without notice; nothing above requires a paid plan at demo scale, and no
+credential beyond the ones already listed in §5 is needed for any row; the
+frontend uses a **single** RPC endpoint (browser-side failover is limited by
+CORS and was not part of the approved P1 — P2's one automatic read retry is
+its mitigation), while the keeper and relayer now fail **reads** over through
+the optional `RPC_URLS` list (L-08 P1) with broadcasts still pinned to
+`RPC_URL`, exactly once — broadcast failover and the relayer direct-pay
+fallback are explicitly *not* approved yet; Gemini's daily quota is
+project-wide, so parse traffic from any client spends one shared budget.
+
+**Sources (all read 10 Nov 2026):** NEAR RPC provider table
+`docs.near.org/api/rpc/providers` · FastNEAR docs `docs.fastnear.com` ·
+Cloudflare pricing & limits `developers.cloudflare.com/workers/platform/`
+(updated 2–29 Oct 2026) · Gemini rate limits & pricing
+`ai.google.dev/gemini-api/docs/` + Google AI forum quota confirmation
+(2026-11-02) · Vercel Hobby plan & limits docs `vercel.com/docs/plans/hobby`.

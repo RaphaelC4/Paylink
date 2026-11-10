@@ -104,6 +104,8 @@ let failOnce = new Map();   // Map<prefixB64, remaining> -> fail N attempts, the
 let injections = new Map(); // Map<prefixB64, entries> -> extra entries in that page (overlap)
 const onceFlags = { throw: false, nonce: false }; // one-shot broadcast behaviors
 const webhookPosts = []; // M-01: ALERT_WEBHOOK_URL deliveries captured here
+let rpcUrlHits = [];     // L-08 P1: every RPC attempt, { url, method }, in order
+let deadUrls = new Set(); // L-08 P1: URLs that reject at the network level
 
 const link = (id, status, extra = {}) => ({
   link_id: id,
@@ -130,6 +132,10 @@ globalThis.fetch = async (_url, opts) => {
     return { json: async () => ({}) };
   }
   const body = JSON.parse(opts.body);
+  /* L-08 P1: record every RPC attempt per endpoint, and let a test mark an
+     endpoint dead (network-level rejection — DNS/connection failure). */
+  rpcUrlHits.push({ url: String(_url), method: body.method });
+  if (deadUrls.has(String(_url))) throw new TypeError("Failed to fetch");
   const json = (obj) => ({ json: async () => obj });
 
   if (body.method === "query" && body.params.request_type === "view_state") {
@@ -267,6 +273,8 @@ const reset = (links, mode) => {
   onceFlags.throw = false;
   onceFlags.nonce = false;
   webhookPosts.length = 0;
+  rpcUrlHits = [];
+  deadUrls = new Set();
 };
 
 /* ══════════════════════════ tests ══════════════════════════ */
@@ -398,7 +406,7 @@ const byEvent = (name) => events().filter((e) => e.event === name);
   const keys = Object.keys(body).sort();
   ok(res.status === 200 && JSON.stringify(keys) === JSON.stringify(["account", "build", "contract", "ok", "service"]),
     "GET / body is a fixed key allowlist (no run or user data)");
-  ok(body.build === "20261110e", "GET / reports the build stamp (bump with BUILD)");
+  ok(body.build === "20261110f", "GET / reports the build stamp (bump with BUILD)");
   ok(!JSON.stringify(body).includes("ed25519"), "health output carries no key material");
 }
 
@@ -423,7 +431,7 @@ const byEvent = (name) => events().filter((e) => e.event === name);
   ok(summary && summary.scanned === 1 && summary.claimed === 1 && summary.over_cap === 0
     && typeof summary.ms === "number",
     "sweep_summary carries the run's aggregate outcome and duration");
-  ok(summary && summary.svc === "paylink-keeper" && summary.build === "20261110e"
+  ok(summary && summary.svc === "paylink-keeper" && summary.build === "20261110f"
     && summary.level === "info" && typeof summary.ts === "string",
     "line carries the ts/svc/build/level envelope");
   ok(!hasEvent("unsettled_paid"), "a fully settled run does not warn unsettled_paid");
@@ -923,6 +931,51 @@ const byEvent = (name) => events().filter((e) => e.event === name);
     "without crypto.subtle the helper fails closed instead of comparing plainly");
   ok((await secretMatches(SECRET, SECRET, {})) === false,
     "an object without digest() also fails closed");
+}
+
+/* 37. L-08 P1: reads fail over across RPC endpoints; broadcasts never do */
+{
+  const FB = "https://rpc-fallback.test";
+
+  // Primary dead outright: reads fail over to RPC_URLS and keep working —
+  // the nonce read completing through the fallback is the proof. The
+  // broadcast, pinned to the primary, then fails: no failover, no retry.
+  reset([link("fb1", 1)], "ok");
+  deadUrls = new Set([ENV.RPC_URL]);
+  const fbEnv = { ...ENV, RPC_URLS: FB };
+  let report = await captureLogs(() => sweep(fbEnv));
+  const q = rpcUrlHits.filter((h) => h.method === "query");
+  ok(q.length >= 2 && q[0].url === ENV.RPC_URL && q[1].url === FB,
+    "reads try the primary first, then fail over to RPC_URLS");
+  ok(keyQueries.length === 1,
+    "the nonce read completed through the fallback (reads work after failover)");
+  const bc = rpcUrlHits.filter((h) => h.method === "broadcast_tx_commit");
+  ok(bc.length === 1 && bc[0].url === ENV.RPC_URL,
+    "the broadcast was attempted exactly once, on the primary — no failover, no retry");
+  ok(report.claimed.length === 0 && report.failed.length === 1,
+    "the dead primary's broadcast fails the claim rather than switching endpoints");
+  ok(!rpcUrlHits.some((h) => h.url === FB && h.method === "broadcast_tx_commit"),
+    "the fallback never received a broadcast");
+
+  // Even with a HEALTHY fallback configured, a failing broadcast does not
+  // move: attempted once on the primary, and that is the whole rule.
+  reset([link("fb2", 1)], "throw"); // every broadcast attempt throws
+  rpcUrlHits = [];
+  report = await captureLogs(() => sweep({ ...ENV, RPC_URLS: FB }));
+  const bc2 = rpcUrlHits.filter((h) => h.method === "broadcast_tx_commit");
+  ok(bc2.length === 1 && bc2[0].url === ENV.RPC_URL,
+    "with a healthy fallback, the broadcast still goes only to the primary, once");
+  ok(report.failed.length === 1, "and the claim is reported failed");
+
+  // Legacy parity: no RPC_URLS → a query still retries the SAME endpoint
+  // (the pre-failover "views retry once on a dropped connection").
+  reset([link("fb3", 1)], "ok");
+  deadUrls = new Set([ENV.RPC_URL]);
+  rpcUrlHits = [];
+  await captureLogs(() => sweep(ENV).catch(() => null));
+  const q2 = rpcUrlHits.filter((h) => h.method === "query");
+  ok(q2.length >= 2 && q2[0].url === ENV.RPC_URL && q2[1].url === ENV.RPC_URL,
+    "without RPC_URLS a query still retries the same endpoint (behaviour preserved)");
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

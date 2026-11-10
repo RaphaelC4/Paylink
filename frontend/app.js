@@ -284,7 +284,15 @@ async function copyText(text) {
 
 const RPC_TIMEOUT_MS = 12_000;
 
-async function rpc(method, params) {
+/* Methods rpc() is allowed to issue. This is the page's READ client — every
+   wallet transaction goes through call()/callViaRelayer() and never through
+   here — and the retry below is restricted to this list as defence in depth,
+   so a write accidentally routed through rpc() can never be sent twice. */
+const RPC_READ_METHODS = new Set([
+  "query", "status", "block", "tx", "network_info", "gas_price", "validators",
+]);
+
+async function rpcOnce(method, params) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), RPC_TIMEOUT_MS);
   try {
@@ -294,7 +302,11 @@ async function rpc(method, params) {
       body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params }),
       signal: ctl.signal,
     });
-    if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
+    if (!res.ok) {
+      const httpErr = new Error(`RPC HTTP ${res.status}`);
+      httpErr.rpcStatus = res.status; // lets rpc() tell a 5xx from a 4xx
+      throw httpErr;
+    }
     const body = await res.json();
     if (body.error) throw new Error(body.error.data || body.error.message || "rpc error");
     return body.result;
@@ -303,6 +315,27 @@ async function rpc(method, params) {
     throw e;
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/* One automatic retry (L-08 P2). Reads only, and only for the two conditions
+   a dead or restarting endpoint shows: a rejected fetch (DNS/connection
+   failure — the browser reports a CORS-blocked reply the same way, which is
+   why this is exactly one retry and not a loop) or a 5xx reply. Never on
+   4xx/429 (a rate limit must back off, not hammer), never on a timeout (that
+   attempt already waited the full 12 s), and never on a JSON-RPC error — the
+   chain answered. Two attempts total, each with its own 12 s budget, then
+   the original error reaches friendly(). Mirrors the keeper's query-retry. */
+async function rpc(method, params) {
+  try {
+    return await rpcOnce(method, params);
+  } catch (e) {
+    const retryable =
+      RPC_READ_METHODS.has(method) &&
+      (e.name === "TypeError" ||
+        (typeof e.rpcStatus === "number" && e.rpcStatus >= 500));
+    if (!retryable) throw e;
+    return rpcOnce(method, params);
   }
 }
 

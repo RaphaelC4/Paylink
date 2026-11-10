@@ -66,7 +66,7 @@ cross-contract steps that host tests cannot reach is
 | Behaviour | Proof |
 | --- | --- |
 | **Micro-invoices pay out.** A 100-unit link has a fee that rounds to zero, so `claim` skips the fee leg instead of failing on a zero-amount NEP-141 transfer, and the split never overflows or loses a unit. | `a_tiny_invoice_skips_the_fee_leg_instead_of_failing`, `split_fee_never_overflows_or_loses_a_unit` |
-| **Nobody needs gas to get paid — not even for the link itself.** Creating the link goes through a NEP-366 delegate action: the payee signs off-chain and the relayer Worker attaches the 0.01 NEAR stake and pays the gas, measured on testnet with the payee's balance unchanged to the yocto across four creations. After that `claim` is callable by anyone, so the keeper releases every paid invoice within a minute from its own gas account — after the payer's single approval the frontend only watches the link move `PAID → CLAIMED` — and the payee holds no NEAR and signs nothing after payment. | `a_stranger_can_trigger_claim_but_only_the_payee_is_paid`, `claim_pays_the_payee_less_the_fee_in_one_batch`, `workers/keeper/test/sweep.test.mjs` (155 assertions over mocked RPC) |
+| **Nobody needs gas to get paid — not even for the link itself.** Creating the link goes through a NEP-366 delegate action: the payee signs off-chain and the relayer Worker attaches the 0.01 NEAR stake and pays the gas, measured on testnet with the payee's balance unchanged to the yocto across four creations. After that `claim` is callable by anyone, so the keeper releases every paid invoice within a minute from its own gas account — after the payer's single approval the frontend only watches the link move `PAID → CLAIMED` — and the payee holds no NEAR and signs nothing after payment. | `a_stranger_can_trigger_claim_but_only_the_payee_is_paid`, `claim_pays_the_payee_less_the_fee_in_one_batch`, `workers/keeper/test/sweep.test.mjs` (178 assertions over mocked RPC) |
 | **Overpayment is never lost.** What arrived is what's credited, and the fee applies to the credited amount rather than the invoiced one. | `an_overpayment_is_credited_in_full`, `claim_applies_the_fee_to_an_overpayment` |
 | **Paying twice never double-credits.** A link leaves `OPEN` once; a second payment is returned. | `paying_twice_does_not_double_credit` |
 | **Expiry needs no background job.** `Expired` is derived on read from `expires_at`, never stored, so an aged link reports itself honestly and refuses payment. The same timestamp is also the due date: after it, payment is refused and the tokens return to the payer in the same transaction — a hard cutoff, rather than a late payment accepted and marked late. | `an_expired_invoice_cannot_be_paid`, `an_expired_invoice_is_reported_as_expired_even_unpaid` |
@@ -201,9 +201,12 @@ that renders in the browser with no image request and no third-party service,
 and the copy field needs only the URL. Only the WhatsApp / Telegram row reads
 the chain, because those messages embed the amount.
 
-Every other read has a 12 s timeout and a retry, so a slow or rate-limited
-public endpoint surfaces as *Could not read the chain* with a **Try again**
-button rather than a spinner that never resolves. The endpoint itself is
+Every other read has a 12 s timeout and **one automatic retry** — on a
+network error or a 5xx reply only, never on a rate limit, a timeout or a
+chain error, and only for reads — so a dead or restarting endpoint heals
+itself while a slow or rate-limited one surfaces as *Could not read the
+chain* with a **Try again** button rather than a spinner that never
+resolves. The endpoint itself is
 `test.rpc.fastnear.com`, set in `frontend/config.js`. The previously used
 `rpc.testnet.near.org` is deprecated: it answers `429` with **no CORS
 headers**, so a browser only ever sees `Failed to fetch` and cannot tell a
@@ -273,7 +276,7 @@ pays the stake and gas. The frontend takes this path whenever
 `CONFIG.relayer.endpoint` is set and the wallet offers `signDelegateActions`
 (Meteor Wallet does); otherwise it falls back to the direct transaction, and a
 failed relayer POST surfaces as an error rather than silently making the payee
-pay. `workers/relayer/test/parse.test.mjs` (45 assertions) runs the parser,
+pay. `workers/relayer/test/parse.test.mjs` (173 assertions) runs the parser,
 validator and tx builder against the two real signed fixtures.
 
 ---
@@ -505,11 +508,13 @@ cargo near new contracts/paylink-contract   # generated project; never hand-roll
 
 cargo test --lib                            # 56 unit tests, all pure host tests
 
-# the three JS suites — no dependencies, plain node:
-node workers/relayer/test/parse.test.mjs    # 45 assertions: delegate parse + signing
-node workers/keeper/test/sweep.test.mjs     # 38 assertions: settlement, retry, logs
+# the JS suites — no dependencies, plain node (the parse Worker's
+# own suite is documented in workers/parse/README.md):
+node workers/relayer/test/parse.test.mjs    # 173 assertions: parse, signing, rate limits, L-08 failover
+node workers/keeper/test/sweep.test.mjs     # 178 assertions: settlement, retry, logs, L-08 failover
 node frontend/test/one-approval.test.mjs    # 26 assertions: one payer approval only
 node frontend/test/parse-errors.test.mjs    # 48 assertions: parse errors + L-06 timeout
+node frontend/test/rpc-retry.test.mjs       # 23 assertions: one read retry, never for writes
 
 # build the wasm with its NEP-330 ABI embedded
 cargo near build non-reproducible-wasm --abi-features near-sdk/unit-testing
@@ -549,13 +554,18 @@ block simply does not render.
 
 The release keeper deploys the same way: paste `workers/keeper/src/index.js`
 into a second Worker (one file, no dependencies), add the `KEEPER_KEY` and
-`TICK_SECRET` secrets plus four text variables, and set a `* * * * *` cron
+`TICK_SECRET` secrets plus four text variables (and optionally a fifth,
+`RPC_URLS` — a comma-separated list of read-only RPC fallbacks; reads try
+each endpoint in order, broadcasts always go to `RPC_URL` alone exactly
+once), and set a `* * * * *` cron
 trigger. `workers/keeper/README.md` has the steps and a `curl` check. Without
 it the frontend still releases links itself — the keeper is the backstop.
 
 The relayer is a third Worker of the same shape: paste
 `workers/relayer/src/index.js`, add the `RELAYER_KEY` secret plus five text
-variables, and put its `/submit` URL into `frontend/config.js` as
+variables (optionally a sixth, `RPC_URLS`, with the same read-only failover
+semantics as the keeper's), and put its `/submit` URL into `frontend/config.js`
+as
 `relayer.endpoint` (then bump the `?v=` cache bust). `workers/relayer/README.md`
 has the steps and the fund check. With the endpoint empty the create form
 sends the direct wallet transaction — the payee covers that one stake and gas —

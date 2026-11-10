@@ -68,6 +68,12 @@ down in [NOTES.md](./NOTES.md).
    - All type **Text**: `RPC_URL` = `https://test.rpc.fastnear.com`,
      `CONTRACT_ID` = `paylink-v2.testnet`,
      `KEEPER_ACCOUNT` = `paylink-keeper.testnet`, `ALLOWED_ORIGIN` = `*`.
+   - Optional, type **Text**: `RPC_URLS` — comma-separated read
+     fallbacks (e.g. `https://near-testnet.drpc.org,
+     https://testnet-rpc.intea.rs`). Reads try `RPC_URL` first, then
+     each entry in order, stopping at the first that answers; a
+     broadcast always goes to `RPC_URL` alone, exactly once — never
+     retried, never failed over. Unset = the original behaviour.
 4. **Settings → Triggers → Cron**, add `* * * * *`, then deploy again.
 
 ## Check it
@@ -101,7 +107,7 @@ For a local run, put `KEEPER_KEY=...` and `TICK_SECRET=...` in `.dev.vars`
 ## Monitoring (M-01)
 
 Every event is one structured JSON line (`{ts, svc, build, level, event,
-...}`, build `20261110e`) on stdout — Workers → Logs or `wrangler tail`.
+...}`, build `20261110f`) on stdout — Workers → Logs or `wrangler tail`.
 All lines of one sweep share a `run_id` (also returned by `/tick`), so
 "did the 14:03 run settle it?" is one query.
 

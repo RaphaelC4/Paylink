@@ -356,7 +356,7 @@ throwsWith(() => parseSignedDelegate(withDeposit(rawCli, 2n ** 128n - 1n), env),
   const res = await worker.fetch(new Request("https://relayer.test/"), env);
   const body = await res.json();
   ok(res.status === 200 && body.ok === true, "GET / still answers ok");
-  ok(body.build === "20261110c", "GET / reports the build stamp (bump with BUILD)");
+  ok(body.build === "20261110d", "GET / reports the build stamp (bump with BUILD)");
 }
 
 /* ═════════════════════════════ M-07: composite rate limiting ═══════
@@ -694,7 +694,7 @@ const evs = (lines) =>
   const rid = a.value.headers.get("x-request-id");
   ok(typeof rid === "string" && rid.length === 8, "response carries an 8-char X-Request-Id");
   ok(ev && ev.rid === rid, "the log line's rid matches the echoed header");
-  ok(ev && ev.svc === "paylink-relayer" && ev.build === "20261110c" && ev.level === "info",
+  ok(ev && ev.svc === "paylink-relayer" && ev.build === "20261110d" && ev.level === "info",
     "every line carries the svc/build/level envelope");
 
   const b = await withLogs(() =>
@@ -1060,6 +1060,123 @@ const evs = (lines) =>
   /* the swap is fully undone: real WebCrypto verifies again */
   ok(await verifyDelegate(cli) === true,
     "after every stub is removed, real verification still passes");
+}
+
+/* ── L-08 P1: reads fail over across RPC endpoints; broadcasts never do ── */
+{
+  const kp = generateKeyPairSync("ed25519");
+  const pkcs8 = kp.privateKey.export({ type: "pkcs8", format: "der" });
+  const spki = kp.publicKey.export({ type: "spki", format: "der" });
+  const secret = new Uint8Array(64);
+  secret.set(pkcs8.subarray(pkcs8.length - 32), 0);
+  secret.set(spki.subarray(spki.length - 32), 32);
+  const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  const b58e = (bytes) => {
+    let n = 0n;
+    for (const x of bytes) n = (n << 8n) | BigInt(x);
+    let s = "";
+    while (n > 0n) { s = B58[Number(n % 58n)] + s; n /= 58n; }
+    for (const x of bytes) { if (x === 0) s = "1" + s; else break; }
+    return s || "1";
+  };
+  const secretB58 = b58e(secret);
+  const BLOCK_HASH = "75xVe8oDH4VV9uKpcGsx7xTQFWtNsbngukNMC8qsqKTw";
+  const TX_HASH = "5KvQmWnJ4dP8sR2tY6vB9xZ1cF7hL3aE5uG8iM4oN6q";
+  const PRIMARY = "https://rpc.mock.testnet";
+  const FB = "https://rpc-fallback.test";
+
+  const base = {
+    ...env,
+    RELAYER_KEY: `ed25519:${secretB58}`,
+    RELAYER_ACCOUNT: "paylink-relayer.testnet",
+    RPC_URL: PRIMARY,
+    RPC_URLS: FB,
+  };
+
+  /* Scripted RPC: records every attempt as { url, method }; a URL can be
+     marked dead (network-level rejection) and the broadcast can be made to
+     fail independently of the reads. */
+  const makeFetch = ({ deadPrimary = false, broadcastThrows = false } = {}) => {
+    const hits = [];
+    return {
+      hits,
+      fn: async (_url, init) => {
+        const url = String(_url);
+        const req = JSON.parse(init.body);
+        hits.push({ url, method: req.method });
+        if (deadPrimary && url === PRIMARY) throw new TypeError("Failed to fetch");
+        let result = null;
+        if (req.method === "status") {
+          result = { latest_block_height: 200_000_000 };
+        } else if (req.method === "broadcast_tx_commit") {
+          if (broadcastThrows) throw new TypeError("Failed to fetch");
+          result = { status: "SuccessValue", transaction: { hash: TX_HASH } };
+        } else if (req.method === "query" && req.params.request_type === "view_access_key") {
+          result = req.params.account_id === "paylink-payee.testnet"
+            ? { nonce: 0, block_hash: BLOCK_HASH }
+            : { nonce: 50, block_hash: BLOCK_HASH };
+        } else if (req.method === "query" && req.params.request_type === "view_account") {
+          result = { amount: "10000000000000000000000000" };
+        }
+        return { json: async () => ({ jsonrpc: "2.0", id: "1", result }) };
+      },
+    };
+  };
+
+  const realFetch = globalThis.fetch;
+  const run = async (mock, env2, ip) => {
+    globalThis.fetch = mock.fn;
+    try {
+      return await postSubmit({ signedDelegateAction: FIX_CLI }, env2, { "cf-connecting-ip": ip });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  };
+
+  /* R1: primary dead — reads fail over to RPC_URLS (the flow reaches the
+     broadcast only because the fallback answered every read), then the
+     broadcast is attempted exactly once, on the primary, and fails. */
+  {
+    const mock = makeFetch({ deadPrimary: true });
+    const res = await run(mock, base, "198.51.100.210");
+    const reads = mock.hits.filter((h) => h.method !== "broadcast_tx_commit");
+    ok(reads.length >= 2 && reads[0].url === PRIMARY && reads[1].url === FB,
+      "reads try the primary first, then fail over to RPC_URLS");
+    const bcs = mock.hits.filter((h) => h.method === "broadcast_tx_commit");
+    ok(bcs.length === 1 && bcs[0].url === PRIMARY,
+      "the broadcast was attempted exactly once, on the primary — no failover");
+    ok(res.status >= 500,
+      "the dead primary's broadcast fails the submit rather than switching endpoints");
+    ok(!mock.hits.some((h) => h.url === FB && h.method === "broadcast_tx_commit"),
+      "the fallback never received a broadcast");
+  }
+
+  /* R2: primary healthy for reads, broadcast fails — with a working
+     fallback configured, the broadcast still does not move. */
+  {
+    const mock = makeFetch({ broadcastThrows: true });
+    const res = await run(mock, base, "198.51.100.211");
+    const bcs = mock.hits.filter((h) => h.method === "broadcast_tx_commit");
+    ok(bcs.length === 1 && bcs[0].url === PRIMARY,
+      "with a healthy fallback, the broadcast still goes only to the primary, once");
+    const reads = mock.hits.filter((h) => h.method !== "broadcast_tx_commit");
+    ok(reads.every((h) => h.url === PRIMARY),
+      "reads stayed on the healthy primary (no pointless failover)");
+    ok(res.status >= 500, "and the submit fails");
+  }
+
+  /* R3: legacy parity — no RPC_URLS: a query retries the same endpoint,
+     and the fallback is never contacted because it is not configured. */
+  {
+    const mock = makeFetch({ deadPrimary: true });
+    const res = await run(mock, { ...base, RPC_URLS: undefined }, "198.51.100.212");
+    const reads = mock.hits.filter((h) => h.method !== "broadcast_tx_commit");
+    ok(reads.length >= 2 && reads[0].url === PRIMARY && reads[1].url === PRIMARY,
+      "without RPC_URLS a query still retries the same endpoint (behaviour preserved)");
+    ok(!mock.hits.some((h) => h.url === FB),
+      "the fallback is never contacted when unconfigured");
+    ok(res.status >= 500, "and the submit fails cleanly");
+  }
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

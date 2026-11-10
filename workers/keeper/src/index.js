@@ -84,15 +84,15 @@ const SCAN_PARTIAL_ALERT = 3; // M-01 pattern: alert on the 3rd consecutive part
 const CLAIM_STRIKE_ALERT = 3;
 const SWEEP_OUTAGE_ALERT = 3;
 const SVC = "paylink-keeper";
-const BUILD = "20261110e";
+const BUILD = "20261110f";
 
 /* ────────────────────────────────────────────────────────────── rpc ── */
 
-async function rpcOnce(env, method, params, timeoutMs) {
+async function rpcOnce(url, method, params, timeoutMs) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const r = await fetch(env.RPC_URL, {
+    const r = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: "1", method, params }),
@@ -110,17 +110,50 @@ async function rpcOnce(env, method, params, timeoutMs) {
   }
 }
 
-/* Views are retried once on a dropped connection. A broadcast never is: if
-   the response is lost the transaction may still have landed, and the next
-   sweep settles it either way (already CLAIMED = skipped; still PAID =
-   re-claimed). */
+/* Endpoints in order: RPC_URL (the primary, required) then any extras from
+   RPC_URLS (comma-separated). Every endpoint is tried INDEPENDENTLY — a
+   previous success promises nothing about the next one, and a failure just
+   moves the attempt down the list (L-08 P1). Unconfigured, this returns the
+   single primary exactly as before. */
+function readEndpoints(env) {
+  const extra = env.RPC_URLS ? String(env.RPC_URLS).split(",") : [];
+  const list = [env.RPC_URL, ...extra].map((u) => String(u || "").trim()).filter(Boolean);
+  return list.length ? list : [env.RPC_URL];
+}
+
+/* Reads fail over; a broadcast never does.
+
+   A broadcast is attempted exactly once, against the primary endpoint only:
+   if the response is lost the transaction may still have landed, so it is
+   never retried and never failed over — the next sweep settles it either
+   way (already CLAIMED = skipped; still PAID = re-claimed). That rule
+   predates RPC_URLS and is deliberately unchanged by it.
+
+   Reads get one attempt per endpoint, in order, stopping at the first
+   success. The historical "views retry once on a dropped connection" is
+   preserved exactly when only RPC_URL is set: a query still gets its one
+   retry on the same endpoint. When alternates ARE configured, that second
+   attempt goes to the next endpoint instead — spending the retry on a
+   different node rather than repeating a dead one. */
 async function rpc(env, method, params, timeoutMs = RPC_TIMEOUT_MS) {
-  try {
-    return await rpcOnce(env, method, params, timeoutMs);
-  } catch (err) {
-    if (method === "query") return await rpcOnce(env, method, params, timeoutMs);
-    throw err;
+  const urls = readEndpoints(env);
+  if (method === "broadcast_tx_commit") {
+    return rpcOnce(urls[0], method, params, timeoutMs);
   }
+  const plan = [];
+  for (const u of urls) {
+    plan.push(u);
+    if (method === "query" && urls.length === 1) plan.push(u);
+  }
+  let lastErr;
+  for (const url of plan) {
+    try {
+      return await rpcOnce(url, method, params, timeoutMs);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
 }
 
 /* ────────────────────────────────────────── base58 / base64 / borsh ── */

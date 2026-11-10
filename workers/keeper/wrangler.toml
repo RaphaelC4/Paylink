@@ -20,6 +20,13 @@ ALLOWED_ORIGIN = "*"
 # FastNEAR, not rpc.testnet.near.org: the old endpoint is deprecated and
 # measured 3.6-6.1s here vs 0.6-1.3s. Same reasoning as frontend/config.js.
 RPC_URL = "https://test.rpc.fastnear.com"
+# Optional (L-08 P1): comma-separated FALLBACKS for READS only — tried in
+# order, each independently (a past success promises nothing about the next
+# one), stopping at the first that answers. Broadcasts always go to
+# RPC_URL alone, exactly once — never retried, never failed over. Public
+# testnet endpoints from NEAR's provider table (docs.near.org/api/rpc/
+# providers); no SLA is assumed for any of them. Omit = previous behaviour.
+RPC_URLS = "https://near-testnet.drpc.org, https://testnet-rpc.intea.rs"
 CONTRACT_ID = "paylink-v2.testnet"
 KEEPER_ACCOUNT = "paylink-keeper.testnet"
 
