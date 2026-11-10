@@ -347,29 +347,89 @@ export function parseSignedDelegate(raw, env) {
 
 /* ──────────────────────────────────────────────── signature verify ── */
 
+/* L-01 support detection: the runtime itself decides. A NotSupportedError
+   (or a TypeError whose message says the algorithm is unsupported) from
+   importKey/verify means this WebCrypto has no Ed25519 — a capability
+   gap, which is distinct from key material that is simply invalid. */
+const isUnsupportedAlg = (e) => !!e && (
+  e.name === "NotSupportedError"
+  || (e.name === "TypeError" && /not (supported|available)|unsupported/i.test(e.message || "")));
+
+/* "Cannot verify" surfaces as an explicit, safe 503 — the caller must
+   never treat an unverifiable delegate as verified (L-01), and the client
+   sees a server-side capability problem rather than a signature
+   accusation. The message is a fixed phrase plus an error NAME only:
+   no key material, no internals. */
+function verifyUnsupported(detail) {
+  const err = new Error(`signature verification unavailable on this runtime — refusing to relay an unverified delegate (${detail})`);
+  err.status = 503;
+  err.reason = "ed25519_unavailable";
+  return err;
+}
+function verifyApiFailure(detail) {
+  const err = new Error(`signature verification could not complete — refusing to relay an unverified delegate (${detail})`);
+  err.status = 503;
+  err.reason = "verify_api_failed";
+  return err;
+}
+
 /**
  * Verify the payee's signature over the delegate — NEP-461's preimage:
  *   sha256( borsh(u32 discriminant) ++ borsh(DelegateAction) )
  * where discriminant = 2^30 + 366 (on-chain NEP range + NEP-366's number),
  * per nearcore's SignedDelegateAction::verify / get_nep461_hash. Proven
  * against two fixtures the chain accepted (near-cli-rs and Meteor Wallet) —
- * see test/parse.test.mjs. Returns false rather than throwing so callers
- * can turn it into a clean 400.
+ * see test/parse.test.mjs.
+ *
+ * Three outcomes, never a silent pass (L-01):
+ *   true   only when crypto.subtle.verify itself resolved true;
+ *   false  when the material is cryptographically wrong — callers turn
+ *          that into a clean 400 (bad_signature);
+ *   throw  when verification cannot be performed at all (no WebCrypto,
+ *          no Ed25519 in the runtime, or the verification API failed)
+ *          — status 503 with a reason code, so an unsupported runtime
+ *          can never be mistaken for success.
  */
 export async function verifyDelegate(parsed) {
-  if (!globalThis.crypto?.subtle) return true; // no Ed25519 in runtime: chain still verifies
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) throw verifyUnsupported("WebCrypto is unavailable in this runtime");
+
+  /* Structural guards run before any crypto: malformed material is
+     invalid (false), never "unsupported". parseSignedDelegate already
+     enforces these for real input (32-byte key, 64-byte signature, no
+     trailing bytes); they hold for hand-built parsed objects too. */
+  if (!parsed || !(parsed.raw instanceof Uint8Array) || parsed.raw.length < 65) return false;
+  if (!(parsed.publicKey instanceof Uint8Array) || parsed.publicKey.length !== 32) return false;
+  const signature = parsed.raw.subarray(parsed.raw.length - 64);
+
   const disc = new Uint8Array(4);
   new DataView(disc.buffer).setUint32(0, (1 << 30) + 366, true);
   const delegateAction = parsed.raw.subarray(0, parsed.raw.length - 65);
-  const signature = parsed.raw.subarray(parsed.raw.length - 64);
   const preimage = concat(disc, delegateAction);
+
+  let digest;
   try {
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", preimage));
-    const key = await crypto.subtle.importKey("raw", parsed.publicKey,
+    digest = new Uint8Array(await subtle.digest("SHA-256", preimage));
+  } catch (e) {
+    throw verifyUnsupported(`SHA-256 digest unavailable (${(e && e.name) || "error"})`);
+  }
+
+  let key;
+  try {
+    key = await subtle.importKey("raw", parsed.publicKey,
       { name: "Ed25519" }, false, ["verify"]);
-    return await crypto.subtle.verify({ name: "Ed25519" }, key, signature, digest);
-  } catch {
+  } catch (e) {
+    /* No Ed25519 here → capability error; anything else means the key
+       material itself is unusable → invalid (false), not unsupported. */
+    if (isUnsupportedAlg(e)) throw verifyUnsupported(`Ed25519 importKey unavailable (${e.name})`);
     return false;
+  }
+
+  try {
+    return await subtle.verify({ name: "Ed25519" }, key, signature, digest);
+  } catch (e) {
+    if (isUnsupportedAlg(e)) throw verifyUnsupported(`Ed25519 verify unavailable (${e.name})`);
+    throw verifyApiFailure(`verification API failed (${(e && e.name) || "error"})`);
   }
 }
 

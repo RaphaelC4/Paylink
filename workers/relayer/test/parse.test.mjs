@@ -9,7 +9,7 @@
 
 import { generateKeyPairSync } from "node:crypto";
 import { readFileSync } from "node:fs";
-import worker, { parseSignedDelegate, signDelegateTx, submit, logEvent } from "../src/index.js";
+import worker, { parseSignedDelegate, signDelegateTx, submit, logEvent, verifyDelegate } from "../src/index.js";
 
 const b64decode = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 const b64encode = (bytes) => {
@@ -934,6 +934,132 @@ const evs = (lines) =>
     "bearer token redacted");
   ok(rec && rec.detail.length <= 240,
     "strings capped at 240 chars — a full signed delegate cannot fit");
+}
+
+/* ── L-01: verification never passes without verifying ──
+   verifyDelegate has exactly three outcomes: true only when
+   crypto.subtle.verify itself resolved true, false for cryptographically
+   wrong material (the caller answers 400), and a thrown 503 when
+   verification cannot be performed at all (no WebCrypto, no Ed25519 in
+   the runtime, or a broken verification API). Nothing below may ever
+   end in an unverified "true" — that was the bug (line ~360 used to
+   return true whenever globalThis.crypto.subtle was missing). */
+{
+  const realDesc = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+  const realCryptoObj = globalThis.crypto;
+
+  const caught = async (fn) => {
+    try { return { ok: true, value: await fn() }; }
+    catch (e) { return { ok: false, err: e }; }
+  };
+
+  /* Swap globalThis.crypto for one test, always restoring the exact
+     original descriptor in finally — every later assertion (and the
+     runtime itself) depends on the real WebCrypto coming back. */
+  const withCrypto = async (stub, fn) => {
+    Object.defineProperty(globalThis, "crypto", { value: stub, configurable: true });
+    try { return await fn(); }
+    finally { Object.defineProperty(globalThis, "crypto", realDesc); }
+  };
+
+  const cli = parseSignedDelegate(b64decode(FIX_CLI), env);
+  const met = parseSignedDelegate(b64decode(FIX_MET), env);
+
+  /* valid signatures still verify on a normal runtime */
+  ok(await verifyDelegate(cli) === true, "valid near-cli-rs signature verifies");
+  ok(await verifyDelegate(met) === true, "valid Meteor Wallet signature verifies");
+
+  /* invalid signature → false (the caller turns that into 400), never a throw */
+  const tampered = Uint8Array.from(rawCli);
+  tampered[tampered.length - 1] ^= 0x01;
+  const tamperedParsed = parseSignedDelegate(tampered, env);
+  ok(await verifyDelegate(tamperedParsed) === false,
+    "one flipped signature byte → false, not true");
+
+  /* malformed input never reaches crypto at all */
+  let truncated = null;
+  try { parseSignedDelegate(rawCli.subarray(0, rawCli.length - 10), env); }
+  catch (e) { truncated = e; }
+  ok(truncated !== null && String(truncated.message).includes("truncated"),
+    "truncated delegate rejected by the parser (malformed signature)");
+  ok(await verifyDelegate({ raw: new Uint8Array(64), publicKey: cli.publicKey }) === false,
+    "raw under 65 bytes → false without touching crypto");
+
+  /* invalid public keys → false */
+  ok(await verifyDelegate({ raw: rawCli, publicKey: new Uint8Array(31) }) === false,
+    "31-byte public key → false");
+  ok(await verifyDelegate({ raw: rawCli, publicKey: new Uint8Array(32) }) === false,
+    "all-zero 32-byte public key → false");
+
+  /* unsupported environment: no WebCrypto at all — the old bug returned
+     true here; it must now be an explicit, safe 503 */
+  const noSubtle = await withCrypto({}, () => caught(() => verifyDelegate(cli)));
+  ok(noSubtle.ok === false && noSubtle.err.status === 503
+    && noSubtle.err.reason === "ed25519_unavailable",
+    "no crypto.subtle → explicit 503 ed25519_unavailable (never true)");
+  ok(String(noSubtle.err.message).includes("refusing to relay an unverified delegate"),
+    "the refusal message says exactly why");
+  ok(!/[A-Za-z0-9+/]{40,}/.test(String(noSubtle.err.message)),
+    "the refusal message carries no key or signature material");
+
+  /* Ed25519 missing at importKey — even a verify() that would answer
+     true must not be reached: capability beats whatever the stub says */
+  const impNs = await withCrypto({ subtle: {
+    digest: async () => new Uint8Array(32).buffer,
+    importKey: async () => { const e = new Error("Ed25519 not supported"); e.name = "NotSupportedError"; throw e; },
+    verify: async () => true,
+  } }, () => caught(() => verifyDelegate(cli)));
+  ok(impNs.ok === false && impNs.err.status === 503 && impNs.err.reason === "ed25519_unavailable",
+    "importKey NotSupportedError → 503 even though stubbed verify() answers true");
+
+  /* Ed25519 missing at verify() itself */
+  const verNs = await withCrypto({ subtle: {
+    digest: async () => new Uint8Array(32).buffer,
+    importKey: async () => ({}),
+    verify: async () => { const e = new Error("unsupported"); e.name = "NotSupportedError"; throw e; },
+  } }, () => caught(() => verifyDelegate(cli)));
+  ok(verNs.ok === false && verNs.err.status === 503 && verNs.err.reason === "ed25519_unavailable",
+    "verify() NotSupportedError → 503 ed25519_unavailable");
+
+  /* verification API present but failing → distinct, explicit reason */
+  const broken = await withCrypto({ subtle: {
+    digest: async () => new Uint8Array(32).buffer,
+    importKey: async () => ({}),
+    verify: async () => { throw new Error("engine exploded"); },
+  } }, () => caught(() => verifyDelegate(cli)));
+  ok(broken.ok === false && broken.err.status === 503 && broken.err.reason === "verify_api_failed",
+    "verification API failure → 503 verify_api_failed");
+
+  /* end-to-end through submit(): the same chain-accepted delegate is
+     refused before any network call happens */
+  const realFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; throw new Error("network disabled in test"); };
+  try {
+    const r = await withCrypto({}, () => capture(() =>
+      submit(env, { signedDelegateAction: FIX_CLI }, "198.51.100.180")));
+    ok(r.ok === false && r.err.status === 503 && r.err.reason === "ed25519_unavailable",
+      "submit answers 503 ed25519_unavailable in an unsupported runtime");
+    ok(calls === 0, "nothing fetched or broadcast — no unverified delegate reaches the chain");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  /* end-to-end through the HTTP handler: safe 503 body for the client.
+     The stub keeps getRandomValues (the handler mints a request id
+     before submit) while withholding subtle. */
+  const h = await withCrypto(
+    { getRandomValues: (a) => realCryptoObj.getRandomValues(a) },
+    () => capture(() => postSubmit({ signedDelegateAction: FIX_CLI }, env,
+      { "cf-connecting-ip": "198.51.100.181" })));
+  ok(h.ok && h.value.status === 503, "HTTP handler answers 503, not 200");
+  const hj = await h.value.json();
+  ok(typeof hj.error === "string" && hj.error.includes("refusing to relay an unverified delegate"),
+    "the response body is the safe refusal message");
+
+  /* the swap is fully undone: real WebCrypto verifies again */
+  ok(await verifyDelegate(cli) === true,
+    "after every stub is removed, real verification still passes");
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
