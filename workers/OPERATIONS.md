@@ -14,14 +14,14 @@ so explicitly and invents no credential values.
 Every operational event is **one JSON line on stdout**:
 
 ```json
-{"ts":"2026-11-10T03:27:55.810Z","svc":"paylink-parse","build":"20261110a","level":"error","event":"upstream_error","rid":"7910c9fa","kind":"http_status","status":500,"detail":"…"}
+{"ts":"2026-11-10T03:27:55.810Z","svc":"paylink-parse","build":"20261110b","level":"error","event":"upstream_error","rid":"7910c9fa","kind":"http_status","status":500,"detail":"…"}
 ```
 
 | Field   | Meaning |
 |---------|---------|
 | `ts`    | ISO-8601 UTC timestamp |
 | `svc`   | `paylink-relayer` \| `paylink-keeper` \| `paylink-parse` |
-| `build` | build stamp — relayer `20261110c`, keeper `20261110c`, parse `20261110a` (in log lines only) |
+| `build` | build stamp — relayer `20261110c`, keeper `20261110c`, parse `20261110b` (in log lines only) |
 | `level` | `info` \| `warn` \| `error` \| `alert` |
 | `event` | catalog name from the tables below |
 | …       | event-specific fields, always flat scalars or short string arrays |
@@ -221,7 +221,7 @@ Nothing above was done for M-01 (no deploy, no push, no account changes).
 |-------|--------|---------------|
 | `node workers/relayer/test/parse.test.mjs` | **145 passed, 0 failed** | envelope + svc/build/level, `X-Request-Id` echo ↔ log `rid` match, `submit_rejected` reason codes, `submit_ok` happy path through an in-process RPC mock (no delegate/key bytes in any line), `rate_limited` layer+retry_after, `volume_anomaly` (fires at threshold, once per window), `error_burst` ×5 with webhook payload assertions, webhook on/off/dead-URL-never-logged plumbing, scrub probe, `GET /` allowlist + stats shape |
 | `node workers/keeper/test/sweep.test.mjs` | **148 passed, 0 failed** | `GET /` allowlist + build, `/tick` run_id correlation, tick 500 → `sweep_failed`+`tick_failed`, `cron_heartbeat` ok true/false (exactly one per run), `unsettled_paid` warn, `repeated_claim_failure` 3-strike + webhook + streak reset, `sweep_outage` 3-strike + scrubbed error + recovery reset, sweep_summary shape, scrub probe; **M-06**: live key/value layout fixture, 61-bucket fallback walk (boundaries 4/7/64), transient page retry, unreadable region fail-soft + `scan_partial`/`scan_degraded` streaks + recovery, duplicate key across pages claims once, query ceiling and zero-budget guards, one access-key read per sweep with sequential nonces, nonce re-read after unknown broadcast outcome and `InvalidNonce`; **L-02**: u128 both-limb decode (zero → u128::MAX, the 2^64 boundary, optional paid_amount path), lo-then-hi byte order incl. the live view_state record, settlement unchanged for a >2^64 amount (still 1 yocto), `formatYoctoNEAR` (0/1 yocto/1 NEAR/1.5/10^30/2^64/u128::MAX + malformed strings/Numbers/out-of-range rejected), truncated and garbage records skipped without failing the sweep |
-| `node workers/parse/test/parse.test.mjs` | **115 passed, 0 failed** | `parse_ok` envelope/no-values/rid, 405 untouched (no rid header), `parse_rejected` reason codes, `rate_limited` (11th request), `upstream_error` kinds + key redacted by value + 240 cap, `upstream_degraded` 5-in-window + webhook delivery, `service_error` generic 500 with no stack, leak sweep over 79 captured bodies |
+| `node workers/parse/test/parse.test.mjs` | **136 passed, 0 failed** | `parse_ok` envelope/no-values/rid, 405 untouched (no rid header), `parse_rejected` reason codes, `rate_limited` (11th request), `upstream_error` kinds + key redacted by value + 240 cap, `upstream_degraded` 5-in-window + webhook delivery, `service_error` generic 500 with no stack, leak sweep over 86 captured bodies; **L-06**: slow-in-budget response still parses (timer cleared — no late abort), stalled success body → 504 `kind=timeout`, stalled **error** body → 504 `kind=timeout` (was 502 `http_status`), upstream 429/400 → 502 status-only with no key/detail leak, network failure → 502 `kind=unreachable`, invalid JSON → 502 `kind=unreadable` (never a timeout) |
 
 ---
 

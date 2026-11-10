@@ -17,7 +17,10 @@ POST https://<worker>/
 Limits: 4,000 characters of text, or a 3.5 MB file (PDF, PNG, JPEG, WebP);
 5.5 MB request body; **10 requests/minute per IP** (then `429` with
 `Retry-After`); a present `Origin` header must equal `ALLOWED_ORIGIN` (`403`);
-the Gemini call is aborted after 15 s (`504`).
+the Gemini call is aborted after 15 s (`504`) — the budget covers the whole
+exchange (connect, headers, both body reads), so a stall on any leg answers
+`504`, never a bare `502`. The frontend gives that leg its own 20 s budget
+(above the Worker's, so Gemini stalls always surface as the Worker's `504`).
 
 Status codes: `400` malformed input (bad JSON, non-object body, missing
 text/file, junk base64) · `403` origin mismatch · `404` wrong path · `405`
@@ -78,7 +81,7 @@ rejects an amount above the cap and leaves the form untouched.
 ## Monitoring (M-01)
 
 Every event is one structured JSON line (`{ts, svc, build, level, event,
-...}`, build `20261110a` in log lines — no `GET /` build stamp: the `405 +
+...}`, build `20261110b` in log lines — no `GET /` build stamp: the `405 +
 Allow: POST` deploy signal stays untouched). Each `POST /` response carries
 an `X-Request-Id` echoed in that request's log lines.
 

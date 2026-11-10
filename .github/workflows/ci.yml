@@ -63,7 +63,8 @@ jobs:
             workers/parse/test/parse.test.mjs \
             frontend/app.js \
             frontend/config.js \
-            frontend/test/one-approval.test.mjs
+            frontend/test/one-approval.test.mjs \
+            frontend/test/parse-errors.test.mjs
           do
             if node --check "$f"; then
               echo "ok  node --check $f"
@@ -182,6 +183,9 @@ jobs:
 
       - name: node frontend/test/one-approval.test.mjs
         run: node frontend/test/one-approval.test.mjs
+
+      - name: node frontend/test/parse-errors.test.mjs
+        run: node frontend/test/parse-errors.test.mjs
 
   # ── item 9 (parse worker tests) ──────────────────────────────────────────
   parse:

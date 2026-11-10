@@ -16,7 +16,11 @@
  * ALLOWED_ORIGIN (403); 10 requests/minute per IP (429 + Retry-After) via the
  * RATE_LIMITER binding when it is provisioned, a per-isolate window otherwise;
  * body capped at 5.5 MB before it is parsed (413); the Gemini call aborted
- * after 15 s (504). Every error is a JSON { error } string — never a key,
+ * after 15 s (504) — L-06 bounds the WHOLE exchange (connect, headers,
+ * error-body read, success-body read) with one AbortController whose timer
+ * is cleared in a single finally, and classifies an abort on ANY of those
+ * legs as a timeout (504) rather than a generic upstream failure (502).
+ * Every error is a JSON { error } string — never a key,
  * a prompt, an upstream body or a stack trace.
  *
  * Observability (M-01): one structured JSON line per event
@@ -86,7 +90,7 @@ Never invent a value that is not in the document.`;
 /* ─────────────────────────── structured logging + alerts (M-01) ── */
 
 const SVC = "paylink-parse";
-const BUILD = "20261110a";
+const BUILD = "20261110b";
 
 /* Correlation id for one request: 8 hex chars, no user data in it. */
 const newRid = () => {
@@ -350,107 +354,120 @@ async function handle(request, env, ctx) {
     const url =
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
-    /* Bound the whole exchange — connect, response headers and body read —
-       so a hung upstream cannot pin the request open. PARSE_TIMEOUT_MS
-       overrides the default for tuning and for tests. */
+    /* L-06: bound the WHOLE exchange — connect, response headers, error-body
+       read and success-body read — with one AbortController, so a hung or
+       crawling upstream cannot pin the request open. PARSE_TIMEOUT_MS
+       overrides the default for tuning and for tests. The timer is cleared
+       in a single finally, so no abort can ever fire after this handler
+       returns, on any exit path. */
     const timeoutMs = parseTimeoutMs(env);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    let upstream;
-    try {
-      upstream = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": env.GEMINI_API_KEY,
-        },
-        signal: controller.signal,
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM }] },
-          contents: [{ role: "user", parts }],
-          generationConfig: {
-            temperature: 0,
-            maxOutputTokens: 512,
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: "OBJECT",
-              properties: {
-                amount: { type: "STRING" },
-                token: { type: "STRING" },
-                payee: { type: "STRING" },
-                description: { type: "STRING" },
-                expires_in_hours: { type: "NUMBER" },
-              },
-              required: FIELDS,
-            },
-          },
-        }),
-      });
-    } catch {
-      clearTimeout(timer);
-      if (controller.signal.aborted) {
-        upstreamFail("timeout");
-        return json({ error: "Gemini timed out" }, 504, rh);
-      }
-      upstreamFail("unreachable");
-      return json({ error: "Could not reach Gemini" }, 502, rh);
-    }
-
-    if (!upstream.ok) {
-      let detail = "";
-      try {
-        detail = await upstream.text();
-      } catch {
-        detail = ""; // body read aborted or reset — the status says enough
-      }
-      clearTimeout(timer);
-      /* structured + bounded: the logger redacts the configured key by value
-         (upstream error bodies echo it) and caps the detail at 240 chars */
-      upstreamFail("http_status", { status: upstream.status, detail: detail.slice(0, 400) });
-      return json({ error: `Gemini returned ${upstream.status}` }, 502, rh);
-    }
-
-    let data;
-    try {
-      data = await upstream.json();
-    } catch {
-      clearTimeout(timer);
-      if (controller.signal.aborted) {
-        upstreamFail("timeout");
-        return json({ error: "Gemini timed out" }, 504, rh);
-      }
-      upstreamFail("unreadable");
-      return json({ error: "Gemini response was unreadable" }, 502, rh);
-    }
-    clearTimeout(timer);
-    const reading = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!reading) {
-      upstreamFail("no_reading");
-      return json({ error: "No reading came back" }, 422, rh);
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(reading);
-    } catch {
-      upstreamFail("bad_payload");
-      return json({ error: "The reading was not JSON" }, 422, rh);
-    }
-
-    /* Return only the five known fields, coerced to the types the frontend
-       expects. Anything else the model produced is dropped here. */
-    const out = {
-      amount: str(parsed.amount),
-      token: str(parsed.token),
-      payee: str(parsed.payee),
-      description: str(parsed.description).slice(0, 200),
-      expires_in_hours: num(parsed.expires_in_hours),
+    /* One predicate for "the budget ran out", consulted by every failure
+       path below. Without it a stall during the ERROR-body read was
+       misclassified: the catch fell through to the http_status branch and
+       answered 502 instead of the timeout's 504. */
+    const timedOut = () => controller.signal.aborted;
+    const timeoutFail = () => {
+      upstreamFail("timeout");
+      return json({ error: "Gemini timed out" }, 504, rh);
     };
-    /* The success line: source/size/latency only — parsed VALUES are payment
-       details and never logged; there is no safe identifier yet at parse time. */
-    logEvent("parse_ok", { rid, ip, source, chars, model, ms: Date.now() - t0 }, env);
-    return json(out, 200, rh);
+
+    try {
+      let upstream;
+      try {
+        upstream = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": env.GEMINI_API_KEY,
+          },
+          signal: controller.signal,
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: SYSTEM }] },
+            contents: [{ role: "user", parts }],
+            generationConfig: {
+              temperature: 0,
+              maxOutputTokens: 512,
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: "OBJECT",
+                properties: {
+                  amount: { type: "STRING" },
+                  token: { type: "STRING" },
+                  payee: { type: "STRING" },
+                  description: { type: "STRING" },
+                  expires_in_hours: { type: "NUMBER" },
+                },
+                required: FIELDS,
+              },
+            },
+          }),
+        });
+      } catch {
+        if (timedOut()) return timeoutFail();
+        upstreamFail("unreachable");
+        return json({ error: "Could not reach Gemini" }, 502, rh);
+      }
+
+      if (!upstream.ok) {
+        let detail = "";
+        try {
+          detail = await upstream.text();
+        } catch {
+          /* L-06: an abort during the error-body read is still a timeout —
+             the budget covers the body read too, so classify it as one
+             rather than reporting a bare upstream status we never saw. */
+          if (timedOut()) return timeoutFail();
+          detail = ""; // body read aborted or reset — the status says enough
+        }
+        /* structured + bounded: the logger redacts the configured key by value
+           (upstream error bodies echo it) and caps the detail at 240 chars */
+        upstreamFail("http_status", { status: upstream.status, detail: detail.slice(0, 400) });
+        return json({ error: `Gemini returned ${upstream.status}` }, 502, rh);
+      }
+
+      let data;
+      try {
+        data = await upstream.json();
+      } catch {
+        if (timedOut()) return timeoutFail();
+        upstreamFail("unreadable");
+        return json({ error: "Gemini response was unreadable" }, 502, rh);
+      }
+      const reading = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!reading) {
+        upstreamFail("no_reading");
+        return json({ error: "No reading came back" }, 422, rh);
+      }
+
+      let parsed;
+      try {
+        parsed = JSON.parse(reading);
+      } catch {
+        upstreamFail("bad_payload");
+        return json({ error: "The reading was not JSON" }, 422, rh);
+      }
+
+      /* Return only the five known fields, coerced to the types the frontend
+         expects. Anything else the model produced is dropped here. */
+      const out = {
+        amount: str(parsed.amount),
+        token: str(parsed.token),
+        payee: str(parsed.payee),
+        description: str(parsed.description).slice(0, 200),
+        expires_in_hours: num(parsed.expires_in_hours),
+      };
+      /* The success line: source/size/latency only — parsed VALUES are payment
+         details and never logged; there is no safe identifier yet at parse time. */
+      logEvent("parse_ok", { rid, ip, source, chars, model, ms: Date.now() - t0 }, env);
+      return json(out, 200, rh);
+    } finally {
+      /* L-06: exactly one clearTimeout, reached by every path — success,
+         timeout, unreachable, bad status, unreadable body, bad payload —
+         so the abort timer never leaks past this request. */
+      clearTimeout(timer);
+    }
   }
 
 const str = (v) => (typeof v === "string" ? v.trim() : v == null ? "" : String(v).trim());

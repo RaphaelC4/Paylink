@@ -508,6 +508,7 @@ cargo test --lib                            # 38 unit tests, all pure host tests
 node workers/relayer/test/parse.test.mjs    # 45 assertions: delegate parse + signing
 node workers/keeper/test/sweep.test.mjs     # 38 assertions: settlement, retry, logs
 node frontend/test/one-approval.test.mjs    # 26 assertions: one payer approval only
+node frontend/test/parse-errors.test.mjs    # 48 assertions: parse errors + L-06 timeout
 
 # build the wasm with its NEP-330 ABI embedded
 cargo near build non-reproducible-wasm --abi-features near-sdk/unit-testing

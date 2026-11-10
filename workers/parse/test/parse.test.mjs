@@ -423,7 +423,7 @@ try {
       ok(typeof ridHdr === "string" && ridHdr.length === 8, "POST response carries an 8-char X-Request-Id");
       const [ev] = evs.filter((e) => e.event === "parse_ok");
       ok(ev && ev.rid === ridHdr, "parse_ok shares the response's rid (one trace end to end)");
-      ok(ev && ev.svc === "paylink-parse" && ev.build === "20261110a" && ev.level === "info"
+      ok(ev && ev.svc === "paylink-parse" && ev.build === "20261110b" && ev.level === "info"
         && typeof ev.ts === "string", "line carries the ts/svc/build/level envelope");
       ok(ev && ev.source === "text" && ev.chars === sample.length && typeof ev.ms === "number"
         && ev.ip === ip, "parse_ok records source/size/duration/ip — operational facts only");
@@ -551,6 +551,147 @@ try {
       ok(!txt.includes("index.js") && !txt.includes("at Object"),
         "the response carries no stack trace");
     }
+  }
+
+  /* ── 11c. L-06: one AbortController bounds the WHOLE Gemini exchange ──
+     M-02 already aborted a hung fetch. L-06 covers the two legs the old
+     code missed: a stall while reading the ERROR body (was misclassified
+     as http_status -> 502; must be timeout -> 504) and timer cleanup on
+     every exit path (single clearTimeout in a finally). Own console
+     capture: these upstream_error lines must never be read by 11b's
+     assertions, and none may open a fresh degraded-alert window (11b
+     already alerted once, which keeps upAlerted set for this block). */
+  {
+    const captured = [];
+    const baseLog = console.log;
+    const parse = (l) => { try { return JSON.parse(l); } catch { return null; } };
+    const around = async (fn) => {
+      const start = captured.length;
+      console.log = (...a) => captured.push(a.join(" "));
+      try {
+        const value = await fn();
+        return { value, evs: captured.slice(start).map(parse).filter(Boolean) };
+      } finally {
+        console.log = baseLog;
+      }
+    };
+
+    /* A stub whose RESPONSE BODY never arrives: the read settles only when
+       the Worker's own abort signal fires — exactly what a stalled upstream
+       leg does. status 200 exercises the success read (.json), 503 the
+       error read (.text). */
+    const stalledBody = (status) => (_url, init) =>
+      Promise.resolve(new Response(
+        new ReadableStream({
+          start(controller) {
+            init.signal.addEventListener("abort", () => {
+              try { controller.error(new Error("The operation was aborted")); }
+              catch { /* stream already closed */ }
+            });
+          },
+        }),
+        { status },
+      ));
+
+    /* a. slow but inside the budget: parsing still succeeds, and the abort
+       timer is cancelled afterwards — no late abort can fire post-success. */
+    {
+      let seen = null;
+      globalThis.fetch = async (_url, init) => {
+        seen = init.signal;
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return new Response(
+          JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify({
+            amount: "400", token: "USDC", payee: "chidi.testnet",
+            description: "Slow but fine", expires_in_hours: 72,
+          }) }] } }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      };
+      const { value: r } = await around(() =>
+        post({ text: "hi" }, baseEnv({ PARSE_TIMEOUT_MS: "400" })));
+      ok(r.res.status === 200, "L-06: a slow response inside the budget still parses");
+      ok(JSON.parse(r.text).description === "Slow but fine", "…with its fields intact");
+      await new Promise((resolve) => setTimeout(resolve, 450)); // past the 400 ms budget
+      ok(seen && !seen.aborted, "the abort timer was cleared — no late abort after success");
+    }
+
+    /* b. stall during the SUCCESS body read: headers arrived, the body
+       never does -> abort mid-read -> 504 kind=timeout, promptly. */
+    {
+      globalThis.fetch = stalledBody(200);
+      const t0 = Date.now();
+      const { value: r, evs } = await around(() =>
+        post({ text: "hi" }, baseEnv({ PARSE_TIMEOUT_MS: "60" })));
+      const elapsed = Date.now() - t0;
+      ok(r.res.status === 504 && JSON.parse(r.text).error === "Gemini timed out",
+        "stalled success body -> 504 Gemini timed out");
+      ok(elapsed < 5_000, `the abort fires promptly (${elapsed} ms)`);
+      const [ev] = evs.filter((e) => e.event === "upstream_error");
+      ok(ev && ev.kind === "timeout" && ev.level === "error", "logged as upstream_error kind=timeout");
+      ok(!r.text.includes(KEY), "the 504 body does not leak the key");
+    }
+
+    /* c. L-06 REGRESSION: stall during the ERROR body read (503). The old
+       catch fell through to http_status and answered 502; the budget
+       covers this leg too, so it must be 504 kind=timeout. */
+    {
+      globalThis.fetch = stalledBody(503);
+      const t0 = Date.now();
+      const { value: r, evs } = await around(() =>
+        post({ text: "hi" }, baseEnv({ PARSE_TIMEOUT_MS: "60" })));
+      const elapsed = Date.now() - t0;
+      ok(r.res.status === 504 && JSON.parse(r.text).error === "Gemini timed out",
+        "stalled ERROR body -> 504 (was 502 http_status before L-06)");
+      ok(elapsed < 5_000, `the error-body abort fires promptly (${elapsed} ms)`);
+      const [ev] = evs.filter((e) => e.event === "upstream_error");
+      ok(ev && ev.kind === "timeout", "classified as kind=timeout, not http_status");
+      ok(!r.text.includes(KEY) && !r.text.includes("503"),
+        "the 504 echoes neither the key nor a status it never read");
+    }
+
+    /* d. upstream 4xx and 5xx: one safe 502 carrying only the status
+       number — no upstream body, no key, kind=http_status in the log. */
+    {
+      globalThis.fetch = async () =>
+        new Response(JSON.stringify({ error: { message: "UPSTREAM-DETAIL-MARKER key=" + KEY } }), { status: 429 });
+      const a = await around(() => post({ text: "hi" }, baseEnv()));
+      ok(a.value.res.status === 502 && JSON.parse(a.value.text).error === "Gemini returned 429",
+        "upstream 429 -> 502 with the status only");
+      ok(!a.value.text.includes(KEY) && !a.value.text.includes("UPSTREAM-DETAIL-MARKER"),
+        "the 429 mapping leaks neither key nor upstream detail");
+      const [evA] = a.evs.filter((e) => e.event === "upstream_error");
+      ok(evA && evA.kind === "http_status" && evA.status === 429, "429 logged kind=http_status");
+
+      globalThis.fetch = async () => new Response("bad request from upstream", { status: 400 });
+      const b = await around(() => post({ text: "hi" }, baseEnv()));
+      ok(b.value.res.status === 502 && JSON.parse(b.value.text).error === "Gemini returned 400",
+        "upstream 400 -> 502 with the status only");
+      ok(!b.value.text.includes("bad request from upstream"),
+        "the upstream error text never reaches the client");
+      const [evB] = b.evs.filter((e) => e.event === "upstream_error");
+      ok(evB && evB.kind === "http_status" && evB.status === 400, "400 logged kind=http_status");
+    }
+
+    /* e. network failure and invalid JSON keep their OWN kinds — neither
+       is ever reported as a timeout. */
+    {
+      globalThis.fetch = () => Promise.reject(new TypeError("fetch failed"));
+      const a = await around(() => post({ text: "hi" }, baseEnv()));
+      ok(a.value.res.status === 502 && JSON.parse(a.value.text).error === "Could not reach Gemini",
+        "network failure -> 502 generic message");
+      const [evA] = a.evs.filter((e) => e.event === "upstream_error");
+      ok(evA && evA.kind === "unreachable", "network failure logged kind=unreachable");
+
+      globalThis.fetch = async () => new Response("<html>gateway</html>", { status: 200 });
+      const b = await around(() => post({ text: "hi" }, baseEnv()));
+      ok(b.value.res.status === 502 && JSON.parse(b.value.text).error === "Gemini response was unreadable",
+        "invalid JSON -> 502 unreadable");
+      const [evB] = b.evs.filter((e) => e.event === "upstream_error");
+      ok(evB && evB.kind === "unreadable", "invalid JSON logged kind=unreadable, not timeout");
+    }
+
+    globalThis.fetch = geminiOk();
   }
 
   /* ── 12. leak sweep across every captured response ── */

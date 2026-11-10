@@ -825,6 +825,13 @@ function aiNote(msg, kind = "") {
 
 const AI_AMOUNT = /^\d{1,9}(\.\d{1,6})?$/;
 const MAX_BASE_UNITS = 10n ** 12n; // 1,000,000 USDC
+/* L-06: the browser -> Worker leg gets its own budget. The Worker gives up
+   on Gemini after 15 s (its UPSTREAM_TIMEOUT_MS), so 20 s sits strictly
+   ABOVE it: a Gemini stall surfaces first as the Worker's precise 504
+   "Gemini timed out", and this budget only ever fires when the Worker or
+   the network itself is hung — otherwise the UI would hang forever on a
+   fetch with no signal. */
+const PARSE_CLIENT_TIMEOUT_MS = 20_000;
 
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
@@ -846,31 +853,52 @@ async function parseInvoice() {
   btn.disabled = true;
   aiNote("Reading the request…");
 
-  try {
-    const body = file
-      ? { filename: file.name, mime: file.type || "application/octet-stream", data: await fileToBase64(file) }
-      : { text };
+  /* L-06: arm the budget BEFORE the first await (including the file read),
+     so no part of this request can outlive it. */
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), PARSE_CLIENT_TIMEOUT_MS);
 
-    const res = await fetch(CONFIG.parseEndpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    /* The Worker writes a usable message for every failure — "Text is too long",
-       "Unsupported file type", "GEMINI_API_KEY is not set". Surface that rather
-       than a bare status number. */
-    if (!res.ok) {
-      const detail = await res.json().catch(() => null);
-      throw new Error(detail?.error || `The parser could not read that (error ${res.status}).`);
+  try {
+    let parsed;
+    try {
+      const body = file
+        ? { filename: file.name, mime: file.type || "application/octet-stream", data: await fileToBase64(file) }
+        : { text };
+
+      const res = await fetch(CONFIG.parseEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: ctl.signal,
+      });
+      /* The Worker writes a usable message for every failure — "Text is too long",
+         "Unsupported file type", "GEMINI_API_KEY is not set". Surface that rather
+         than a bare status number. */
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null);
+        throw new Error(detail?.error || `The parser could not read that (error ${res.status}).`);
+      }
+      parsed = await res.json();
+    } finally {
+      /* Cleared the moment the exchange ends — BEFORE applyParsed — so a
+         field-validation error can never be misread as a timeout, and the
+         timer never outlives the request. */
+      clearTimeout(timer);
     }
-    const parsed = await res.json();
     await applyParsed(parsed);
   } catch (err) {
     const msg = String(err?.message || "");
-    aiNote(/failed to fetch|networkerror|load failed/i.test(msg)
-      ? "Could not reach the parser service. Check your connection and try again."
-      : msg || "Could not read that request.", "warn");
+    /* Our own abort is checked first: an aborted fetch reports a DOMException
+       whose raw message must never reach the user. Everything else keeps the
+       Worker's own wording (or the network fallback). */
+    let note = msg || "Could not read that request.";
+    if (ctl.signal.aborted) note = "The parser took too long to respond. Try again.";
+    else if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+      note = "Could not reach the parser service. Check your connection and try again.";
+    }
+    aiNote(note, "warn");
   } finally {
+    clearTimeout(timer);
     btn.disabled = false;
   }
 }
