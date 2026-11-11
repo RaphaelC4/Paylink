@@ -397,7 +397,7 @@ will look for them.
 | Replaying one payment across links | Each `msg` names one link, and a link can only leave `OPEN` once. |
 | Payee never receives the funds | `claim` pays only `link.creator` and the fee account, never the caller. A failed transfer reverts the link to `PAID` so anyone can retry. |
 | Payee not registered with the token | `create_link` registers the payee but does not wait for the result, so `claim` now registers them again before every payout — a `storage_deposit` paid from the contract's own balance, refunded in full when the payee is already registered. If that registration fails, the payout batch fails too, `on_claimed` returns the link to `PAID`, and the next attempt — frontend or keeper, every minute — starts over. A slow registration can delay a payout; it can no longer strand one. Fixed in this build and deployed: test `claim_re_registers_the_payee_before_paying_out`, live in tx [`AZES8yzvj3nBxWeAe4HmgYfQMbqBPBYwGzdBXGUkDvYy`](https://testnet.nearblocks.io/txns/AZES8yzvj3nBxWeAe4HmgYfQMbqBPBYwGzdBXGUkDvYy). |
-| Stuck links crowd out others | The keeper claims at most 10 links per sweep — a per-tick gas bound, not a queue with a tail. Every sweep re-reads contract state and takes the first 10 links still sitting in `PAID`, in contract key order, so a link one tick settled leaves the set and the next one in key order moves up. A link whose claim fails does not move to the back — it keeps its place in that order and is retried on every later sweep, holding one of the ten slots until a claim lands. That is precisely why the one failure which could make a claim fail forever (an unregistered payee) is now retried inside `claim` itself: the retry has to succeed rather than occupy a slot indefinitely. The manual *Release* button calls the contract directly and bypasses the keeper entirely. |
+| Stuck links crowd out others | The keeper claims at most 10 links per sweep — a per-tick gas bound. Over the cap the window **rotates**: PAID links are sorted by id and the window advances one step of 10 each minute, so a link that keeps failing holds a slot only on the minutes its window comes up and every other link is reached within ceil(n/10) minutes (tested: 25 links, 3 minutes, all reached). Before each broadcast the keeper reads the link's live status (`get_link`, optimistic finality) and skips one that is already CLAIMED or in flight, so a manual *Release* or an overlapping `/tick` does not cost a doomed transaction; if that view fails the claim goes out anyway, because a duplicate reverts harmlessly and a missed settlement waits. The one failure that could make a claim fail forever (an unregistered payee) is retried inside `claim` itself. The manual *Release* button calls the contract directly and bypasses the keeper entirely. |
 | Someone claims on the payee's behalf | `claim` is deliberately callable by anyone, but the payout address comes from the invoice, not from the caller. A stranger can only cause the payee to be paid. |
 | Payer loses money on a bad payment | Every rejection returns the full amount; the token contract refunds the sender. |
 | Deployer holds power | No admin function, no owner and no withdrawal path in the contract's code. The fee account and the 0.5% rate are fixed at deploy; changing either needs a code upgrade signed by the deployer's key — and that key can redeploy the contract, so the deployer retains that one power outside the code. |
@@ -602,3 +602,42 @@ soon as the folder is uploaded. If you deploy the parser too, set its
   payee never holds gas at any point in the lifecycle.
 - [1Click API](https://docs.near-intents.org/integration/distribution-channels/1click-api/quickstart) · [Tidepool testnet sandbox](https://www.usetidepool.tech/docs/quickstart)
 - [NEAR docs index](https://docs.near.org/llms.txt) · [NEAR Intents docs index](https://docs.near-intents.org/llms.txt)
+
+## Keeper scaling (audit M-06)
+
+**Today.** Each minute the keeper makes one `view_state` call (prefix `l`) and
+decodes every stored link: O(total links) bytes per sweep, O(PAID) claims. At
+~170 B per link that is ~5 kB for the current ~30 links. The contract stores
+links in a `LookupMap`, which cannot be iterated or filtered by status, and
+`view_state` has no cursor, so **pagination is not available**. Splitting by key
+prefix (key = `l` + u32 length + id) would only multiply calls (up to 61 length
+buckets per sweep) and cannot get past the limit below.
+
+**Likely ceiling (unverified).** Stock nearcore refuses `view_state` for the
+whole account once its non-code storage exceeds the node's limit, 50 kB by
+default, whatever the prefix. If the public RPC keeps that default, discovery
+stops somewhere past a few hundred links. Verify once with a
+`view_state` call against a large account on the RPC the keeper uses; the
+keeper now reports it as `scan_failed` / `account_state_too_large`.
+
+**Shipped in this change (keeper only, no contract or economics change).**
+a failed or malformed scan is classified and logged (`scan_failed`:
+`account_state_too_large` | `rpc_failed` | `bad_response`) and never treated as
+"nothing is PAID"; undecodable records are counted (`scan_degraded`); rotating
+batch window; live-status check before each claim (`claim_skipped`). Retries
+stay idempotent: `claim` reverts unless the link is PAID, and `on_claimed`
+returns a failed payout to PAID, so the next run simply finds it again.
+
+**Rejected:** skipping the scan when the contract's `storage_usage` is unchanged
+— an `on_claimed` revert (−9 B) can cancel a simultaneous claim (+9 B) and hide a
+link that is PAID again.
+
+**Options beyond the ceiling — need a decision (not implemented):**
+
+| Option | Discovery cost | Needs | Trade-off |
+|---|---|---|---|
+| A. Contract PAID index (`IterableSet` of PAID ids, paged `get_paid_links(from, limit)`) | O(PAID), paged `call_function` | contract change, redeploy, state migration, old PAID links backfilled | Cleanest and fully on-chain; touches the deployed contract and its storage layout |
+| B. Hint fast path (`POST /settle {link_id}` → `get_link` → claim; cron kept as slow backstop) | O(1) per payment | frontend change + a public endpoint (abuse-safe: only claims PAID links) | Seconds-level settlement; the cron still hits the ceiling for payments that never send a hint |
+| C. External indexer (FastNEAR/NEAR Lake) | O(events) | third-party service or self-hosted infra, API keys, cost | Highest scale, new trust and uptime dependency |
+
+Recommendation: B for the hackathon window (small, reversible), A after it.

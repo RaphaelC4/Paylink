@@ -12,7 +12,9 @@
  *
  * Discovery needs no registry: `view_state` with prefix "l" returns every
  * link the contract stores (LookupMap key = b"l" + borsh(link_id)), and the
- * value borsh-decodes to the Link struct. One RPC call sees all of them.
+ * value borsh-decodes to the Link struct. One RPC call sees all of them — and
+ * that is also the ceiling: view_state has no cursor, no status filter and (on
+ * stock nodes) a whole-account size limit, so see README "Keeper scaling".
  *
  * Secrets:  wrangler secret put KEEPER_KEY      (ed25519, matches KEEPER_ACCOUNT)
  *           wrangler secret put TICK_SECRET     (for POST /tick)
@@ -201,26 +203,89 @@ export function decodeLink(v) {
   };
 }
 
-/** Every link in contract state: one view_state call, prefix "l". */
+/** Scan failure with a machine-readable reason, so the log says WHY discovery
+ *  stopped. view_state has no cursor and no status filter, so there is no
+ *  partial result to fall back on: a failed scan means "nothing discovered",
+ *  and it must never be mistaken for "nothing is PAID". */
+export class ScanError extends Error {
+  constructor(reason, message) {
+    super(message);
+    this.reason = reason;
+  }
+}
+
+/** Every link in contract state: one view_state call, prefix "l".
+ *
+ *  Complete or it throws. A response that is not the expected shape is an error,
+ *  never an empty list; records that fail to decode are counted and returned so
+ *  the caller can shout about them instead of silently skipping a PAID link. */
 export async function scanLinks(env) {
-  const res = await rpc(env, "query", {
-    request_type: "view_state",
-    finality: "final",
-    account_id: env.CONTRACT_ID,
-    prefix_base64: btoa("l"),
-  });
-  const entries = Array.isArray(res.values)
-    ? res.values
-    : (res.keys || []).map((key, i) => ({ key, value: res.values[i] }));
+  let res;
+  try {
+    res = await rpc(env, "query", {
+      request_type: "view_state",
+      finality: "final",
+      account_id: env.CONTRACT_ID,
+      prefix_base64: btoa("l"),
+    });
+  } catch (err) {
+    const msg = String(err.message || err);
+    /* nearcore refuses view_state for the whole account once its non-code
+       storage passes the node's limit (50 kB by default) — whatever the prefix.
+       Splitting the scan by prefix cannot help, so say so instead of retrying. */
+    if (/too large|AccountStateTooLarge/i.test(msg)) throw new ScanError("account_state_too_large", msg);
+    throw new ScanError("rpc_failed", msg);
+  }
+  if (!res || !Array.isArray(res.values)) {
+    throw new ScanError("bad_response", "view_state result has no values array");
+  }
   const links = [];
-  for (const e of entries) {
+  const undecodable = [];
+  for (const e of res.values) {
     try {
       links.push(decodeLink(b64decode(e.value)));
     } catch {
-      /* an undecodable record is skipped, never fatal to the sweep */
+      undecodable.push(String(e.key ?? "").slice(0, 80));
     }
   }
-  return { links, blockHash: res.block_hash };
+  return { links, undecodable, blockHash: res.block_hash };
+}
+
+/** Live status of one link via the contract's `get_link` view (O(1), no state
+ *  scan). `optimistic` finality sees a claim that is still in flight, which the
+ *  `final` scan cannot. Returns the status string, "MISSING", or null when the
+ *  RPC could not answer — callers treat null as "unknown, go ahead". */
+export async function liveStatus(env, linkId) {
+  try {
+    const res = await rpc(env, "query", {
+      request_type: "call_function",
+      finality: "optimistic",
+      account_id: env.CONTRACT_ID,
+      method_name: "get_link",
+      args_base64: btoa(JSON.stringify({ link_id: linkId })),
+    });
+    const parsed = JSON.parse(utf8.decode(Uint8Array.from(res.result)));
+    return parsed ? String(parsed.status).toUpperCase() : "MISSING";
+  } catch {
+    return null;
+  }
+}
+
+/** Which PAID links this sweep handles. Everything fits under the cap in the
+ *  normal case. Over the cap, a fixed head-of-queue would let ten links that
+ *  keep failing starve every link behind them forever, so the window rotates:
+ *  sorted by id, advancing one cap-sized step per minute, so every link comes
+ *  up within ceil(n / cap) minutes. Stateless — the minute is the only input. */
+export function pickBatch(paidAll, nowMs) {
+  const sorted = [...paidAll].sort((a, b) => (a.link_id < b.link_id ? -1 : a.link_id > b.link_id ? 1 : 0));
+  const n = sorted.length;
+  if (n <= MAX_CLAIMS_PER_SWEEP) return { batch: sorted, deferred: [] };
+  const start = (Math.floor(nowMs / 60_000) * MAX_CLAIMS_PER_SWEEP) % n;
+  const idx = Array.from({ length: n }, (_, i) => (start + i) % n);
+  return {
+    batch: idx.slice(0, MAX_CLAIMS_PER_SWEEP).map((i) => sorted[i]),
+    deferred: idx.slice(MAX_CLAIMS_PER_SWEEP).map((i) => sorted[i]),
+  };
 }
 
 /* ──────────────────────────────────────────────────── tx signing ── */
@@ -320,7 +385,10 @@ async function broadcast(env, txB64) {
 /* One structured JSON line per settlement event, greppable in Workers →
    Logs or `wrangler tail`. Six events, in the order they happen:
    invoice_discovered, claim_submitted, claim_successful, claim_failed,
-   invoice_already_claimed, retry_scheduled. Never logs the key — only
+   invoice_already_claimed, retry_scheduled. Three more report discovery
+   health and the duplicate guard: scan_failed (reason: account_state_too_large |
+   rpc_failed | bad_response), scan_degraded (records that would not decode)
+   and claim_skipped (live status no longer PAID). Never logs the key — only
    link ids, transaction hashes and error text. */
 const logEvent = (event, detail) => console.log(JSON.stringify({ event, ...detail }));
 
@@ -329,17 +397,31 @@ const logEvent = (event, detail) => console.log(JSON.stringify({ event, ...detai
  * panics unless the link is PAID, so a link released elsewhere between the
  * scan and the broadcast simply fails its own transaction and is reported.
  */
-export async function sweep(env) {
-  const report = { scanned: 0, paid: [], claimed: [], failed: [], alreadyClaimed: [] };
-  const { links, blockHash } = await scanLinks(env);
+export async function sweep(env, { now = Date.now() } = {}) {
+  const report = { scanned: 0, undecodable: 0, paid: [], claimed: [], failed: [], alreadyClaimed: [], skipped: [] };
+  let scan;
+  try {
+    scan = await scanLinks(env);
+  } catch (err) {
+    const reason = err.reason || "rpc_failed";
+    logEvent("scan_failed", { reason, error: String(err.message || err).slice(0, 200) });
+    logEvent("retry_scheduled", { reason: `scan ${reason} — next run` });
+    throw err;
+  }
+  const { links } = scan;
   report.scanned = links.length;
+  report.undecodable = scan.undecodable.length;
+  if (scan.undecodable.length) {
+    /* A record the keeper cannot read might be a PAID link it cannot settle. */
+    logEvent("scan_degraded", { undecodable: scan.undecodable.length, keys: scan.undecodable.slice(0, 5) });
+  }
 
   const paidAll = links.filter((l) => l.status === "PAID");
-  const paid = paidAll.slice(0, MAX_CLAIMS_PER_SWEEP);
+  const { batch: paid, deferred } = pickBatch(paidAll, now);
   report.paid = paid.map((l) => l.link_id);
   for (const l of paid) logEvent("invoice_discovered", { link_id: l.link_id });
-  /* Over the per-sweep cap: not forgotten — the next run picks it up. */
-  for (const l of paidAll.slice(MAX_CLAIMS_PER_SWEEP)) {
+  /* Over the per-sweep cap: not forgotten — the rotating window reaches it. */
+  for (const l of deferred) {
     logEvent("retry_scheduled", { link_id: l.link_id, reason: "sweep cap — next run" });
   }
   if (!paid.length) return report;
@@ -355,6 +437,16 @@ export async function sweep(env) {
 
   for (const link of paid) {
     try {
+      /* The scan is `final` and a few seconds stale; a manual Release, a
+         parallel /tick or an in-flight claim may already have taken this link.
+         One cheap view avoids a doomed transaction. If the view itself fails
+         we go ahead: a duplicate claim reverts harmlessly, a missed one waits. */
+      const live = await liveStatus(env, link.link_id);
+      if (live !== null && live !== "PAID") {
+        logEvent("claim_skipped", { link_id: link.link_id, live_status: live });
+        report.skipped.push({ link_id: link.link_id, live_status: live });
+        continue;
+      }
       const ak = await accessKey(env, env.KEEPER_ACCOUNT, publicKeyB58);
       const tx = await signTx({
         secret,

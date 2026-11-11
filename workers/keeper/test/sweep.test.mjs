@@ -8,7 +8,7 @@
  */
 
 import { generateKeyPairSync } from "node:crypto";
-import { sweep, decodeLink, parseSecretKey } from "../src/index.js";
+import { sweep, decodeLink, parseSecretKey, pickBatch, ScanError } from "../src/index.js";
 
 let passed = 0;
 let failed = 0;
@@ -80,6 +80,10 @@ let broadcastMode;  // "ok" | "generic-fail" | "not-paid-fail" | "throw"
 let broadcasts;     // captured signed transactions
 let keyQueries;     // captured view_access_key params
 let nonceCounter = 41;
+let viewStateMode;  // "ok" | "too-large" | "rpc-down" | "bad-shape" | "junk-record"
+let liveOverride;   // link_id -> status string get_link reports (default: same as state)
+let liveMode;       // "ok" | "down"
+let viewCalls;      // captured get_link link ids
 
 const link = (id, status, extra = {}) => ({
   link_id: id,
@@ -101,7 +105,23 @@ globalThis.fetch = async (_url, opts) => {
   const body = JSON.parse(opts.body);
   const json = (obj) => ({ json: async () => obj });
 
+  if (body.method === "query" && body.params.request_type === "call_function") {
+    if (liveMode === "down") throw new Error("view down");
+    const id = JSON.parse(Buffer.from(body.params.args_base64, "base64").toString()).link_id;
+    viewCalls.push(id);
+    const l = state.find((x) => x.link_id === id);
+    const st = liveOverride[id] ?? (l ? ["OPEN", "PAID", "CLAIMED"][l.status] : null);
+    const val = st ? { link_id: id, status: st } : null;
+    return json({ result: { result: [...Buffer.from(JSON.stringify(val))], block_hash: BLOCK_HASH } });
+  }
   if (body.method === "query" && body.params.request_type === "view_state") {
+    if (viewStateMode === "too-large") return json({ error: { message: "State of contract paylink-v2.testnet is too large to be viewed" } });
+    if (viewStateMode === "rpc-down") throw new Error("socket hang up");
+    if (viewStateMode === "bad-shape") return json({ result: { block_hash: BLOCK_HASH } });
+    if (viewStateMode === "junk-record") {
+      return json({ result: { values: [{ key: btoa("lbad"), value: b64([9, 9]) },
+        ...state.map((l) => ({ key: btoa("l" + l.link_id), value: b64(encodeLink(l)) }))], block_hash: BLOCK_HASH } });
+    }
     return json({
       result: {
         values: state.map((l) => ({ key: btoa("l" + l.link_id), value: b64(encodeLink(l)) })),
@@ -176,6 +196,10 @@ const reset = (links, mode) => {
   broadcasts = [];
   keyQueries = [];
   nonceCounter = 41;
+  viewStateMode = "ok";
+  liveOverride = {};
+  liveMode = "ok";
+  viewCalls = [];
 };
 
 /* ══════════════════════════ tests ══════════════════════════ */
@@ -273,11 +297,85 @@ const reset = (links, mode) => {
 {
   const many = Array.from({ length: 12 }, (_, i) => link(`bulk${i}`, 1));
   reset(many, "ok");
-  const report = await captureLogs(() => sweep(ENV));
+  const report = await captureLogs(() => sweep(ENV, { now: 0 }));
   ok(report.paid.length === 10, "one sweep caps claims at 10");
   ok(broadcasts.length === 10, "cap bounds the broadcasts too");
-  const deferred = events().filter((e) => e.event === "retry_scheduled" && /^bulk1[01]$/.test(e.link_id));
+  const deferred = events().filter((e) => e.event === "retry_scheduled" && /^bulk[89]$/.test(e.link_id));
   ok(deferred.length === 2, "the 2 over-cap links are logged retry_scheduled for the next run");
+}
+
+/* 8b. rotation: over the cap, the window advances so no link is starved */
+{
+  const many = Array.from({ length: 25 }, (_, i) => link(`rot${String(i).padStart(2, "0")}`, 1));
+  const seen = new Set();
+  for (let minute = 0; minute < 3; minute++) {
+    const { batch, deferred } = pickBatch(many, minute * 60_000);
+    ok(batch.length === 10 && batch.length + deferred.length === 25, `minute ${minute}: batch of 10, rest deferred`);
+    batch.forEach((l) => seen.add(l.link_id));
+  }
+  ok(seen.size === 25, "every link is reached within ceil(25/10)=3 minutes (no starvation)");
+  ok(pickBatch(many.slice(0, 10), 5).batch.length === 10 && pickBatch(many.slice(0, 10), 5).deferred.length === 0,
+    "exactly at the cap: everything in one batch, nothing deferred");
+  ok(pickBatch([], 0).batch.length === 0, "empty input: empty batch");
+  reset(many, "ok");
+  const r0 = await captureLogs(() => sweep(ENV, { now: 0 }));
+  const r1 = await captureLogs(() => sweep(ENV, { now: 60_000 }));
+  ok(r0.paid[0] === "rot00" && r1.paid[0] === "rot10", "sweep honours the rotating window");
+}
+
+/* 8c. duplicate guard: live status checked before every broadcast */
+{
+  reset([link("dupA", 1), link("dupB", 1)], "ok");
+  liveOverride = { dupA: "CLAIMED" }; // claimed elsewhere / in flight since the final-state scan
+  const r = await captureLogs(() => sweep(ENV));
+  ok(broadcasts.length === 1 && JSON.parse(parseTx(broadcasts[0]).args).link_id === "dupB", "link already CLAIMED live is not re-broadcast");
+  ok(r.skipped.length === 1 && r.skipped[0].link_id === "dupA" && hasEvent("claim_skipped", "dupA"), "skip reported and logged");
+  ok(viewCalls.length === 2, "one get_link view per candidate");
+
+  reset([link("dupC", 1)], "ok");
+  liveMode = "down"; // the view itself fails: fail open, settlement must not wait on it
+  const r2 = await captureLogs(() => sweep(ENV));
+  ok(r2.claimed.length === 1 && broadcasts.length === 1, "live-status outage fails open: claim still goes out");
+
+  reset([link("dupD", 1)], "ok");
+  liveOverride = { dupD: "PAID" };
+  await captureLogs(() => sweep(ENV));
+  ok(broadcasts.length === 1, "live PAID proceeds with exactly one claim");
+}
+
+/* 8d. scan failures: classified, logged, never read as "nothing PAID" */
+{
+  for (const [mode, reason] of [["too-large", "account_state_too_large"], ["rpc-down", "rpc_failed"], ["bad-shape", "bad_response"]]) {
+    reset([link("pX", 1)], "ok");
+    viewStateMode = mode;
+    let err = null;
+    await captureLogs(() => sweep(ENV).catch((e) => { err = e; }));
+    ok(err instanceof ScanError && err.reason === reason, `scan ${mode} -> ScanError(${reason})`);
+    ok(events().some((e) => e.event === "scan_failed" && e.reason === reason) && hasEvent("retry_scheduled"), `scan ${mode} logs scan_failed + retry_scheduled`);
+    ok(broadcasts.length === 0, `scan ${mode}: nothing broadcast on a failed scan`);
+  }
+  /* recovery: the next run, scan healthy again, settles the link */
+  viewStateMode = "ok";
+  const r = await captureLogs(() => sweep(ENV));
+  ok(r.claimed.length === 1, "next run after a failed scan settles the stranded link");
+}
+
+/* 8e. undecodable record: counted and shouted about, PAID links still settle */
+{
+  reset([link("goodP", 1)], "ok");
+  viewStateMode = "junk-record";
+  const r = await captureLogs(() => sweep(ENV));
+  ok(r.undecodable === 1 && hasEvent("scan_degraded"), "undecodable record reported (scan_degraded), not silently dropped");
+  ok(r.claimed.length === 1, "readable PAID link is still settled");
+}
+
+/* 8f. idempotent retry: claim reverted to PAID by on_claimed is picked up again */
+{
+  reset([link("flap", 1)], "generic-fail");
+  await captureLogs(() => sweep(ENV));
+  broadcastMode = "ok";
+  const r = await captureLogs(() => sweep(ENV));
+  ok(broadcasts.length === 2 && r.claimed.length === 1, "failed claim retried next run, exactly one successful claim");
 }
 
 /* 9. parseSecretKey still refuses a public key pasted as the secret */
