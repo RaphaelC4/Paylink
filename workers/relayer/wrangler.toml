@@ -1,0 +1,32 @@
+# Relayer Worker deploy config — the controlled home for this file is
+# "wrangler.toml next to src/index.js" (see README.md). It preserves the
+# configuration used for the 11 Nov 2026 production release (version
+# f399802f-48e1-4fc0-90be-c011aa90ae1a, build 20261110d), previously kept
+# only in a temp directory.
+# Vars: README.md "Settings -> Variables and Secrets" (mirror them exactly).
+# Binding: README.md "Rate limiting (M-07)" snippet, verbatim.
+# Secrets are NOT in this file: RELAYER_KEY lives server-side; keep_vars
+# preserves it across deploys (re-set with `npx wrangler secret put RELAYER_KEY`).
+name = "paylink-relayer"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+keep_vars = true
+
+[vars]
+RPC_URL = "https://test.rpc.fastnear.com"
+RPC_URLS = "https://near-testnet.drpc.org, https://testnet-rpc.intea.rs"
+CONTRACT_ID = "paylink-v2.testnet"
+TOKEN_ID = "usdc.tidepool-sandbox.testnet"
+RELAYER_ACCOUNT = "paylink-relay.testnet"
+ALLOWED_ORIGIN = "https://paylink-near.vercel.app"
+
+# M-07 layer 2 — durable cross-isolate burst cap. namespace_id "2002" is
+# unique per account policy: workers sharing a namespace share one counter.
+# workers/parse uses 2001 — do NOT reuse it here. Requires wrangler >= 4.36.
+[[ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "2002"
+
+  [ratelimits.simple]
+  limit = 10
+  period = 60

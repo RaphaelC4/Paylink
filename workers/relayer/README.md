@@ -128,10 +128,11 @@ namespace_id = "2002"   # must be unique per account policy:
                         # which is why layer 1 owns the hourly policy.
 ```
 
-Then `npx wrangler deploy` (it will prompt for the vars currently set in the
-dashboard — mirror them exactly — and the `RELAYER_KEY` secret is re-set with
-`npx wrangler secret put RELAYER_KEY`). Until then the paste deployment runs
-layer 1 alone.
+The complete deploy config — the vars above plus this binding — is preserved
+in `wrangler.toml` next to `src/index.js`, so the next deploy is reproducible:
+`npx wrangler deploy`. Secrets stay out of the file (`keep_vars = true`
+preserves `RELAYER_KEY` server-side; re-set it with
+`npx wrangler secret put RELAYER_KEY`). A dashboard paste runs layer 1 alone.
 
 Client identity: the `cf-connecting-ip` header, which Cloudflare sets at the
 edge (clients cannot forge it on `workers.dev`); `X-Forwarded-For` and
