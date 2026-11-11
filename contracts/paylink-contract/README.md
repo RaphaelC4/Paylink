@@ -105,7 +105,8 @@ transfer leg will fail.
   one batch to the token contract, so they succeed or fail together.
 - **`claim` is callable by anyone but can only pay the invoice's payee and the
   fee account.** The caller is never a payment destination. This is what lets
-  the frontend release a paid invoice for a payee who is offline.
+  the keeper Worker release a paid invoice for a payee who is offline — no
+  payee signature, no browser required.
 - **`create_link` registers the creator with the token** (fire-and-forget
   `storage_deposit`, 0.005 NEAR out of the 0.01 NEAR stake), so the later payout
   cannot fail because the payee was never registered. Already-registered payees

@@ -174,6 +174,17 @@ the keeper sweeps every minute.
 Automatic settlement is in progress.* and the **Release** button on the paid
 card is the manual fallback — anyone can press it.)
 
+> *([drift] In the recorded video this beat predates the one-approval change
+> of 9 Nov 2026: after PAID the payer's wallet signs a second transaction —
+> `claim`, shown on camera as `sign-as paylink-payer.testnet` — and the app
+> reports "Payment released to the payee". Since that change the pay flow
+> only watches `OPEN → PAID → CLAIMED`: the payer signs exactly once
+> (`ft_transfer_call`), the keeper settles from its own gas account, and no
+> second wallet prompt exists. The narration here was already accurate
+> ("anyone can trigger the release"); it is the on-screen signature that is
+> outdated. Re-record this beat if the video is refreshed — the script above
+> is current.)*
+
 **On screen:** the timeline moves to **Claimed**. Switch to profile A: the payee
 balance has increased by 24.875 USDC.
 

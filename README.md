@@ -19,8 +19,9 @@ signs nothing.
 **On gas:** the track hints at meta transactions; Paylink uses them — a
 NEP-366 delegate action carries `create_link` to chain with the relayer
 paying the gas and the stake, while `claim` is callable by anyone and can
-only pay the invoice's payee, so the release is signed by whoever is holding
-the app (or by the keeper Worker) and the payee never holds gas
+only pay the invoice's payee, so the release is signed by the keeper Worker
+from its own gas account — the app's *Release* button is the manual fallback
+— and the payee never holds gas
 ([how the relayer works](#references)).
 
 Built for **NEAR HACKATHON**, track **`realworld` — Real-World Money**.
@@ -30,6 +31,13 @@ Built for **NEAR HACKATHON**, track **`realworld` — Real-World Money**.
 **Launch post:** <https://x.com/agu_raphael_/status/2119552525439492372> ·
 **Contract:** [`paylink-v2.testnet`](https://testnet.nearblocks.io/address/paylink-v2.testnet)
 on NEAR testnet explorer
+
+*Video drift note (M-05): the walkthrough was recorded 7 Nov 2026, before
+the one-approval change of 9 Nov — its release beat (~1:45–1:55) shows the
+payer's wallet signing `claim`, a second approval that no longer exists.
+Today the payer signs only the payment; the keeper settles automatically
+from its own gas account. The narration and the gasless creation clip are
+accurate as recorded. [DEMO.md](DEMO.md) carries the re-record script.*
 
 ---
 
@@ -49,9 +57,10 @@ Paylink removes that requirement — even for creating the link. The payee's
 wallet signs a delegate action off-chain and the relayer covers the 0.01 NEAR
 stake and the gas for that first transaction (a wallet that cannot sign a
 delegate pays it itself, once). After that, the payer uses what they have, and
-the payee does not have to claim, sweep, or hold gas: the frontend releases a
-paid invoice to them the moment it is settled, and a keeper Worker repeats
-that release every minute so nothing waits on a browser staying open.
+the payee does not have to claim, sweep, or hold gas: a keeper Worker
+releases the paid invoice automatically from its own gas account, sweeping
+every minute, so settlement never waits on a browser staying open or on
+another wallet prompt.
 
 ---
 
@@ -141,10 +150,11 @@ All four links read `creator: paylink-payee.testnet` on chain.
    the token — a deposit from the contract's own balance, refunded in full if
    they already are — then sends the credited amount to the payee, minus a
    fixed 0.5% fee. **Anyone can call it** — the money can only go to the
-   invoice's payee and the fee account, never to the caller — so the frontend
-   releases a paid invoice for the payee instead of asking them to come back
-   and sign something, and `workers/keeper/` repeats the release from a cron
-   every minute as the backstop.
+   invoice's payee and the fee account, never to the caller — so
+   `workers/keeper/` calls it from a cron every minute to release a paid
+   invoice for the payee without asking them to come back and sign anything,
+   and the frontend's *Release* button is the manual fallback anyone can
+   press.
 
 **There is no `mark_paid` function.** Nothing in the public interface lets
 anyone assert that a link was paid. The only code path that marks a link paid
@@ -236,9 +246,11 @@ not render at all.
 ### The release keeper
 
 `workers/keeper/` is a small Cloudflare Worker, with no dependencies, that
-releases paid links from a cron every minute. It exists because the frontend's
-release can fail: the wallet prompt can be rejected, the tab can close, the
-network can drop. Discovery needs no registry — one `view_state` call with
+releases paid links from a cron every minute — it is the settlement path, not
+a backup: it needs no browser, no wallet prompt and no payee signature, so a
+closed tab or a rejected prompt can never strand a paid invoice. (The
+frontend's *Release* button is the manual fallback if the keeper is ever
+down.) Discovery needs no registry — one `view_state` call with
 prefix `l` lists every link the contract stores, and anything sitting in `PAID`
 gets claimed, up to 10 per sweep. That single call is only the fast path: if
 it fails after its retry, the same coverage is fetched as disjoint sub-prefix
@@ -409,8 +421,8 @@ will look for them.
 | Underpayment | The credited amount must be at least the invoiced amount, otherwise the full amount is returned. |
 | Replaying one payment across links | Each `msg` names one link, and a link can only leave `OPEN` once. |
 | Payee never receives the funds | `claim` pays only `link.creator` and the fee account, never the caller. A failed transfer reverts the link to `PAID` so anyone can retry. |
-| Payee not registered with the token | `create_link` registers the payee but does not wait for the result, so `claim` now registers them again before every payout — a `storage_deposit` paid from the contract's own balance, refunded in full when the payee is already registered. If that registration fails, the payout batch fails too, `on_claimed` returns the link to `PAID`, and the next attempt — frontend or keeper, every minute — starts over. A slow registration can delay a payout; it can no longer strand one. Fixed in this build and deployed: test `claim_re_registers_the_payee_before_paying_out`, live in tx [`AZES8yzvj3nBxWeAe4HmgYfQMbqBPBYwGzdBXGUkDvYy`](https://testnet.nearblocks.io/txns/AZES8yzvj3nBxWeAe4HmgYfQMbqBPBYwGzdBXGUkDvYy). |
-| Stuck links crowd out others | The keeper claims at most 10 links per sweep — a per-tick gas bound, not a queue with a tail. Every sweep re-reads contract state and takes the first 10 links still sitting in `PAID`, in contract key order, so a link one tick settled leaves the set and the next one in key order moves up. A link whose claim fails does not move to the back — it keeps its place in that order and is retried on every later sweep, holding one of the ten slots until a claim lands. That is precisely why the one failure which could make a claim fail forever (an unregistered payee) is now retried inside `claim` itself: the retry has to succeed rather than occupy a slot indefinitely. The in-app release and the manual *Release* button call the contract directly and bypass the keeper entirely. |
+| Payee not registered with the token | `create_link` registers the payee but does not wait for the result, so `claim` now registers them again before every payout — a `storage_deposit` paid from the contract's own balance, refunded in full when the payee is already registered. If that registration fails, the payout batch fails too, `on_claimed` returns the link to `PAID`, and the next attempt — the keeper's next sweep or a press of the *Release* button — starts over. A slow registration can delay a payout; it can no longer strand one. Fixed in this build and deployed: test `claim_re_registers_the_payee_before_paying_out`, live in tx [`AZES8yzvj3nBxWeAe4HmgYfQMbqBPBYwGzdBXGUkDvYy`](https://testnet.nearblocks.io/txns/AZES8yzvj3nBxWeAe4HmgYfQMbqBPBYwGzdBXGUkDvYy). |
+| Stuck links crowd out others | The keeper claims at most 10 links per sweep — a per-tick gas bound, not a queue with a tail. Every sweep re-reads contract state and takes the first 10 links still sitting in `PAID`, in contract key order, so a link one tick settled leaves the set and the next one in key order moves up. A link whose claim fails does not move to the back — it keeps its place in that order and is retried on every later sweep, holding one of the ten slots until a claim lands. That is precisely why the one failure which could make a claim fail forever (an unregistered payee) is now retried inside `claim` itself: the retry has to succeed rather than occupy a slot indefinitely. The *Release* button calls the contract directly and bypasses the keeper entirely. |
 | Someone claims on the payee's behalf | `claim` is deliberately callable by anyone, but the payout address comes from the invoice, not from the caller. A stranger can only cause the payee to be paid. |
 | Payer loses money on a bad payment | Every rejection returns the full amount; the token contract refunds the sender. |
 | Deployer holds power | No admin function, no owner and no withdrawal path in the contract's code. The fee account and the 0.5% rate are fixed at deploy; changing either needs a code upgrade signed by the deployer's key — and that key can redeploy the contract, so the deployer retains that one power outside the code. |
@@ -565,7 +577,8 @@ into a second Worker (one file, no dependencies), add the `KEEPER_KEY` and
 each endpoint in order, broadcasts always go to `RPC_URL` alone exactly
 once), and set a `* * * * *` cron
 trigger. `workers/keeper/README.md` has the steps and a `curl` check. Without
-it the frontend still releases links itself — the keeper is the backstop.
+it nothing settles automatically: paid links wait until someone presses the
+*Release* button, so the keeper is the settlement path rather than a backstop.
 
 The relayer is a third Worker of the same shape: paste
 `workers/relayer/src/index.js`, add the `RELAYER_KEY` secret plus five text
