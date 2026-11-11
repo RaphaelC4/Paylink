@@ -247,8 +247,9 @@ Nothing above was done for M-01 (no deploy, no push, no account changes).
 8. **Other audit findings untouched by design**: when M-01 was written,
    M-03 – M-06 and L-01 – L-08 all remained open; M-01 changed no
    contract economics, payment flow, or H-01. (Status has since moved —
-   M-01 – M-03 and L-01 – L-08 are fixed on `staging`; M-04 and M-05
-   remain open.)
+   H-01, M-01 – M-07 and L-01 – L-08 are all fixed on `staging` as of
+   11 Nov 2026; the only two items still deferred are P4 external
+   monitoring — §8.2 above — and broadcast failover — §9 below.)
 
 ---
 
@@ -277,8 +278,10 @@ frontend uses a **single** RPC endpoint (browser-side failover is limited by
 CORS and was not part of the approved P1 — P2's one automatic read retry is
 its mitigation), while the keeper and relayer now fail **reads** over through
 the optional `RPC_URLS` list (L-08 P1) with broadcasts still pinned to
-`RPC_URL`, exactly once — broadcast failover and the relayer direct-pay
-fallback are explicitly *not* approved yet; Gemini's daily quota is
+`RPC_URL`, exactly once — broadcast failover remains explicitly *not*
+approved (deferred), while the direct-payment fallback (L-08 P5) *is*
+approved and implemented behind its consent dialog and post-consent chain
+re-check; Gemini's daily quota is
 project-wide, so parse traffic from any client spends one shared budget.
 
 **Sources (all read 10 Nov 2026):** NEAR RPC provider table
