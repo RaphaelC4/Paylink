@@ -46,12 +46,13 @@ fund them from the CLI.
 
    ```bash
    for a in paylink-relay.testnet paylink-keeper.testnet; do
-     curl -s https://rpc.testnet.near.org -H 'Content-Type: application/json' \
+     curl -s https://test.rpc.fastnear.com -H 'Content-Type: application/json' \
        -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"query\",\"params\":{\"request_type\":\"view_account\",\"finality\":\"final\",\"account_id\":\"$a\"}}" \
        | grep -o '"amount":"[0-9]*"'
    done
    # each "amount" must be > 1000000000000000000000000 (1 NEAR)
    # last check 8 Nov 2026: relay 9.936919, keeper 9.973031 NEAR
+   # (the old rpc.testnet.near.org is deprecated — see README — and may 429)
    ```
 
 8. Set the browser zoom to 100% and the window to roughly 1280×800. The layout
@@ -198,7 +199,7 @@ swap**, and point at the swap row — pick **wNEAR**, press
 
 ### 2:20–2:30 — Close
 
-> "Contract, 38 tests, and deployment steps are in the repo. Testnet only —
+> "Contract, 56 tests, and deployment steps are in the repo. Testnet only —
 > the tokens come free from Tidepool's faucet."
 
 ---

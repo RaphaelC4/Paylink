@@ -227,9 +227,10 @@ Nothing above was done for M-01 (no deploy, no push, no account changes).
 
 ## 8. Remaining operational gaps
 
-1. **Nothing is deployed.** All M-01 code sits uncommitted on local
-   `staging` pending explicit instruction; live workers still run their
-   previous builds.
+1. **Nothing is deployed.** At the time of the M-01 report its code sat
+   uncommitted on local `staging`; it has since been committed (see
+   `git log`), but nothing has been pushed and no worker or frontend has
+   been redeployed — live services still run their previous builds.
 2. **Account setup outstanding** (§5): `observability.enabled`,
    `ALERT_WEBHOOK_URL` values, saved queries/alerts — identified, not done.
 3. **Missed-cron detection is query-based** (absence of `cron_heartbeat`);
@@ -243,8 +244,11 @@ Nothing above was done for M-01 (no deploy, no push, no account changes).
    `submit_ok` counts for true totals.
 7. **Frontend and contract are out of M-01 scope** (browser console has no
    structured pipeline; contract emits events on chain, readable via RPC).
-8. **Other audit findings untouched by design**: M-03 – M-06 and L-01 – L-08
-   remain open; M-01 changed no contract economics, payment flow, or H-01.
+8. **Other audit findings untouched by design**: when M-01 was written,
+   M-03 – M-06 and L-01 – L-08 all remained open; M-01 changed no
+   contract economics, payment flow, or H-01. (Status has since moved —
+   M-01 – M-03 and L-01 – L-08 are fixed on `staging`; M-04 and M-05
+   remain open.)
 
 ---
 

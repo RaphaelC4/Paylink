@@ -108,7 +108,7 @@ jobs:
         with:
           workspaces: contracts/paylink-contract
 
-      - name: cargo test --lib (38 host tests)
+      - name: cargo test --lib (56 host tests)
         working-directory: contracts/paylink-contract
         run: cargo test --lib
 
