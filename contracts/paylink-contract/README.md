@@ -76,10 +76,16 @@ transfer leg will fail.
 | --- | --- | --- | --- |
 | `new(allowed_tokens, fee_account)` | yes | ≥ 0.02 NEAR per token | the contract account, once |
 | `create_link(link_id, amount, token, description, expires_at)` | yes | ≥ 0.01 NEAR | payee |
-| `cancel_link(link_id)` | no | — (0 yocto) | **the link's creator only** |
+| `cancel_link(link_id)` | no | — (0 yocto) | **the link's creator only** — *not deployed yet, see note* |
 | `ft_on_transfer(sender_id, amount, msg)` | yes | 0 or 1 yocto | **the token contract** |
 | `claim(link_id)` | yes | exactly 1 yocto | anyone |
 | `on_claimed(link_id, result)` | no | — | this contract (private callback) |
+
+> **`cancel_link` is a future deployment requirement — not callable on chain
+> yet.** It is written and covered by the host tests below, but the deployed
+> `paylink-v2.testnet` predates it: a read-only `cancel_link` call currently
+> answers `MethodNotFound`. Merchants cannot cancel a link on the live
+> network until the contract is redeployed.
 
 ### Read-only
 
@@ -124,7 +130,7 @@ transfer leg will fail.
 - **The payee cannot pay their own link.** When `sender_id` is the link's
   creator, `ft_on_transfer` returns the full amount: the self-payment is
   refunded and the link stays `OPEN` until somebody else pays it.
-- **`cancel_link` is creator-only and pre-payment only (L-03).** The caller
+- **`cancel_link` is creator-only and pre-payment only (L-03) — source-level behaviour, a future deployment requirement, not yet on chain.** The caller
   must be the stored `creator` (read from state, never from arguments) and the
   *stored* status must still be `OPEN` — so `PAID`, `CLAIMED` and `CANCELLED`
   all panic with `link is not open`, while an expired-but-unpaid link (stored
