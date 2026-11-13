@@ -1,0 +1,93 @@
+# Paylink × Tidepool Worker — Cloudflare Worker.
+#
+# Scope (Phases 2–6): GET /networks (dynamic discovery of the networks and
+# tokens Tidepool currently supports, sourced live from /v0/tokens and
+# /v0/health — nothing about chains or tokens is hardcoded), POST /quote
+# (verified EXACT_OUTPUT quotes + deposit instructions + payment-intent
+# records held in a Durable Object), GET /status (deposit tracking +
+# transaction reconciliation: conservative, record-driven polling of
+# /v0/status plus the authoritative contract re-read that detects a
+# cross-provider invoice conflict), Phase 5 independent payout
+# verification (SETTLED → VERIFIED only on authoritative NEAR tx evidence:
+# exactly one successful ft_transfer of the invoice amount to the merchant
+# on the configured USDC token, plus a fresh get_link immediately before
+# the transition — every hold fails closed and is retryable or held for
+# manual reconciliation) and Phase 6 record integrity + reconciliation
+# hardening (every persisted record type/shape-validated before it is
+# served or acted on — corrupt records hold or quarantine as RECONCILE
+# with 503 record_invalid, never a silent repair; detected conflicts are
+# persisted before a cycle completes; upstream Retry-After honoured on the
+# reconcile path; interrupted writes recover idempotently with no
+# duplicate transitions; audit history capped at 256 entries). The
+# frontend rail and any deployment belong to later phases behind explicit
+# approval.
+#
+# No secrets: Tidepool's testnet API is keyless (any X-API-Key value only
+# selects a fee tier), so this Worker sends no credentials upstream and
+# configures none. There is deliberately no `wrangler secret put` line in
+# this file:
+#   - TIDEPOOL_X_API_KEY is a non-secret fee-tier selector.
+#   - TIDEPOOL_MAKER_KEY is Tidepool's PUBLIC verification key.
+name = "paylink-tidepool"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+# The browser origin allowed to call this Worker. Must match the hosted demo.
+# "*" works for local testing but disables the origin gate entirely.
+ALLOWED_ORIGIN = "https://paylink-near.vercel.app"
+# Tidepool's verified base URL (community testnet sandbox of the NEAR 1Click
+# API). The code defaults to the same value; set here so pointing at a
+# mirror is a config change, not a code change.
+TIDEPOOL_ORIGIN = "https://www.usetidepool.tech"
+# The NEAR contract whose get_link supplies merchant/amount/token/status for
+# every quote. The code defaults to the same value (frontend/config.js).
+CONTRACT_ID = "paylink-v2.testnet"
+# NEAR read endpoint (keeper-style failover: comma-separated list accepted
+# via RPC_URLS). FastNEAR, not the deprecated rpc.testnet.near.org.
+RPC_URL = "https://test.rpc.fastnear.com"
+# Non-secret fee-tier selector — Tidepool accepts any X-API-Key value; the
+# value only picks the keyed tier (same convention as the existing rail).
+TIDEPOOL_X_API_KEY = "paylink-testnet"
+# Optional tuning (defaults live in src/index.js):
+#   TIDEPOOL_TIMEOUT_MS            upstream budget per leg, default 5000
+#   TIDEPOOL_CACHE_MS              discovery cache TTL, default 60000
+#   TIDEPOOL_MAKER_KEY             quote-signature verification key
+#                                  (default Tidepool's published maker key)
+#   TIDEPOOL_QUOTE_WINDOW_MS       quote deadline window, default 3600000
+#                                  (bounded 60000..86400000)
+#   TIDEPOOL_AMBIGUOUS_COOLDOWN_MS reconcile cooldown after an ambiguous
+#                                  quote outcome, default 60000
+#                                  (bounded 0..3600000)
+#   TIDEPOOL_STATUS_MIN_INTERVAL_MS GET /status poll floor, default 2000
+#                                  (Tidepool documents 2–5 s after a
+#                                  deposit; bounded 1000..60000)
+#   TIDEPOOL_VERIFY_BACKOFF_MS     Phase 5: base delay after a held
+#                                  verification attempt, doubled per
+#                                  attempt up to the 1 h cap, default 5000
+#                                  (bounded 0..3600000; 0 = retry on every
+#                                  eligible poll)
+
+# Durable Object: the payment-intent record, one instance per invoice id
+# (class PaymentIntent in src/index.js). This is the serialization point
+# that makes "one active intent per invoice" true — see the Phase 3 header
+# comment in src/index.js for why CREATING is persisted before the upstream
+# call.
+[[durable_objects.bindings]]
+name = "INTENT_DO"
+class_name = "PaymentIntent"
+
+[[migrations]]
+tag = "v1"
+# SQLite-backed class (required on the Workers free plan — plain
+# new_classes is rejected with CF error 10097). v1 has never deployed,
+# so this migration is edited in place rather than re-tagged.
+new_sqlite_classes = ["PaymentIntent"]
+
+# KV assessment (Phase 6): NOT required. Payment records need per-invoice
+# serialization and transactional reads-writes — that IS the Durable Object
+# above; a second store (TIDEPOOL_KV) would only duplicate state without
+# improving recovery, so src/index.js never reads or writes it. The unused
+# [[kv_namespaces]] binding (placeholder id) has therefore been removed —
+# it only blocked deploys. If an approved phase ever needs KV:
+#   npx wrangler kv namespace create TIDEPOOL_KV

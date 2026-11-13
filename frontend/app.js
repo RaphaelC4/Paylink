@@ -3,7 +3,23 @@
    Reads are unsigned JSON-RPC view calls; writes are signed in the wallet. */
 
 import NearConnect from "@hot-labs/near-connect";
-import { CONFIG, ONE_YOCTO, CREATE_STAKE, MAX_DESCRIPTION_BYTES, GAS_DEFAULT, GAS_CLAIM, GAS_FT_CALL } from "./config.js?v=20261109a";
+import { CONFIG, ONE_YOCTO, CREATE_STAKE, MAX_DESCRIPTION_BYTES, GAS_DEFAULT, GAS_CLAIM, GAS_FT_CALL } from "./config.js?v=20261110a";
+/* Phase 7 — the cross-chain payment rail. Self-contained: it renders into
+   #tpWrap, gates the pay buttons through tpPayBlockReason/tpPayBlockHtml,
+   and never touches the NEAR flow itself. */
+import {
+  initTidepool,
+  syncTidepool,
+  teardownTidepool,
+  tpPayBlockReason,
+  tpPayBlockHtml,
+  tpToggleHtml,
+  tpToggle,
+  tpReceiptFacts,
+} from "./tidepool.js?v=20261112b";
+/* Verifiable receipt — pure module: the PDF bytes behind the one-click
+   download, plus the one sentence every completed payment carries. */
+import { buildReceiptPdf, receiptFilename, RECEIPT_SENTENCE } from "./receipt.js?v=20261112b";
 
 /* The vendored bundle is the package's CommonJS build, so esbuild exposes the
    module namespace as the default export rather than as named exports. */
@@ -1459,6 +1475,98 @@ function payNoteHtml(link) {
         </div>`;
 }
 
+/* The verifiable receipt on the card itself — shown after a successful NEAR
+   payment (the same gate as the old success block). It states only facts we
+   hold: the amount credited, the time the chain recorded, the transaction
+   hashes THIS device's wallet returned (each with its explorer link), the
+   invoice id, and the sentence every completed payment carries. A hash row
+   exists only when a real hash exists; the PDF button is routed through the
+   delegated click handler in the wiring section. */
+function payReceiptHtml(link, st) {
+  const credited = link.paid_amount || link.amount;
+  const txs = txReceiptFor(link.link_id);
+  const hashRow = (k, hash) =>
+    `<span class="rcpt-k">${esc(k)}</span><span class="rcpt-v"><a class="mono" href="${CONFIG.explorer}/transactions/${esc(
+      hash
+    )}" target="_blank" rel="noopener" title="${esc(hash)}">${esc(truncate(hash, 14, 10))}</a></span>`;
+  const rows = [
+    `<span class="rcpt-k">Amount received</span><span class="rcpt-v">${esc(
+      `${formatAmount(credited)} ${CONFIG.token.symbol}`
+    )}</span>`,
+    Number(link.paid_at)
+      ? `<span class="rcpt-k">Time</span><span class="rcpt-v">${esc(new Date(Number(link.paid_at)).toLocaleString())}</span>`
+      : "",
+    txs.payment ? hashRow("Transaction", txs.payment) : "",
+    txs.release ? hashRow("Release", txs.release) : "",
+    `<span class="rcpt-k">Invoice</span><span class="rcpt-v mono">${esc(link.link_id)}</span>`,
+  ]
+    .filter(Boolean)
+    .join("");
+  const x = txs.payment
+    ? `<a class="rcpt-x" href="${CONFIG.explorer}/transactions/${esc(txs.payment)}" target="_blank" rel="noopener">View on NEAR explorer</a>`
+    : `<a class="rcpt-x" href="${CONFIG.explorer}/accounts/${encodeURIComponent(
+        CONFIG.contractId
+      )}" target="_blank" rel="noopener">View contract on NEAR explorer</a>`;
+  return `<div class="pay-receipt tx-line ok" role="status">
+    <div class="rcpt-head">
+      <span class="chk" aria-hidden="true">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.6 8.4 6.6 11.4 12.4 5"/></svg>
+      </span>
+      <div class="rcpt-head-txt">
+        <strong>${esc(RECEIPT_SENTENCE)}</strong>
+        <span>${st === "CLAIMED" ? "Released to the payee" : "Funds secured — release pending"}</span>
+      </div>
+      <span class="pill ${st === "CLAIMED" ? "claimed" : "paid"}">receipt</span>
+    </div>
+    <div class="rcpt-rows">${rows}</div>
+    <div class="rcpt-foot">${x}<button class="btn btn-sm rcpt-pdf" type="button" data-receipt-pdf="near"><span>Download PDF receipt</span></button></div>
+  </div>`;
+}
+
+/* The same facts as a PDF document model — [{text, kind}] lines for
+   receipt.js. "near" receipts carry this device's wallet hashes; "cross"
+   receipts carry what the Worker's status view exposes (reference, invoice,
+   time) and say so instead of printing a hash it was never given. */
+function receiptPdfDoc(kind) {
+  const link = lastPayLink;
+  const facts = kind === "cross" ? tpReceiptFacts() : null;
+  const txs = link ? txReceiptFor(link.link_id) : {};
+  const linkId = (facts && facts.invoice) || (link && link.link_id) || null;
+  if (!linkId && !(facts && facts.amountLabel)) return null;
+  const amount =
+    (facts && facts.amountLabel) ||
+    (link ? `${formatAmount(link.paid_amount || link.amount)} ${CONFIG.token.symbol}` : null);
+  const timeMs = link && Number(link.paid_at) ? Number(link.paid_at) : facts && facts.time ? Date.parse(facts.time) : 0;
+  const time = timeMs ? `${new Date(timeMs).toISOString().replace("T", " ").slice(0, 19)} UTC` : null;
+  const urls = [];
+  if (txs.payment) urls.push(`${CONFIG.explorer}/transactions/${txs.payment}`);
+  if (txs.release) urls.push(`${CONFIG.explorer}/transactions/${txs.release}`);
+  if (facts && facts.explorerUrl) urls.push(facts.explorerUrl);
+  if (!urls.length && CONFIG.explorer && CONFIG.contractId) {
+    urls.push(`${CONFIG.explorer}/accounts/${encodeURIComponent(CONFIG.contractId)}`);
+  }
+  const rows = [];
+  if (amount) rows.push({ text: `Amount received: ${amount}`, kind: "row" });
+  if (time) rows.push({ text: `Time: ${time}`, kind: "row" });
+  if (txs.payment) rows.push({ text: `Transaction: ${txs.payment}`, kind: "row" });
+  if (txs.release) rows.push({ text: `Release: ${txs.release}`, kind: "row" });
+  if (facts && facts.reference) rows.push({ text: `Payment reference: ${facts.reference}`, kind: "row" });
+  if (linkId) rows.push({ text: `Invoice: ${linkId}`, kind: "row" });
+  const lines = [
+    { text: "Paylink payment receipt", kind: "title" },
+    { text: kind === "cross" ? `Cross-chain payment — ${RECEIPT_SENTENCE}` : RECEIPT_SENTENCE, kind: "sub" },
+    { kind: "rule" },
+    ...rows,
+    { kind: "rule" },
+    { text: "Verifiable on NEAR:", kind: "head" },
+    ...urls.map((u) => ({ text: u, kind: "small" })),
+    txs.payment || txs.release
+      ? { text: "The transaction hashes above are the wallet's own receipts — open them on the explorer to verify independently.", kind: "small" }
+      : { text: "Verified from NEAR transaction evidence held by the Paylink verifier; the links above read the record back on chain.", kind: "small" },
+  ];
+  return { lines, linkId };
+}
+
 async function renderPay(id) {
   const card = $("#payCard");
   delete card.dataset.status;
@@ -1481,14 +1589,17 @@ async function renderPay(id) {
   try {
     link = await V.getLink(id);
   } catch (err) {
+    teardownTidepool(); /* the card is gone — stop any payment polling */
     card.innerHTML = payError("Could not read the chain", friendly(err), id);
     return;
   }
   if (!link) {
+    teardownTidepool();
     card.innerHTML = payError("No such link", `Nothing on chain with id ${id}.`);
     return;
   }
   if (link.token !== CONFIG.tokenId) {
+    teardownTidepool();
     card.innerHTML = payError(
       "Unsupported token",
       `This link is denominated in ${link.token}, which this deployment does not accept.`
@@ -1509,16 +1620,7 @@ async function renderPay(id) {
     confetti();
   }
 
-  const success = celebrated && landed ? `
-    <div class="pay-success">
-      <span class="chk" aria-hidden="true">
-        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.6 8.4 6.6 11.4 12.4 5"/></svg>
-      </span>
-      <div>
-        <strong>Paid!</strong>
-        <span>${formatAmount(credited)} ${esc(CONFIG.token.symbol)} settled &mdash; ${st === "CLAIMED" ? (mine ? "released to you" : "released to the payee") : "waiting to be released"}.</span>
-      </div>
-    </div>` : "";
+  const success = celebrated && landed ? payReceiptHtml(link, st) : "";
 
   card.dataset.status = st;
   lastPayLink = link;
@@ -1533,14 +1635,17 @@ async function renderPay(id) {
           <span>requests ${amount} ${esc(CONFIG.token.symbol)}</span>
         </div>
       </div>
-      <span class="${STATUS_PILL[st]}">${st}</span>
+      <span class="${STATUS_PILL[st]}" title="invoice status on chain"><span class="pill-k">invoice</span>${st}</span>
     </div>
 
-    <div class="pay-usd"><span class="approx" aria-hidden="true">&asymp;</span><span>${usd(value)}</span></div>
-    <div class="pay-ngn" id="payNgn" hidden></div>
-    <div class="pay-token">
-      <svg class="coin" aria-hidden="true"><use href="#coin-usdc"/></svg>
-      <span>${amount} ${esc(CONFIG.token.symbol)}</span>
+    <div class="pay-amount">
+      <div class="pay-usd"><span class="approx" aria-hidden="true">&asymp;</span><span>${usd(value)}</span></div>
+      <div class="pay-ngn" id="payNgn" hidden></div>
+      <div class="pay-token">
+        <svg class="coin" aria-hidden="true"><use href="#coin-usdc"/></svg>
+        <span>${amount} ${esc(CONFIG.token.symbol)}</span>
+        <span class="pay-net">on NEAR ${esc(CONFIG.network)}</span>
+      </div>
     </div>
 
     ${payNoteHtml(link)}
@@ -1548,6 +1653,8 @@ async function renderPay(id) {
     ${timeline(st)}
 
     <div class="pay-actions" id="payActions"></div>
+
+    <div id="tpWrap"></div>
 
     <details class="tech">
       <summary>Technical details</summary>
@@ -1565,6 +1672,10 @@ async function renderPay(id) {
     ${st === "OPEN" && !mine ? fundRail() : ""}`;
 
   paintNgn(card, value);
+  /* Phase 7: the cross-chain rail syncs BEFORE the action buttons lay out,
+     so a resuming/active/verified attempt is already gating them. The sync
+     part of syncTidepool runs synchronously to this line. */
+  syncTidepool(link, { st, mine, accountId, amountLabel: `${amount} ${CONFIG.token.symbol}` });
   renderPayActions(link, st);
   if (st === "OPEN" && !mine) wireFundRail(link);
 }
@@ -1604,6 +1715,18 @@ function renderPayActions(link, st) {
         <p class="pay-fee">Copy or share the link. It flips to <strong>PAID</strong> the moment their payment lands, and this page shows it happen.</p>`;
       return;
     }
+    /* Phase 7 — cross-chain gate: while a Tidepool attempt is quoting,
+       unresolved, verified or in conflict, the NEAR payment buttons are
+       replaced by the state note (and the fund rail goes with them: a payer
+       mid-attempt must not be nudged into a second funding flow). The NEAR
+       button markup below is untouched byte for byte. */
+    const tpBlock = tpPayBlockReason();
+    if (tpBlock) {
+      if (rail) { rail.remove(); clearInterval(fundPollTimer); fundPollTimer = null; }
+      box.innerHTML = `${tpPayBlockHtml()}
+        <p class="pay-fee">they receive <strong>${formatAmount(payoutOf(credited))} ${esc(CONFIG.token.symbol)}</strong> after the ${CONFIG.feeBps / 100}% fee</p>`;
+      return;
+    }
     if (!rail) {
       /* Built while connected as the payee, now connected as somebody else:
          put the payer's rail back where full render leaves it. */
@@ -1615,7 +1738,10 @@ function renderPayActions(link, st) {
     } else {
       box.innerHTML = `<button class="btn btn-lg" type="button" data-pay="${esc(link.link_id)}"><span>Pay ${formatAmount(link.amount)} ${esc(CONFIG.token.symbol)}</span></button>`;
     }
-    box.insertAdjacentHTML("beforeend", `
+    /* Two rails, one choice: the divider only appears when the cross-chain
+       toggle actually renders, so a disabled rail never leaves "or" dangling. */
+    const tpToggle = tpToggleHtml();
+    box.insertAdjacentHTML("beforeend", `${tpToggle ? `<div class="pay-or"><span>or</span></div>${tpToggle}` : ""}
       <p class="pay-fee">they receive <strong>${formatAmount(payoutOf(credited))} ${esc(CONFIG.token.symbol)}</strong> after the ${CONFIG.feeBps / 100}% fee</p>
       <p class="wallet-note">One approval — your wallet signs the payment, and the release happens automatically.</p>`);
     return;
@@ -1667,6 +1793,7 @@ async function payLink(linkId) {
     /* Remember it locally: the contract indexes links by creator, not by payer,
        so this is the only way the payer's own activity can be read back. */
     rememberPaid(linkId);
+    rememberTx(linkId, { payment: hash });
     /* ONE approval ends here — the payer's wallet never signs again. The token
        contract's callback marks the link PAID, and the keeper Worker (every
        minute, from its own gas account) calls `claim`, which can only pay the
@@ -1743,6 +1870,7 @@ async function claimLink(linkId) {
     const hash = await call("claim", { link_id: linkId }, { deposit: ONE_YOCTO, gas: GAS_CLAIM });
     show("ok", `released · <a class="mono" href="${CONFIG.explorer}/transactions/${hash}" target="_blank" rel="noopener">${truncate(hash, 12, 8)}</a>`);
     toast("Payment released to the payee");
+    rememberTx(linkId, { release: hash });
     setTimeout(() => { renderPay(linkId); if (currentTab === "ledger") loadLedger(); }, 2500);
   } catch (err) {
     const msg = friendly(err);
@@ -2142,6 +2270,31 @@ async function loadNetwork() {
 
 const PAID_KEY = "paylink:paidHere";
 const SEEN_KEY = "paylink:feedSeen";
+/* Verifiable receipt: the wallet-returned hashes of THIS device's own
+   transactions for a link — {payment?, release?}. Never invented, never
+   synced: a hash absent here is simply absent from the receipt. */
+const TX_KEY = "paylink:txReceipt:v1";
+
+function rememberTx(id, patch) {
+  try {
+    const all = JSON.parse(localStorage.getItem(TX_KEY) || "{}");
+    const row = all && typeof all === "object" && !Array.isArray(all[id]) && typeof all[id] === "object" ? all[id] : {};
+    for (const k of Object.keys(patch || {})) {
+      const v = patch[k];
+      if (typeof v === "string" && v) row[k] = v;
+    }
+    all[id] = row;
+    localStorage.setItem(TX_KEY, JSON.stringify(all));
+  } catch { /* private mode: the receipt simply omits the hashes */ }
+}
+
+function txReceiptFor(id) {
+  try {
+    const all = JSON.parse(localStorage.getItem(TX_KEY) || "{}");
+    const row = all && typeof all === "object" ? all[id] : null;
+    return row && typeof row === "object" ? row : {};
+  } catch { return {}; }
+}
 
 function paidHere() {
   try { return JSON.parse(localStorage.getItem(PAID_KEY) || "[]"); } catch { return []; }
@@ -2391,6 +2544,25 @@ function wire() {
   $("#exportCsv").addEventListener("click", exportCsv);
 
   document.addEventListener("click", async (e) => {
+    /* One-click PDF receipt: turn the facts we already hold into a real
+       PDF and download it — no network, no print dialog, no dependency. */
+    const pdfBtn = e.target.closest("[data-receipt-pdf]");
+    if (pdfBtn) {
+      const doc = receiptPdfDoc(pdfBtn.dataset.receiptPdf);
+      if (!doc) { toast("Nothing to print yet"); return; }
+      const blob = new Blob([buildReceiptPdf(doc.lines)], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = receiptFilename(doc.linkId);
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      toast("Receipt downloaded");
+      return;
+    }
+
     const copyBtn = e.target.closest("[data-copy-text]");
     if (copyBtn) {
       const ok = await copyText(copyBtn.dataset.copyText);
@@ -2453,6 +2625,10 @@ function wire() {
     const payBtn = e.target.closest("[data-pay]");
     if (payBtn) { payLink(payBtn.dataset.pay); return; }
 
+    /* Phase 7 — the cross-chain toggle repaints through the rail itself. */
+    const tpTg = e.target.closest("[data-tp-toggle]");
+    if (tpTg) { tpToggle(); return; }
+
     const claimBtn = e.target.closest("[data-claim]");
     if (claimBtn) { claimLink(claimBtn.dataset.claim); return; }
 
@@ -2502,6 +2678,26 @@ function setupAi() {
 wire();
 initTheme();
 setupAi();
+/* Phase 7 — cross-chain payment rail. The endpoint comes from config (empty
+   string hides the feature); the callbacks turn rail events into app-level
+   actions: remember a verified payment, re-read the invoice when it changed
+   under us, and repaint the pay buttons whenever the gate state moves. */
+initTidepool({
+  endpoint: (CONFIG.tidepoolWorker && CONFIG.tidepoolWorker.endpoint) || "",
+  explorer: CONFIG.explorer || "",
+  contractId: CONFIG.contractId || "",
+  onVerified: (linkId) => {
+    rememberPaid(linkId);
+    toast("Cross-chain payment verified — the merchant has been paid.");
+    if (lastPayLink) renderPay(lastPayLink.link_id);
+  },
+  onInvoiceStale: () => {
+    if (lastPayLink) renderPay(lastPayLink.link_id);
+  },
+  onActionsChanged: () => {
+    if (lastPayLink) renderPayActions(lastPayLink, statusOf(lastPayLink));
+  },
+});
 loadNetwork();
 route();
 refreshWallet();

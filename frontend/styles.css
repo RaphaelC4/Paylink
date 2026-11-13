@@ -932,6 +932,13 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
 .pill.paid{background:var(--bg);border-color:var(--ink);color:var(--ink)}
 .pill.claimed{background:var(--good-bg);border-color:var(--good-line);color:var(--good-ink)}
 .pill.expired{background:var(--warn-bg);border-color:var(--warn-line);color:var(--warn-ink)}
+/* the key inside the pay card's pill: says WHICH status this is (the
+   invoice's), so the chip can never be misread as the payment outcome */
+.pill-k{
+  font-size:9px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.09em;opacity:.72;
+}
+.pill-k::after{content:"\00b7";margin-left:.3em;opacity:.7}
 
 /* ──────────────────────────────────────────────────────────────────── pay ── */
 
@@ -1021,20 +1028,69 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
   text-align:center;max-width:40ch;margin-inline:auto;
 }
 
-/* success banner + confetti */
-.pay-success{
-  display:flex;align-items:center;gap:.75rem;
-  border:1px solid var(--good-line);background:var(--good-bg);color:var(--good-ink);
-  border-radius:var(--r-md);padding:.8rem .9rem;margin-bottom:1.3rem;
+/* verifiable receipt — the success surface after a paid invoice. It carries
+   the `tx-line ok` classes, so the green surface, padding and radius come
+   from the shared status-line rules; what lives here is the receipt's own
+   grid: head (check + sentence + chip), fact rows, and the foot (explorer
+   link + one-click PDF). */
+.pay-receipt{
+  display:grid;gap:.65rem;
+  margin-bottom:1.3rem;
   animation:pop .45s var(--ease) both;
 }
-.pay-success .chk{
+.pay-receipt .rcpt-head{display:flex;align-items:center;gap:.7rem}
+.pay-receipt .chk{
   flex:none;display:inline-flex;align-items:center;justify-content:center;
   width:26px;height:26px;border-radius:50%;
   background:var(--good-ink);color:var(--good-bg);
 }
-.pay-success strong{display:block;font-size:14px;font-weight:700}
-.pay-success span{display:block;font-size:12px;opacity:.85}
+.pay-receipt .pill{flex:none}
+.rcpt-head-txt{min-width:0;display:grid;gap:.1rem;flex:1}
+.rcpt-head-txt strong{font-size:14px;font-weight:700;line-height:1.3}
+.rcpt-head-txt span{font-size:12px;opacity:.85}
+/* label → value facts: keys stay on one line, values (long hashes) wrap */
+.rcpt-rows{
+  display:grid;grid-template-columns:auto minmax(0,1fr);
+  gap:.3rem .8rem;font-size:12.5px;
+  font-variant-numeric:tabular-nums;
+}
+.rcpt-k{opacity:.75;white-space:nowrap}
+.rcpt-v{min-width:0;overflow-wrap:anywhere}
+.rcpt-v a,.rcpt-x{color:inherit;text-decoration:underline;text-underline-offset:2px}
+.rcpt-sig{display:block;font-size:12.5px;font-weight:600}
+.rcpt-foot{
+  display:flex;align-items:center;justify-content:space-between;
+  gap:.6rem;flex-wrap:wrap;
+}
+.rcpt-foot .rcpt-x{font-size:12px}
+.pay-receipt a:focus-visible,.tp-receipt a:focus-visible{
+  outline:2px solid var(--accent-hot);outline-offset:2px;
+}
+
+/* the amount block: USD headline, indicative FX, token + network chip */
+.pay-amount{display:grid}
+/* network chip beside the token: answers "which network?" at a glance */
+.pay-net{
+  font-size:11px;color:var(--muted);letter-spacing:.02em;
+  border:1px solid var(--line-2);border-radius:999px;
+  padding:.08rem .5rem;white-space:nowrap;
+}
+
+/* NEAR pay button ⇄ cross-chain rail: the divider only renders when the
+   toggle does, so a disabled rail never leaves "or" dangling */
+.pay-or{
+  display:flex;align-items:center;gap:.7rem;
+  margin:.2rem 0;
+  font-size:11px;text-transform:uppercase;letter-spacing:.1em;
+  color:var(--muted);
+}
+.pay-or::before,.pay-or::after{content:"";flex:1;height:1px;background:var(--line-2)}
+
+/* phones: the foot stacks so the PDF button gets a full-width tap target */
+@media (max-width:560px){
+  .rcpt-foot{flex-direction:column;align-items:flex-start;gap:.5rem}
+  .rcpt-rows{font-size:12px}
+}
 
 @keyframes pop{from{opacity:0;transform:scale(.94) translateY(-6px)}to{opacity:1;transform:none}}
 
@@ -1471,6 +1527,13 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
 [data-theme="light"] .pay-card .tx-line.pending{background:#0b1a2b;border-color:#1e3a5f;color:#8ec1f0}
 [data-theme="light"] .pay-card .tx-line.ok{background:#131f0d;border-color:#2e4420;color:#a9d380}
 [data-theme="light"] .pay-card .tx-line.err{background:#24110d;border-color:#4d231a;color:#e2a08f}
+/* new card furniture keeps the dark-surface palette: the muted/line vars
+   are light-theme values and would vanish on the black card */
+[data-theme="light"] .pay-card .pay-net{color:#8a8a88;border-color:#2c2c2a}
+[data-theme="light"] .pay-card .pay-or{color:#8a8a88}
+[data-theme="light"] .pay-card .pay-or::before,
+[data-theme="light"] .pay-card .pay-or::after{background:#2c2c2a}
+[data-theme="light"] .pay-card .pill-k{opacity:.7}
 
 /* ── phone: faucet bottom sheet (chip beside the floating pill) ──
    The dialog IS the veil: tapping the padding around the panel closes it,
@@ -1534,3 +1597,88 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
 [data-theme="light"] .pay-card .share-btn svg{color:#8a8a88}
 [data-theme="light"] .pay-card .copy{background:#141413;border-color:#2c2c2a;color:#a3a3a1}
 [data-theme="light"] .pay-card .copy:hover{color:#f4f4f3;border-color:#55554f}
+
+/* ─────────────────────────────────────────── Tidepool rail (Phase 7) ──
+   The cross-chain panel lives inside the pay card: same tokens, same type
+   scale, no framework, no new palette. States lean on the existing
+   .tx-line tones; only VERIFIED ever gets .ok. Base rules follow the dark
+   theme's variables; the light theme's pay card is a dark surface, so the
+   same components are re-pinned to that surface below, exactly like the
+   share row above. */
+
+.tp-toggle{margin-top:.9rem}
+.tp-panel{
+  display:grid;gap:.9rem;margin-top:1rem;padding:1rem;
+  border:1px solid var(--line);border-radius:var(--r-md);
+  background:var(--soft);
+}
+.tp-h{
+  display:flex;flex-wrap:wrap;align-items:baseline;gap:.25rem .7rem;
+  font-size:14px;font-weight:700;letter-spacing:.01em;
+}
+.tp-hsub{font-size:11.5px;font-weight:500;color:var(--muted)}
+.tp-body{display:grid;gap:.75rem;min-width:0}
+.tp-fields{display:grid;gap:.85rem}
+.tp-avail{font-size:11.5px}
+.tp-avail.ok{color:var(--good-ink)}
+.tp-avail.err{color:var(--warn-ink)}
+.tp-err{font-size:12px;color:var(--warn-ink);margin:0;line-height:1.5}
+.tp-hint{display:block;font-size:12px;margin-top:.3rem;opacity:.9;line-height:1.5}
+.tp-detail{font-size:12.5px;line-height:1.55;color:var(--body);margin:.35rem 0 0}
+.tp-upstream{font-size:11.5px;line-height:1.5;color:var(--muted);margin:.3rem 0 0}
+.tp-deadline{font-size:12px;margin:.35rem 0 0;color:var(--muted)}
+.tp-deadline.warn{color:var(--warn-ink);font-weight:600}
+.tp-instr{
+  display:grid;gap:.55rem;padding:.8rem;
+  border:1px dashed var(--line-2);border-radius:var(--r-sm);background:var(--bg);
+}
+.tp-ih{
+  font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--muted);
+}
+.tp-need{font-size:13px;margin:0;line-height:1.5}
+.tp-code{
+  display:flex;align-items:center;gap:.6rem;justify-content:space-between;
+  padding:.45rem .55rem;border:1px solid var(--line);border-radius:var(--r-sm);
+  background:var(--soft);min-width:0;
+}
+.tp-code code{
+  font-family:var(--mono);font-size:12px;overflow-wrap:anywhere;min-width:0;
+}
+.tp-fine{font-size:11.5px;line-height:1.55;color:var(--muted);margin:0}
+.tp-fine code{font-family:var(--mono);font-size:11px}
+.tp-actions{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:.15rem}
+.tp-receipt{
+  display:grid;gap:.3rem;padding:.75rem .85rem;
+  border:1px solid var(--good-line);border-radius:var(--r-sm);
+  background:var(--good-bg);color:var(--good-ink);
+}
+.tp-receipt strong{font-size:13.5px}
+.tp-receipt span{font-size:12px;line-height:1.5}
+
+@media (max-width:560px){
+  .tp-panel{padding:.85rem}
+  .tp-code{flex-wrap:wrap;align-items:flex-start}
+}
+
+/* Light theme: the pay card is a dark surface — re-pin the panel to it. */
+[data-theme="light"] .pay-card .tp-panel{background:rgba(255,255,255,.03);border-color:#2c2c2a}
+[data-theme="light"] .pay-card .tp-hsub,
+[data-theme="light"] .pay-card .tp-upstream,
+[data-theme="light"] .pay-card .tp-fine,
+[data-theme="light"] .pay-card .tp-deadline{color:#8a8a88}
+[data-theme="light"] .pay-card .tp-detail{color:#a3a3a1}
+[data-theme="light"] .pay-card .tp-panel .label{color:#a3a3a1}
+[data-theme="light"] .pay-card .tp-panel input,
+[data-theme="light"] .pay-card .tp-panel select{
+  background:#141413;color:#f4f4f3;border-color:#2c2c2a;
+}
+[data-theme="light"] .pay-card .tp-panel input::placeholder{color:#8a8a88}
+[data-theme="light"] .pay-card .tp-code{background:#141413;border-color:#2c2c2a}
+[data-theme="light"] .pay-card .tp-code code{color:#d0d0cd}
+[data-theme="light"] .pay-card .tp-instr{background:#0e0e0d;border-color:#55554f}
+[data-theme="light"] .pay-card .tp-avail.ok{color:#a9d380}
+[data-theme="light"] .pay-card .tp-avail.err,
+[data-theme="light"] .pay-card .tp-err,
+[data-theme="light"] .pay-card .tp-deadline.warn{color:#e2a08f}
+[data-theme="light"] .pay-card .tp-receipt{background:#131f0d;border-color:#2e4420;color:#a9d380}

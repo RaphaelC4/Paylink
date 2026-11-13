@@ -74,6 +74,17 @@ export const CONFIG = {
     origin: "https://www.usetidepool.tech",
     verifier: "verifier.tidepool-sandbox.testnet",
   },
+
+  /* Paylink Tidepool Worker (workers/tidepool/) — the browser's ONLY
+     cross-chain payment endpoint. Discovery (/networks), quotes (/quote)
+     and payment status (/status) all go here; the page never calls
+     Tidepool directly for anything payment-related. Empty string = the
+     cross-chain payment option is hidden (same convention as
+     parseEndpoint). Set this to the Worker URL after deploying it —
+     see workers/OPERATIONS.md. */
+  tidepoolWorker: {
+    endpoint: "https://paylink-tidepool.g32772584.workers.dev",
+  },
 };
 
 /* 1 yoctoNEAR, required by NEP-141 state-changing calls and by `claim`. */

@@ -63,10 +63,25 @@ jobs:
             workers/parse/test/parse.test.mjs \
             frontend/app.js \
             frontend/config.js \
+            frontend/tidepool.js \
+            frontend/receipt.js \
             frontend/test/one-approval.test.mjs \
             frontend/test/parse-errors.test.mjs \
             frontend/test/rpc-retry.test.mjs \
-            frontend/test/relayer-fallback.test.mjs
+            frontend/test/relayer-fallback.test.mjs \
+            frontend/test/tidepool-discovery.test.mjs \
+            frontend/test/tidepool-quote.test.mjs \
+            frontend/test/tidepool-status.test.mjs \
+            frontend/test/tidepool-polling.test.mjs \
+            frontend/test/tidepool-deposit.test.mjs \
+            frontend/test/tidepool-regression.test.mjs \
+            frontend/test/receipt.test.mjs \
+            workers/tidepool/src/index.js \
+            workers/tidepool/test/networks.test.mjs \
+            workers/tidepool/test/quote.test.mjs \
+            workers/tidepool/test/status.test.mjs \
+            workers/tidepool/test/payout.test.mjs \
+            workers/tidepool/test/records.test.mjs
           do
             if node --check "$f"; then
               echo "ok  node --check $f"
@@ -175,7 +190,7 @@ jobs:
         # Formatting & syntax job.
         run: |
           set -euo pipefail
-          for f in frontend/index.html frontend/app.js frontend/config.js frontend/styles.css; do
+          for f in frontend/index.html frontend/app.js frontend/config.js frontend/tidepool.js frontend/receipt.js frontend/styles.css; do
             if [ ! -f "$f" ]; then
               echo "::error file=$f::required frontend file is missing"
               exit 1
@@ -195,6 +210,29 @@ jobs:
       - name: node frontend/test/relayer-fallback.test.mjs
         run: node frontend/test/relayer-fallback.test.mjs
 
+      # Phase 7 — the cross-chain rail (six suites, same plain-Node harness).
+      - name: node frontend/test/tidepool-discovery.test.mjs
+        run: node frontend/test/tidepool-discovery.test.mjs
+
+      - name: node frontend/test/tidepool-quote.test.mjs
+        run: node frontend/test/tidepool-quote.test.mjs
+
+      - name: node frontend/test/tidepool-status.test.mjs
+        run: node frontend/test/tidepool-status.test.mjs
+
+      - name: node frontend/test/tidepool-polling.test.mjs
+        run: node frontend/test/tidepool-polling.test.mjs
+
+      - name: node frontend/test/tidepool-deposit.test.mjs
+        run: node frontend/test/tidepool-deposit.test.mjs
+
+      - name: node frontend/test/tidepool-regression.test.mjs
+        run: node frontend/test/tidepool-regression.test.mjs
+
+      # Verifiable receipt — PDF bytes, single success surface, card wiring.
+      - name: node frontend/test/receipt.test.mjs
+        run: node frontend/test/receipt.test.mjs
+
   # ── item 9 (parse worker tests) ──────────────────────────────────────────
   parse:
     name: Parse tests
@@ -213,3 +251,58 @@ jobs:
 
       - name: node workers/parse/test/parse.test.mjs
         run: node workers/parse/test/parse.test.mjs
+
+  # ── Tidepool integration worker tests (Phases 3–6) ─────────────────────
+  # Same rules as every job above: no install step (all five suites are
+  # plain node with no dependencies), mocked upstream only, no secrets,
+  # nothing deployed. quote.test.mjs signs its own fixtures with per-run
+  # Ed25519 keys; the real-signature fixtures inside it are static
+  # payloads. status.test.mjs (Phase 4) drives GET /status against the
+  # same mocks: seven Tidepool statuses, polling bounds, the race
+  # detector and leak sweeps. payout.test.mjs (Phase 5) drives
+  # SETTLED -> VERIFIED against mocked NEAR tx_status evidence.
+  # records.test.mjs (Phase 6) drives record integrity and reconciliation
+  # hardening: validation/quarantine of corrupt persisted records,
+  # persist-before-complete conflicts, interrupted-write recovery,
+  # honoured upstream Retry-After, DO-reactivation recovery and the
+  # no-evidence-never-VERIFIED sweeps.
+  tidepool:
+    name: Tidepool tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # nothing after checkout runs git; keep the token off disk
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: node workers/tidepool/test/networks.test.mjs
+        run: node workers/tidepool/test/networks.test.mjs
+
+      - name: node workers/tidepool/test/quote.test.mjs
+        run: node workers/tidepool/test/quote.test.mjs
+
+      - name: node workers/tidepool/test/status.test.mjs
+        run: node workers/tidepool/test/status.test.mjs
+
+      # Phase 5: independent payout verification. SETTLED -> VERIFIED only
+      # on authoritative NEAR tx evidence (exact recipient/token/amount,
+      # fresh get_link immediately before the move) — every incomplete or
+      # contradictory evidence path must hold, and the cross-provider
+      # invoice_paid race must be recorded and never auto-verified.
+      - name: node workers/tidepool/test/payout.test.mjs
+        run: node workers/tidepool/test/payout.test.mjs
+
+      # Phase 6: payment records + reconciliation hardening. Persisted
+      # records are type/shape-validated before they are served or acted
+      # on (hold / quarantine, never a silent repair), a detected conflict
+      # survives an interrupted cycle, upstream Retry-After is honoured on
+      # the reconcile path, and no flow can reach VERIFIED without the
+      # full Phase 5 evidence.
+      - name: node workers/tidepool/test/records.test.mjs
+        run: node workers/tidepool/test/records.test.mjs

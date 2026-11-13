@@ -3,9 +3,12 @@
 Monitoring and alerting for the three Paylink Cloudflare Workers: **relayer**
 (meta-transactions), **keeper** (claim sweep), **parse** (invoice reader).
 This file is the M-01 report: what is implemented in code and tested, versus
-what still requires Cloudflare account configuration. Nothing here has been
-deployed, merged or pushed; every recommendation that needs account setup says
-so explicitly and invents no credential values.
+what still requires Cloudflare account configuration. All four Workers run
+in production on workers.dev — relayer, keeper, parse and Tidepool (§2) —
+so the gap this report tracks is the account-side setup: dashboard saved
+queries, Workers Logs retention and webhook secrets, none of which is
+configured yet. Every recommendation that needs account setup says so
+explicitly and invents no credential values.
 
 ---
 
@@ -108,6 +111,40 @@ allowlist, no run detail.
 | `upstream_degraded` | **alert** | **5** upstream failures in **5 minutes** (once per window) — `rid`, `count`, `window_s`. |
 | `service_error` | error | Unexpected exception — `method`, `error`; client gets a generic 500, stack stays server-side. |
 
+### Tidepool — `svc: paylink-tidepool`
+
+Same envelope as every worker above (`ts`, `svc`, `build`, `level`, `event`,
+plus `rid` on every request-scoped line). **Deployed** as
+`paylink-tidepool` (workers.dev, version `98f6e7ab`, Durable Object
+migration `v1` / SQLite-backed `PaymentIntent`); these rows describe the
+code running in `workers/tidepool/`. Routes are `GET /networks`,
+`POST /quote`, `GET /status` (there is no health route in this scope).
+
+| Event | Level | Meaning / key fields |
+|-------|-------|----------------------|
+| `networks_ok` | info (`warn` when `dropped` > 0) | `GET /networks` served — `rid`, `ip`, `chains`, `tokens`, `dropped`, `cached`, `ms`. `cached:true` means the isolate cache answered. |
+| `networks_rejected` | info | 403 origin gate on `/networks` — `rid`, `ip`, `status`, `reason: origin_not_allowed`. |
+| `upstream_error` | error | `/v0/tokens` or `/v0/health` failed during discovery — `rid`, `target` (`tokens`\|`health`), `kind`, `status`, `detail` (≤ 400 chars, scrubbed; never in the response body). |
+| `quote_ok` | info | Quote issued (201) or the invoice's active intent reused (200) — `rid`, `ip`, `linkId`, `intentId`, `reused`, `state`, `ms`. |
+| `quote_rejected` | info | Client-visible rejection — `rid`, `ip`, `linkId`, `status`, `code`, `reason`. Codes: `origin_not_allowed`, `invalid_link`, `invalid_token_meta`, `invalid_refund_to`, `invalid_idempotency_key`, `same_asset_source`, `network_token_mismatch`, `invoice_settled`, `invoice_cancelled`, `invoice_expired`, `invoice_not_open`, `invoice_token_unsupported`, `invoice_expiry_too_soon`, `payment_verified`, `payment_settled`, `intent_history_full`, `payload_too_large`. |
+| `quote_deposit_mode_retry` | info | The ONE data-driven retry: a 400 naming `depositMode` re-sent once with `depositMode:"MEMO"` — `reason: deposit_mode_memo_required`. A 400 created no quote, so the retry cannot duplicate one. |
+| `quote_upstream_error` | error (`warn` for `unmapped_status`) | A read failed on the quote path — `rid`, `linkId`, `target` (`contract`\|`tokens`\|`quote`\|`status`), `kind`, `status`, `detail` (scrubbed, bounded). `status` here is the reconcile path (POST /quote re-reading `/v0/status`), not GET /status. |
+| `intent_transition` | info | State machine moved — `rid`, `linkId`, `intentId`, `from`, `to`, `reason` (e.g. `creation_started`, `quote_verified`, `awaiting_deposit`, `tidepool_SUCCESS`, `no_deposit_past_deadline`, `status_resolved`). One line per accepted transition; duplicates are refused silently. |
+| `status_ok` | info | A `GET /status` poll that **changed** something — `rid`, `ip`, `linkId`, `intentId`, `status`, `tidepoolStatus`, `conflict`, `ms`. Unchanged polls are silent by design: a 2-second watcher can never burn the log budget (the transition itself already logged `intent_transition`). |
+| `status_rejected` | info | `GET /status` request rejected — `rid`, `ip`, `status`, `linkId`, `code`, `reason`. Fires only for 400/403/404 (`invalid_link_id`, `invalid_intent_id`, `origin_not_allowed`, `intent_not_found`); cooldown 503s never log here (their cause already logged `status_upstream_error`). |
+| `status_upstream_error` | error (`warn` for the contract leg, `unmapped_status`, `transition_refused`) | A read failed inside a status cycle — `rid`, `linkId`, `intentId`, `target` (`status`\|`contract`), `kind`, `status`. The contract leg failing never fails the response (last known state kept, `onChainCheckedAt` not advanced); the status leg failing parks the intent in RECONCILE with a persisted cooldown. Never logs a raw upstream body on this path. |
+| `invoice_conflict` | **error** | Cross-provider double-pay risk detected: the NEAR invoice went `PAID`/`CLAIMED` while a Tidepool intent was still in flight — `rid`, `linkId`, `intentId`, `previous`, `onChainStatus`. Logged **once** per record; the `conflict` flag then rides on every `/status` response and polling continues (only observation reveals whether the double pay actually happened). During Phase 5 verification the same line fires from the fresh pre-transition contract read (same shape, same once-per-record rule). |
+| `payout_verify_ok` | info | Phase 5: `SETTLED → VERIFIED` — authoritative NEAR tx evidence proved exactly one successful `ft_transfer` of the invoice amount to the merchant on the configured USDC token, and the fresh `get_link` immediately before the move still authorized it — `rid`, `linkId`, `intentId`, `attempts` (prior held attempts). One line per verification; `intent_transition` also fires for the move itself. |
+| `payout_verify_hold` | warn | Phase 5: a verification attempt (or a candidate-less SETTLED hold) did not — or could not — prove the payout, so the intent stays `SETTLED` — `rid`, `linkId`, `intentId`, `reason`. **Logged once per distinct reason** per intent (repeats are silent; the reason changes ⇒ one new line). Reason codes only, never a hash, amount or address: `no_payout_hash`, `evidence_pending`, `no_transfer_evidence`, `transfer_failed`, `evidence_malformed`, `evidence_mismatch`, `rpc_inconclusive`, `contract_inconclusive`, `invoice_mismatch`, `invoice_paid`, `double_payout`, `payout_reversed`, `transition_refused`. Every hold is retryable with backoff (`TIDEPOOL_VERIFY_BACKOFF_MS`, doubling to 1 h) or — for conflicts — a manual-reconciliation hold. |
+| `payout_conflict` | **error** | Phase 5: the payout evidence itself proved a money conflict — `rid`, `linkId`, `intentId`, `kind` (`double_payout`\|`payout_reversed`). The conflict is persisted on the record (rides on every `/status` response), the intent is **never** auto-verified, and all further cycles are zero-read holds until an operator reconciles. |
+| `record_invalid` | **error** | Phase 6: a persisted payment record failed type/shape validation — `rid`, `linkId`, `intentId` (`null` for record/pointer-level findings), `reason` (machine code only; **the corrupt value itself is never logged**). **Logged once per distinct reason per record** — repeats answer identically with no second line and no re-write. Reasons: `status_invalid` (quarantined to `RECONCILE` with an `intent_transition` of `record_malformed`), `deposit_address_invalid`, `deposit_memo_invalid`, `quote_deadline_invalid`, `merchant_invalid`, `amount_invalid`, `meta_invalid`, `correlation_invalid`, `tidepool_status_invalid`, `reason_invalid`, `link_invalid`, `intent_invalid` (intent held in place, 503 `record_invalid`), `history_invalid`, `conflict_invalid` (stamped, non-blocking — but a malformed conflict still blocks verification), `intents_invalid`, `active_intent_unresolvable`, `active_intent_missing`. Operator procedure: §10. |
+| `service_error` | error | Unexpected exception or intent-store failure — `method`, `error` (scrubbed), or `rid` + `error: intent store failed` / `INTENT_DO binding missing`. Client gets a generic 500; stack stays server-side. |
+
+This worker emits **no alert-level events** and has no webhook path: nothing
+pages automatically yet — see the queries added to §3b for the signals that
+should be watched from day one (the cross-provider conflict, the Phase 5
+payout conflicts, and a corrupt payment record).
+
 ---
 
 ## 3. Alert conditions — implemented vs. recommended
@@ -146,6 +183,10 @@ implemented in code** (a Worker cannot alert on an event that never happened)
 | Relayer key problems | `reason:config_key_missing` OR `rpc_relayers_key` | alert on first |
 | Abuse signal | `event:rate_limited` volume per IP | dashboard trend; the limiter already enforces |
 | Parse abuse / Origin probing | `event:parse_rejected AND reason:origin_not_allowed` rate | dashboard trend |
+| **Tidepool double-pay risk** | `event:invoice_conflict` | **alert on first** — a NEAR invoice was paid while a Tidepool payment was in flight; Phase 5 holds the intent (`reason:invoice_paid`) and never auto-verifies it — manual reconciliation |
+| **Payout evidence conflict** | `event:payout_conflict` | **alert on first** — two payouts of the invoice amount (`double_payout`) or a transfer out of the merchant (`payout_reversed`) was proven from NEAR tx evidence; the intent is held for manual reconciliation, never verified |
+| **Corrupt payment record** | `event:record_invalid` | **alert on first** — a persisted record cannot be read safely; the Worker holds or quarantines it (503 `record_invalid`, never a silent repair). Follow the §10 procedure: the log line carries `linkId` + `intentId` + a machine `reason`, the record itself lives in Durable Object storage |
+| Stuck Phase 5 verification | `event:payout_verify_hold` — graph `count` by `reason` (excluding one-off `invoice_paid`/`no_payout_hash`) | warn when one intent's reason persists > 30 min (backoff caps at 1 h; a permanent `evidence_malformed` / `contract_inconclusive` needs a human) |
 | Business volume | count of `event:submit_ok` per hour | dashboard only |
 | Log budget | total events/day vs. 200k/day free cap | warn at 80 % |
 
@@ -227,10 +268,16 @@ Nothing above was done for M-01 (no deploy, no push, no account changes).
 
 ## 8. Remaining operational gaps
 
-1. **Nothing is deployed.** At the time of the M-01 report its code sat
-   uncommitted on local `staging`; it has since been committed (see
-   `git log`), but nothing has been pushed and no worker or frontend has
-   been redeployed — live services still run their previous builds.
+1. **Nothing is pushed and the frontend is not redeployed.** The M-01
+   code sat uncommitted at report time and has since been committed (see
+   `git log`), but `origin/staging` and `origin/master` are both behind
+   local. The four Workers are live — relayer `20261110d`, keeper
+   `20261110f`, parse `405`-signal, Tidepool `98f6e7ab` (deployed
+   2026-11-13) — but the **frontend** still serves its previous build
+   (`app.js?v=20261110a`, `styles.css?v=20261109a`): the checkout-card
+   redesign, the receipt, and the `tidepoolWorker` endpoint config are
+   committed on `staging` only and reach users only after the Vercel
+   redeploy.
 2. **Account setup outstanding** (§5): `observability.enabled`,
    `ALERT_WEBHOOK_URL` values, saved queries/alerts — identified, not done.
 3. **Missed-cron detection is query-based** (absence of `cron_heartbeat`);
@@ -290,3 +337,108 @@ Cloudflare pricing & limits `developers.cloudflare.com/workers/platform/`
 (updated 2–29 Oct 2026) · Gemini rate limits & pricing
 `ai.google.dev/gemini-api/docs/` + Google AI forum quota confirmation
 (2026-11-02) · Vercel Hobby plan & limits docs `vercel.com/docs/plans/hobby`.
+
+---
+
+## 10. Tidepool record integrity & reconciliation — operator procedures (Phase 6)
+
+Phase 6 hardened `workers/tidepool/` around one rule: **the persisted
+Durable Object record is the only thing the Worker acts on, and a record
+it cannot read is held — never guessed, never silently repaired.** This
+section is the operator side of that rule. Everything marked *implemented*
+below is in code and proven by `node workers/tidepool/test/records.test.mjs`
+(199 assertions) alongside the existing networks/quote/status/payout suites;
+items marked *recommended* need Cloudflare dashboard setup and say so.
+There is deliberately **no admin endpoint**: hold reasons, integrity stamps
+and history are never exposed on a public route — visibility is log lines
+plus Durable Object storage only.
+
+### 10.1 What the Worker does by itself (implemented)
+
+| Situation | Response | State effect |
+|-----------|----------|--------------|
+| Intent status unreadable (`status_invalid`) | 503 `record_invalid` + `Retry-After` | force-quarantined to `RECONCILE`, `lastReason: record_malformed`, cooldown persisted **with** the state, `intent_transition` records the raw value → `RECONCILE` |
+| Corrupt intent field (address, memo, deadline, amounts, merchant, correlation, …) | 503 `record_invalid` + `Retry-After` | intent **held in place** — no transition, no upstream call, no repair |
+| Broken `intents` list or `activeIntentId` pointer (`POST /quote`) | 503 `record_invalid` | held — a second deposit address is never minted over an uncertain record (the old silent null-repair is gone) |
+| Corrupt `history` / `conflict` (record level) | stamped + logged, request continues | non-blocking by design; a **malformed conflict still blocks verification** (the truthy-conflict hold fails closed) |
+| Interrupted write (`persistence_failed`) | 500; record keeps the last complete state | retry after the poll floor — idempotent, no duplicate transitions, recovery never assumes the interrupted outcome |
+| Upstream 429/5xx/404 on a status read | 503 `reconcile_cooldown` | `RECONCILE` + cooldown = **max(own, upstream `Retry-After`)**, clamped to 1 h — honoured on both the status and the reconcile path |
+| Unrecognised Tidepool status | 503 `status_unknown` | `UNKNOWN` + cooldown; the raw value is stored, surfaced as `null`, never interpreted |
+| Invoice turns PAID/CLAIMED mid-flight | `invoice_paid` conflict recorded **immediately** (persist-before-complete, before the cycle's final write) | surfaced as `conflict` on every response, **never cleared**, intent never auto-verified |
+| Two payouts / a reversal proven from tx evidence | `double_payout` / `payout_reversed` conflict persisted | zero-read hold until an operator reconciles |
+| Any unresolved ambiguous record | — | **never auto-`FAILED`**; `SUCCESS`/`SETTLED` never becomes `VERIFIED` without the full Phase 5 evidence chain |
+
+`record_invalid` is logged **once per distinct `reason` per record** at
+level `error` (reason codes only — never the corrupt value); repeats
+answer identically with no second line and no re-write, and the
+`record.invalid = {reason, at}` stamp persists for forensics even after
+the record later resolves.
+
+### 10.2 Retry / backoff matrix (implemented)
+
+| Path | Backoff | What the client sees |
+|------|---------|----------------------|
+| `record_invalid` hold | fixed = ambiguous cooldown (default 60 s) | 503 + `Retry-After` header + `retryAfterSec`; does **not** self-heal — the next window re-answers identically until an operator acts |
+| Quarantine (`RECONCILE`) | cooldown persisted with the state | 503 `record_invalid`; after it expires the next request reconciles against upstream truth (never a guess, never a forced success) |
+| Status read failed / unmapped | `max(default 60 s, upstream Retry-After)` ≤ 1 h | 503 `reconcile_cooldown` / `status_unknown` + `retryAfterSec` |
+| Poll floor | ≥ 2 s between status cycles (`TIDEPOOL_STATUS_MIN_INTERVAL_MS`, clamped 1–60 s) | repeat polls inside the floor are answered from the record with **zero** upstream reads |
+| Verification hold | `TIDEPOOL_VERIFY_BACKOFF_MS` (default 5 s) doubling per attempt, cap 1 h | 200 from the record; attempts counted in `verifyAttempts`, hold reason logged once per distinct reason |
+| Held-SETTLED contract watch | ≥ 60 s between contract reads (`HOLD_CONTRACT_REFRESH_MS`) | zero reads when fresh; when stale exactly one `get_link` — never a Tidepool re-read, never a tx read; a failed read does **not** advance `onChainCheckedAt`, so staleness stays honest |
+
+### 10.3 Reconciliation scenario matrix (Phase 6 spec §5)
+
+| # | Scenario | Deciding (authoritative) evidence | Transition / response | Retryable? | Manual investigation? |
+|---|----------|-----------------------------------|----------------------|------------|------------------------|
+| 1 | Well-formed record, invoice OPEN, Tidepool `PENDING_DEPOSIT` | NEAR contract + Tidepool status | stays `AWAITING_DEPOSIT` (or `EXPIRED` past our real deadline with no deposit) | client-driven polls | no |
+| 2 | Status read fails (5xx / timeout / 404) | our last stored state | `RECONCILE` + persisted cooldown | yes — after `Retry-After` | no (a good read resolves it) |
+| 3 | Unrecognised Tidepool status string | the raw value (stored, surfaced as `null`) | `UNKNOWN` + cooldown, 503 `status_unknown` | yes | no — but watch `status_unknown` volume |
+| 4 | Invoice goes PAID/CLAIMED while an intent is in flight | NEAR contract `get_link` | `invoice_paid` conflict persisted immediately, intent held, never `VERIFIED` | polling continues (observation only) | **yes — conflict never auto-clears** |
+| 5 | Two payout transfers of the invoice amount proven | NEAR tx receipts | `double_payout` conflict, zero-read hold | no | **yes** |
+| 6 | Transfer out of the merchant / reversal proven | NEAR tx receipts | `payout_reversed` conflict, zero-read hold | no | **yes** |
+| 7 | Payout tx not yet visible (`UNKNOWN_TRANSACTION`) | the node's answer | `evidence_pending` hold, state stays `SETTLED` | yes (verify backoff) | no |
+| 8 | Inconclusive RPC / contract read during verification | the node's answer | `rpc_inconclusive` / `contract_inconclusive` hold | yes (verify backoff) | only if one reason persists > 30 min |
+| 9 | `SUCCESS` with no settlement-hash candidates | Tidepool `SUCCESS` | held `SETTLED`, bounded contract-only watch | watch continues | only if a conflict appears |
+| 10 | Persisted intent status unreadable | the record itself | quarantine → `RECONCILE` + cooldown, 503 `record_invalid` | after cooldown, reconciles upstream | **yes — inspect the record (§10.4)** |
+| 11 | Persisted field / pointer / intents list corrupt | the record itself | held in place, 503 `record_invalid`, no self-heal | no (identical answer each time) | **yes — inspect the record (§10.4)** |
+| 12 | Write interrupted mid-cycle | storage | last complete state kept, 500 `persistence_failed` | yes — idempotent retry, no duplicate transitions | no |
+
+No row can reach `VERIFIED` through uncertainty: `VERIFIED` requires the
+complete Phase 5 evidence (exactly one clean payout tx + a fresh contract
+read authorizing it), and any recorded conflict blocks that path entirely.
+
+### 10.4 Investigating a record (recommended procedure — manual, no endpoint)
+
+1. **Find the log line** (Workers → Logs): `event:record_invalid` gives
+   `linkId` + `intentId` + machine `reason`; conflicts appear as
+   `event:invoice_conflict` / `event:payout_conflict`; quarantines as
+   `event:intent_transition AND reason:record_malformed`. Saved-query
+   alerts are listed in §3b — **recommended, not yet configured**.
+2. **Read the record**: one JSON value per invoice in the INTENT_DO
+   storage (key `record`, addressed by `linkId`). Field dictionary:
+
+   | Field | Meaning |
+   |-------|---------|
+   | `linkId`, `merchant` | invoice identity (contract-sourced, never client-writable) |
+   | `onChainStatus`, `onChainCheckedAt` | last authoritative NEAR invoice state + when it was read (deliberately **not** advanced on a failed read) |
+   | `conflict` | `{kind: invoice_paid\|double_payout\|payout_reversed, onChainStatus, detectedAt}` — written by code, **never cleared by code** |
+   | `invalid` | `{reason, at}` — Phase 6 integrity stamp, **never cleared by code** |
+   | `activeIntentId` | which intent is live; must resolve into `intents` or the record holds |
+   | `intents[]` | one object per attempt: `status`, `lastReason`, `reconcileUntil`, `lastStatusPollAt`, `payoutHashes` (server-captured, never served), `payoutHoldReason`, `verifyUntil`, `verifyAttempts`, `depositObserved`, `signature` (server-side proof, never served) |
+   | `history[]` | audit trail `{ts, intentId, from, to, reason}` — capped at 256 entries, oldest dropped |
+
+3. **Decide**: a conflict (row 4–6) needs a human reconciliation decision
+   against the chain — nothing in this Worker can or will clear it. A
+   corrupt record (row 10–11) needs the field fixed or the record
+   re-derived from the contract/Tidepool truth by an operator; the code
+   path itself will never rewrite it.
+
+### 10.5 Deliberately not here
+
+* No admin or status endpoint exposing hold reasons, stamps or history —
+  the public response allowlist is unchanged from Phases 4–5.
+* No automatic conflict clearing, no automatic refunds, no invented
+  cancellation, no auto-`FAILED` for unresolved records.
+* No claim that detecting a conflict eliminates anything at contract
+  level — detection is observation and holding only.
+* No new storage infrastructure: everything lives in the existing
+  one-record-per-invoice Durable Object.
