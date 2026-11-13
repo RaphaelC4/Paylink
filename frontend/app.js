@@ -1383,7 +1383,7 @@ function renderPayActions(link, st) {
   box.innerHTML = `<p class="pay-fee">This link expired. The contract refuses payment on an expired link.</p>`;
 }
 
-async function payLink(linkId) {
+async function payLink(linkId, { afterSwap = false } = {}) {
   const line = $("#payStatus");
   const show = (cls, html) => { line.hidden = false; line.className = `tx-line ${cls}`; line.innerHTML = html; };
 
@@ -1395,7 +1395,14 @@ async function payLink(linkId) {
   /* Backstop for a stale Pay button: the contract refunds this anyway, so
      refuse it here with words instead of letting a doomed signing prompt up. */
   if (accountId && link.creator === accountId) return show("err", "This is your own link — only the person you sent it to can pay it");
-  if (statusOf(link) !== "OPEN") return show("err", `This link is ${statusOf(link)}, not open`);
+  if (statusOf(link) !== "OPEN") {
+    /* Reverse-order race: the swap settled, but the link was paid or cancelled
+       while it ran. The contract would refund a late payment anyway; say where
+       the money is so the payer is not left guessing. */
+    return show("err", afterSwap
+      ? `Your swap settled, but this link is now ${statusOf(link)} — it was ${statusOf(link) === "PAID" ? "paid by someone else" : "closed"} while the swap ran. Nothing was lost: the ${esc(CONFIG.token.symbol)} is in your account.`
+      : `This link is ${statusOf(link)}, not open`);
+  }
 
   show("pending", "signing the payment…");
   try {
@@ -1504,6 +1511,15 @@ async function claimLink(linkId) {
    into exactly enough USDC to cover this link. Fail-closed: if Tidepool
    is unreachable the rail shows the error and the normal pay flow is
    untouched. Test tokens only — never real funds. */
+
+/* How long a live quote stays fillable, and how long the page keeps watching it.
+   The watch must OUTLAST the quote: if both were 10 minutes the page would say
+   "timed out" while the quote could still be filled, and a payer who signed in
+   the last seconds would be told nothing. Tidepool settles in seconds; the
+   margin is for a slow wallet approval, not for the swap. */
+const SWAP_QUOTE_TTL_MS = 15 * 60 * 1000;
+const SWAP_POLL_EVERY_MS = 4000;
+const SWAP_POLL_MAX_TICKS = Math.ceil((SWAP_QUOTE_TTL_MS + 60_000) / SWAP_POLL_EVERY_MS);
 
 /* `id` is Tidepool's namespaced asset id — the form the 1Click quote API
    wants (originAsset / destinationAsset). `account` is the bare NEAR contract
@@ -1684,7 +1700,7 @@ function wireFundRail(link) {
         refundType: "INTENTS",
         recipient: accountId,
         recipientType: "DESTINATION_CHAIN",
-        deadline: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+        deadline: new Date(Date.now() + SWAP_QUOTE_TTL_MS).toISOString(),
         dry: false,
       };
       const res = await fetch(`${CONFIG.tidepool.origin}/v0/quote`, {
@@ -1771,7 +1787,7 @@ function pollSwap(depositAddress, src, swapBtn, refreshBal, linkId) {
            the same action. The wallet still signs each transaction — that is
            the part no free testnet build can chain — but the payer never has
            to go looking for the Pay button. */
-        if (linkId) payLink(linkId);
+        if (linkId) payLink(linkId, { afterSwap: true });
         return;
       }
       if (st === "REFUNDED" || st === "FAILED") {
@@ -1791,15 +1807,15 @@ function pollSwap(depositAddress, src, swapBtn, refreshBal, linkId) {
         : st === "PROCESSING"
           ? "settling the swap…"
           : `${String(st).toLowerCase()}…`;
-      if (ticks >= 150) {
+      if (ticks >= SWAP_POLL_MAX_TICKS) {
         clearInterval(fundPollTimer);
         fundPollTimer = null;
         out.className = "tx-line err";
-        out.textContent = "Timed out waiting for the swap — your deposit is safe; reopen the link shortly and the status will catch up.";
+        out.textContent = "The quote has expired without a result — if you sent the deposit it is refunded automatically; reopen the link and quote again.";
         swapBtn.disabled = false;
       }
     } catch { /* transient network blip — keep polling */ }
-  }, 4000);
+  }, SWAP_POLL_EVERY_MS);
 }
 
 /* ─────────────────────────────────────────────────────────── network ── */

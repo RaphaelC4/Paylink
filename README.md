@@ -607,3 +607,20 @@ soon as the folder is uploaded. If you deploy the parser too, set its
   payee never holds gas at any point in the lifecycle.
 - [1Click API](https://docs.near-intents.org/integration/distribution-channels/1click-api/quickstart) · [Tidepool testnet sandbox](https://www.usetidepool.tech/docs/quickstart)
 - [NEAR docs index](https://docs.near.org/llms.txt) · [NEAR Intents docs index](https://docs.near-intents.org/llms.txt)
+
+### Tidepool swap rail — timing and the reverse-order race
+
+- **Quote lifetime.** A swap quote is fillable for 15 minutes; the page keeps
+  watching for 16, so it never reports "expired" while the quote can still be
+  filled. Tidepool normally settles in seconds. A deposit that arrives after the
+  quote expires is refunded by Tidepool, not lost.
+- **Reverse-order race.** If someone pays or cancels a link while a swap is
+  still settling, the contract's `ft_on_transfer` refunds any payment to a link
+  that is not open, and the page re-reads the link live before the second
+  signature and says so plainly: the swapped tokens stay in the payer's account.
+  Remaining risk: the payer holds sandbox USDC they did not need — harmless, but
+  confusing. There is no on-chain reservation of a link while a swap is in
+  flight.
+- **Not yet recorded:** a live end-to-end swap with its transaction hashes. The
+  checklist is in `workers/OPERATIONS.md` §10.
+

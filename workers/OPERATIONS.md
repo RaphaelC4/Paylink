@@ -245,3 +245,39 @@ Nothing above was done for M-01 (no deploy, no push, no account changes).
    structured pipeline; contract emits events on chain, readable via RPC).
 8. **Other audit findings untouched by design**: M-03 – M-06 and L-01 – L-08
    remain open; M-01 changed no contract economics, payment flow, or H-01.
+
+## 9. Troubleshooting: Cloudflare error 1042
+
+`error code: 1042` from a Worker's `fetch()` means one of two things (Cloudflare
+docs, "Errors and exceptions"):
+
+1. **Worker → Worker on the same zone.** A Worker called another Worker through
+   its public hostname, e.g. `https://paylink-keeper.<sub>.workers.dev/...` from
+   the relayer. All Paylink Workers share one `workers.dev` account, so this is
+   the usual cause when a new Worker calls a sibling. Fix: call it through a
+   **service binding** (`[[services]]` in `wrangler.toml`, then
+   `env.KEEPER.fetch(request)`), or set the `global_fetch_strictly_public`
+   compatibility flag.
+2. **A `workers.dev` URL with nothing serving it** — the Worker was never
+   deployed under that name, the subdomain is misspelled, or its `workers.dev`
+   route is disabled. Fix: open the Worker in the dashboard and re-enable the
+   route / check the URL.
+
+Calling Tidepool (`https://www.usetidepool.tech`) from a Worker is not a 1042
+case — it is a third-party host. Today the browser calls Tidepool directly and
+no Worker does. To find the culprit, read the `url` in the failing log line and
+check which of the two cases it matches.
+
+## 10. Tidepool swap rail: live verification checklist
+
+Not yet recorded as evidence. Run once on testnet and paste the results here:
+
+1. Quote (`dry:false`) → note `depositAddress` and the quote `deadline`.
+2. `ft_transfer_call` to the verifier with `msg = depositAddress` → deposit tx hash.
+3. `/v0/status?depositAddress=…` reaches `SUCCESS` → settlement receipt on NEAR.
+4. The link then goes OPEN → PAID → CLAIMED (keeper) → record all three hashes.
+5. Negative case: send the same deposit with a **wrong** `msg` → expect a refund.
+6. Race case: pay the link directly while a swap is in flight → the swap still
+   settles, the late payment is refunded by `ft_on_transfer`, and the page says
+   the link is no longer open and that the tokens are in the payer's account.
+
