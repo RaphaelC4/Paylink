@@ -647,8 +647,8 @@ try {
       logs.slice(mark).some((e) => e.event === "intent_transition" && e.reason === "record_malformed"),
       "intent_transition logged once with reason record_malformed");
     ok(eventCount("record_invalid", mark) === 1 &&
-      logs.slice(mark).some((e) => e.event === "record_invalid" && e.reason === "status_invalid" && e.level === "error"),
-      "record_invalid logged once at level error with the specific reason");
+      logs.slice(mark).some((e) => e.event === "record_invalid" && e.reason === "status_invalid" && e.level === "alert"),
+      "record_invalid logged once at level alert with the specific reason");
     ok(!r.text.includes("depositAddress") && !r.text.includes("signature"),
       "the 503 body carries no record fields");
 
@@ -686,6 +686,64 @@ try {
       "…and after the cooldown it reconciles to the same intent (no duplicate address)");
     ok(stateQ.calls.quote.length === 0 && stateQ.calls.status.length === 1, "reconciliation, not creation");
     noVerifyTexts.push(q.text, q2.text);
+  }
+
+  /* ── 2b. alert webhook: a dead delivery can NEVER affect payment state ── */
+  {
+    const HOOK = "https://hooks.alert.example.test/services/DEAD-DESTINATION";
+    const state = stubNet();
+    const env = makeEnv({ ALERT_WEBHOOK_URL: HOOK });
+    const baseFetch = globalThis.fetch;
+    const hookCalls = [];
+    let persistedWhenFired = null;
+    globalThis.fetch = (url, init = {}) => {
+      const u = String(url);
+      if (u !== HOOK) return baseFetch(url, init);
+      /* OBSERVE the store at delivery time: the quarantine must already
+         be on disk before the webhook is awaited (persist-before-notify).
+         Reversed order would see the record still unreadable (ZOMBIE). */
+      const rec = getRecord(env);
+      persistedWhenFired = !!(rec && rec.invalid && rec.invalid.reason === "status_invalid" &&
+        rec.intents[0] && rec.intents[0].status === "RECONCILE");
+      hookCalls.push({ url: u, init });
+      return Promise.reject(new TypeError("webhook unreachable"));
+    };
+    env.INTENT_DO.seed(LINK_ID, seedRecord([seedIntent({ status: "ZOMBIE" })]));
+    const mark = logMark();
+    const r = await getStatus(env, SEED_ID);
+    ok(persistedWhenFired === true,
+      "quarantine + integrity stamp are ALREADY persisted when the delivery fires (persist-before-notify)");
+    ok(hookCalls.length === 1, "exactly one delivery attempt for the alert");
+    ok(r.res.status === 503 && r.out.code === "record_invalid" && Number.isFinite(r.out.retryAfterSec),
+      "a dead webhook cannot change the response: 503 record_invalid + Retry-After, as without one");
+    const rec = getRecord(env);
+    ok(rec.intents[0].status === "RECONCILE" && rec.intents[0].lastReason === "record_malformed" &&
+      rec.invalid && rec.invalid.reason === "status_invalid",
+      "quarantine + integrity stamp persisted exactly as in the no-webhook run");
+    ok(typeof rec.intents[0].reconcileUntil === "number", "the cooldown persisted with the quarantine too");
+    ok(eventCount("record_invalid", mark) === 1 &&
+      logs.slice(mark).some((e) => e.event === "record_invalid" && e.level === "alert" && e.reason === "status_invalid"),
+      "the alert line is still emitted at level alert when delivery fails");
+    const sent = JSON.parse(hookCalls[0].init.body);
+    ok(sent.event === "record_invalid" && sent.level === "alert" && sent.svc === "paylink-tidepool" &&
+      sent.reason === "status_invalid",
+      "the payload is the scrubbed alert record (machine reason only)");
+    ok(!hookCalls[0].init.body.includes("depositAddress") &&
+      !hookCalls[0].init.body.includes("signature") && !hookCalls[0].init.body.includes(SEED_SIG),
+      "no record fields beyond the log line reach the webhook");
+    ok(!logs.slice(mark).some((e) => JSON.stringify(e).includes(HOOK)),
+      "the webhook URL is never logged");
+
+    /* Repeat behaviour is identical to the no-webhook run (section 2). */
+    const mark2 = logMark();
+    const r2 = await getStatus(env, SEED_ID);
+    ok(r2.res.status === 503 && r2.out.code === "reconcile_cooldown" &&
+      eventCount("record_invalid", mark2) === 0 && hookCalls.length === 1,
+      "repeat: identical cooldown answer, no re-log, no second delivery attempt");
+    ok(state.calls.status.length === 0 && state.calls.rpc.length === 0,
+      "zero upstream reads while quarantined — the dead delivery changed nothing");
+    noVerifyTexts.push(r.text, r2.text);
+    globalThis.fetch = baseFetch;
   }
 
   /* ── 3. corrupt field: hold in place, never served, never repaired ── */
@@ -1339,8 +1397,8 @@ try {
 
     const invLogs = logs.filter((e) => e.event === "record_invalid");
     ok(invLogs.length > 0, `record_invalid exercised (${invLogs.length} lines)`);
-    ok(invLogs.every((e) => e.level === "error" && typeof e.reason === "string" && e.reason && e.linkId),
-      "record_invalid: level error + machine reason + ids on every line");
+    ok(invLogs.every((e) => e.level === "alert" && typeof e.reason === "string" && e.reason && e.linkId),
+      "record_invalid: level alert + machine reason + ids on every line");
     ok(!/[1-9A-HJ-NP-Za-km-z]{40,}/.test(invLogs.map((e) => JSON.stringify(e)).join("\n")),
       "record_invalid lines carry reason codes only — no hash-shaped data");
     const malformedTransitions = logs.filter((e) => e.event === "intent_transition" && e.reason === "record_malformed");
@@ -1348,8 +1406,8 @@ try {
       malformedTransitions.every((e) => e.from && e.to === "RECONCILE"),
       "quarantine transitions are auditable (from the raw value to RECONCILE)");
     const conflictLogs = logs.filter((e) => e.event === "invoice_conflict" || e.event === "payout_conflict");
-    ok(conflictLogs.length > 0 && conflictLogs.every((e) => e.level === "error"),
-      "every conflict log is level error");
+    ok(conflictLogs.length > 0 && conflictLogs.every((e) => e.level === "alert"),
+      "every conflict log is level alert (webhook-eligible)");
 
     ok(noVerifyTexts.length >= 20, `no-evidence sample is meaningful (${noVerifyTexts.length} responses)`);
     ok(noVerifyTexts.every((t) => !t.includes('"status":"VERIFIED"')),

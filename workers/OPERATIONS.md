@@ -1,7 +1,8 @@
 # Paylink Workers — Operations (M-01)
 
-Monitoring and alerting for the three Paylink Cloudflare Workers: **relayer**
-(meta-transactions), **keeper** (claim sweep), **parse** (invoice reader).
+Monitoring and alerting for the Paylink Cloudflare Workers: **relayer**
+(meta-transactions), **keeper** (claim sweep), **parse** (invoice reader)
+and **Tidepool** (cross-chain payment rail, §2).
 This file is the M-01 report: what is implemented in code and tested, versus
 what still requires Cloudflare account configuration. All four Workers run
 in production on workers.dev — relayer, keeper, parse and Tidepool (§2) —
@@ -12,7 +13,7 @@ explicitly and invents no credential values.
 
 ---
 
-## 1. The log line (identical in all three Workers)
+## 1. The log line (identical in all four Workers)
 
 Every operational event is **one JSON line on stdout**:
 
@@ -23,8 +24,8 @@ Every operational event is **one JSON line on stdout**:
 | Field   | Meaning |
 |---------|---------|
 | `ts`    | ISO-8601 UTC timestamp |
-| `svc`   | `paylink-relayer` \| `paylink-keeper` \| `paylink-parse` |
-| `build` | build stamp — relayer `20261110d`, keeper `20261110f`, parse `20261110b` (in log lines only) |
+| `svc`   | `paylink-relayer` \| `paylink-keeper` \| `paylink-parse` \| `paylink-tidepool` |
+| `build` | build stamp — relayer `20261110d`, keeper `20261110f`, parse `20261110b`, tidepool `20261111a` (in log lines only) |
 | `level` | `info` \| `warn` \| `error` \| `alert` |
 | `event` | catalog name from the tables below |
 | …       | event-specific fields, always flat scalars or short string arrays |
@@ -41,7 +42,8 @@ Rules enforced by `logEvent` in each worker:
   `GEMINI_API_KEY` **by value** — upstream error bodies echo it, and an
   arbitrary literal cannot be caught by shape patterns.
 * **Delivery failures are swallowed** (3 s timeout, resolve `false`). A dead
-  webhook can never break a submission, sweep or parse.
+  webhook can never break a submission, sweep, parse or Tidepool status
+  cycle — the record is always persisted before delivery is awaited.
 
 Correlation ids:
 
@@ -50,6 +52,7 @@ Correlation ids:
 | relayer | `rid` (8 hex) | `X-Request-Id` response header + every log line of that request |
 | parse   | `rid` (8 hex) | `X-Request-Id` on `POST /` responses + that request's lines |
 | keeper  | `run_id` (8 hex) | every line of one sweep + returned in the `/tick` response report |
+| tidepool | `rid` (8 hex) | `X-Request-Id` on `/networks`, `/quote`, `/status` responses + that request's lines |
 
 Parse deliberately creates `rid` **after** the OPTIONS/405/404 checks, so
 those responses are byte-identical to M-02 output (the `GET /` → `405` +
@@ -133,17 +136,30 @@ code running in `workers/tidepool/`. Routes are `GET /networks`,
 | `status_ok` | info | A `GET /status` poll that **changed** something — `rid`, `ip`, `linkId`, `intentId`, `status`, `tidepoolStatus`, `conflict`, `ms`. Unchanged polls are silent by design: a 2-second watcher can never burn the log budget (the transition itself already logged `intent_transition`). |
 | `status_rejected` | info | `GET /status` request rejected — `rid`, `ip`, `status`, `linkId`, `code`, `reason`. Fires only for 400/403/404 (`invalid_link_id`, `invalid_intent_id`, `origin_not_allowed`, `intent_not_found`); cooldown 503s never log here (their cause already logged `status_upstream_error`). |
 | `status_upstream_error` | error (`warn` for the contract leg, `unmapped_status`, `transition_refused`) | A read failed inside a status cycle — `rid`, `linkId`, `intentId`, `target` (`status`\|`contract`), `kind`, `status`. The contract leg failing never fails the response (last known state kept, `onChainCheckedAt` not advanced); the status leg failing parks the intent in RECONCILE with a persisted cooldown. Never logs a raw upstream body on this path. |
-| `invoice_conflict` | **error** | Cross-provider double-pay risk detected: the NEAR invoice went `PAID`/`CLAIMED` while a Tidepool intent was still in flight — `rid`, `linkId`, `intentId`, `previous`, `onChainStatus`. Logged **once** per record; the `conflict` flag then rides on every `/status` response and polling continues (only observation reveals whether the double pay actually happened). During Phase 5 verification the same line fires from the fresh pre-transition contract read (same shape, same once-per-record rule). |
+| `invoice_conflict` | **alert** | Cross-provider double-pay risk detected: the NEAR invoice went `PAID`/`CLAIMED` while a Tidepool intent was still in flight — `rid`, `linkId`, `intentId`, `previous`, `onChainStatus`. Logged **once** per record; the `conflict` flag then rides on every `/status` response and polling continues (only observation reveals whether the double pay actually happened). During Phase 5 verification the same line fires from the fresh pre-transition contract read (same shape, same once-per-record rule). Alert delivery: see the note below the table. |
 | `payout_verify_ok` | info | Phase 5: `SETTLED → VERIFIED` — authoritative NEAR tx evidence proved exactly one successful `ft_transfer` of the invoice amount to the merchant on the configured USDC token, and the fresh `get_link` immediately before the move still authorized it — `rid`, `linkId`, `intentId`, `attempts` (prior held attempts). One line per verification; `intent_transition` also fires for the move itself. |
 | `payout_verify_hold` | warn | Phase 5: a verification attempt (or a candidate-less SETTLED hold) did not — or could not — prove the payout, so the intent stays `SETTLED` — `rid`, `linkId`, `intentId`, `reason`. **Logged once per distinct reason** per intent (repeats are silent; the reason changes ⇒ one new line). Reason codes only, never a hash, amount or address: `no_payout_hash`, `evidence_pending`, `no_transfer_evidence`, `transfer_failed`, `evidence_malformed`, `evidence_mismatch`, `rpc_inconclusive`, `contract_inconclusive`, `invoice_mismatch`, `invoice_paid`, `double_payout`, `payout_reversed`, `transition_refused`. Every hold is retryable with backoff (`TIDEPOOL_VERIFY_BACKOFF_MS`, doubling to 1 h) or — for conflicts — a manual-reconciliation hold. |
-| `payout_conflict` | **error** | Phase 5: the payout evidence itself proved a money conflict — `rid`, `linkId`, `intentId`, `kind` (`double_payout`\|`payout_reversed`). The conflict is persisted on the record (rides on every `/status` response), the intent is **never** auto-verified, and all further cycles are zero-read holds until an operator reconciles. |
-| `record_invalid` | **error** | Phase 6: a persisted payment record failed type/shape validation — `rid`, `linkId`, `intentId` (`null` for record/pointer-level findings), `reason` (machine code only; **the corrupt value itself is never logged**). **Logged once per distinct reason per record** — repeats answer identically with no second line and no re-write. Reasons: `status_invalid` (quarantined to `RECONCILE` with an `intent_transition` of `record_malformed`), `deposit_address_invalid`, `deposit_memo_invalid`, `quote_deadline_invalid`, `merchant_invalid`, `amount_invalid`, `meta_invalid`, `correlation_invalid`, `tidepool_status_invalid`, `reason_invalid`, `link_invalid`, `intent_invalid` (intent held in place, 503 `record_invalid`), `history_invalid`, `conflict_invalid` (stamped, non-blocking — but a malformed conflict still blocks verification), `intents_invalid`, `active_intent_unresolvable`, `active_intent_missing`. Operator procedure: §10. |
+| `payout_conflict` | **alert** | Phase 5: the payout evidence itself proved a money conflict — `rid`, `linkId`, `intentId`, `kind` (`double_payout`\|`payout_reversed`). The conflict is persisted on the record (rides on every `/status` response), the intent is **never** auto-verified, and all further cycles are zero-read holds until an operator reconciles. Alert delivery: see the note below the table. |
+| `record_invalid` | **alert** | Phase 6: a persisted payment record failed type/shape validation — `rid`, `linkId`, `intentId` (`null` for record/pointer-level findings), `reason` (machine code only; **the corrupt value itself is never logged**). **Logged once per distinct reason per record** — repeats answer identically with no second line and no re-write. Reasons: `status_invalid` (quarantined to `RECONCILE` with an `intent_transition` of `record_malformed`), `deposit_address_invalid`, `deposit_memo_invalid`, `quote_deadline_invalid`, `merchant_invalid`, `amount_invalid`, `meta_invalid`, `correlation_invalid`, `tidepool_status_invalid`, `reason_invalid`, `link_invalid`, `intent_invalid` (intent held in place, 503 `record_invalid`), `history_invalid`, `conflict_invalid` (stamped, non-blocking — but a malformed conflict still blocks verification), `intents_invalid`, `active_intent_unresolvable`, `active_intent_missing`. Operator procedure: §10. Alert delivery: see the note below the table. |
 | `service_error` | error | Unexpected exception or intent-store failure — `method`, `error` (scrubbed), or `rid` + `error: intent store failed` / `INTENT_DO binding missing`. Client gets a generic 500; stack stays server-side. |
 
-This worker emits **no alert-level events** and has no webhook path: nothing
-pages automatically yet — see the queries added to §3b for the signals that
-should be watched from day one (the cross-provider conflict, the Phase 5
-payout conflicts, and a corrupt payment record).
+This worker emits **three alert-level events** — `invoice_conflict`,
+`payout_conflict` and `record_invalid` — delivered through the same
+`ALERT_WEBHOOK_URL` mechanism as the other Workers (§4 Tier 1). Order and
+failure handling are pinned by tests: the conflict/quarantine is
+**persisted before** the delivery is awaited (persist-before-notify), the
+console line is **always written first** (Tier 0 log-only never depends on
+the webhook), delivery is best-effort with a 3 s timeout, and any failure
+is swallowed — a dead webhook cannot affect payment state, the response,
+or the repeat behaviour. **The secret is not configured yet** (account-side
+setup: §5 step 2), so today these events are log-only. Two limitations:
+the destination must be **private** — the payload carries `linkId` +
+`intentId`, which together are the `GET /status` read capability for that
+payment (fields are the log line itself: machine reason codes only, no
+amounts, addresses or hashes) — and delivery is **single-shot** (each
+event fires once per record/distinct reason; nothing re-emits it if the
+POST fails). Until the secret is set, §3b's saved queries are the
+visibility mechanism, on 3-day free retention.
 
 ---
 
@@ -160,10 +176,17 @@ webhook only if `ALERT_WEBHOOK_URL` is set)
 | keeper | `scan_degraded` | 3rd consecutive **partial** scan | streak, resets on one full-coverage scan |
 | keeper | `repeated_claim_failure` | 3rd consecutive failure per link | per-link streak, resets on success |
 | parse | `upstream_degraded` | 5 upstream failures per 5 min | per-isolate sliding window, once per window |
+| tidepool | `invoice_conflict` | on first detection — once per record | NEAR invoice settled while a Tidepool intent was in flight (Phase 4 poll or Phase 5 fresh read); conflict persisted **before** delivery, intent never auto-verified |
+| tidepool | `payout_conflict` | on first detection — once per record | payout evidence proved `double_payout` / `payout_reversed`; conflict persisted, zero-read hold until reconciled |
+| tidepool | `record_invalid` | on first distinct reason per record | corrupt persisted record stamped; intent held or quarantined to `RECONCILE` (503), persist-before-notify |
 
 Threshold rationale: single failures are normal (chain hiccups, one bad
 request); every implemented alert requires **repetition** — three strikes or
-five-in-window — so the channel only hears about systemic trouble.
+five-in-window — so the channel only hears about systemic trouble. The three
+Tidepool events are the deliberate exception: they need **no repetition
+gate** because each fires at most once per record (or per distinct reason)
+and therefore cannot flood a channel — and they mark single money-safety
+events that must never be missed.
 
 **State caveat (documented, by design):** counters and streaks are
 *per-isolate*. An isolate restart clears them, so a streak may need to rebuild
@@ -190,7 +213,11 @@ implemented in code** (a Worker cannot alert on an event that never happened)
 | Business volume | count of `event:submit_ok` per hour | dashboard only |
 | Log budget | total events/day vs. 200k/day free cap | warn at 80 % |
 
-Each is a saved query in Workers → Logs with an alert on top. As of the
+Each is a saved query in Workers → Logs with an alert on top. The three
+Tidepool money-safety rows now also **deliver in code** (§3a, §4 Tier 1);
+their dashboard queries are a redundant Tier-2 backstop — still worth
+having, because webhook delivery is single-shot and free log retention is
+3 days. As of the
 Cloudflare pricing page, **queries, dashboards and alerts are included at no
 extra charge** (Workers Logs free tier: **200 000 events/day**, **3-day
 retention**; verify current limits — retention/pricing changes were announced
@@ -206,13 +233,28 @@ first:
 | Tier | Mechanism | Status | Cost |
 |------|-----------|--------|------|
 | 0 | **Log-only** — read `level:"alert"` lines in Workers → Logs / `wrangler tail` | **Implemented, zero config** (default) | free |
-| 1 | **Webhook** — `ALERT_WEBHOOK_URL` secret; each `alert` record POSTed as JSON, best-effort, URL never logged | **Implemented in code**; needs a destination URL you choose | free (Slack/Discord/ntfy/PagerDuty webhooks, or any endpoint you host) |
+| 1 | **Webhook** — `ALERT_WEBHOOK_URL` secret; each `alert` record POSTed as JSON, best-effort, URL never logged | **Implemented in code (all four Workers)**; needs a destination URL you choose | free (Slack/Discord/ntfy/PagerDuty webhooks, or any endpoint you host) |
 | 2 | **Cloudflare Logs alerts** on saved queries (incl. the 3b absence check) | Requires account setup | free per pricing page ("queries, dashboards, alerts" included) |
 | 3 | **Logpush** (long retention, external bucket) | Requires account setup; **Workers Trace Events Logpush requires Workers Paid** | 25 GB/mo internal destination included, then $0.03/GB; external destinations $0.10/GB (rates as researched 2026 — re-verify) |
 | 4 | **Tail Worker / OpenTelemetry export** to your own pipeline | Not implemented (would add code + a destination) | destination-dependent |
 
 Tier 1 is the recommended default: one secret per worker, any JSON-webhook
 endpoint, no vendor lock-in, no cost.
+
+**Destination requirements and delivery limits:**
+
+* Use a **private** destination (DM, private channel, tokened ntfy topic) —
+  the Tidepool alert payload includes `linkId` + `intentId`, which together
+  are the `GET /status` **read capability** for that payment. The response
+  is read-only and response-minimised (no address, amount or hash), but it
+  exposes the payment's conflict/hold state to anyone holding the ids.
+* Nothing else sensitive travels: the payload is the scrubbed log line
+  itself (machine reason codes only), and the webhook URL — which may embed
+  the destination's token — is a secret value that is never logged.
+* Delivery is **single-shot** per event (each fires once per record or
+  distinct reason). If the POST fails, nothing re-emits — the console line
+  is the fallback, so pair Tier 1 with a Tier-2 saved query (§3b) if that
+  matters to you.
 
 ---
 
@@ -226,8 +268,13 @@ Account/dashboard side — not performed by this milestone:
    `wrangler tail` but dashboard queries/alerts have nothing to read.
 2. **Alert destination**: choose a webhook (e.g. a private Discord/Slack
    channel webhook or an ntfy topic URL), then per worker:
-   `wrangler secret put ALERT_WEBHOOK_URL` — paste the URL at the prompt.
-   The secret is optional; without it all alerts still log (log-only mode).
+   `npx wrangler secret put ALERT_WEBHOOK_URL` — run once in **each**
+   worker directory (`workers/relayer`, `workers/keeper`,
+   `workers/parse`, `workers/tidepool`) and paste the URL at the prompt;
+   the secret is per-worker. Choose a **private** destination (§4: the
+   Tidepool payload carries the `GET /status` read capability, `linkId` +
+   `intentId`). The secret is optional; without it all alerts still log
+   (log-only mode).
 3. **Dashboard alerts** for the 3b table: create saved queries + alert
    thresholds in Workers → Logs. Credentials required: your Cloudflare
    account (already implied by deploying these workers); no new service.
@@ -235,7 +282,11 @@ Account/dashboard side — not performed by this milestone:
    insufficient; requires Workers Paid for Trace Events Logpush — a paid
    upgrade, documented here as a cost, not enabled.
 
-Nothing above was done for M-01 (no deploy, no push, no account changes).
+None of the above has been configured yet: no destination chosen, no
+`ALERT_WEBHOOK_URL` secret put, no saved query or alert created, no
+retention change (verified 13 Nov 2026 — `wrangler secret list` on
+`paylink-tidepool` returns none; the Workers themselves are live, §8.1).
+The gap is purely account-side.
 
 ---
 
@@ -247,7 +298,7 @@ Nothing above was done for M-01 (no deploy, no push, no account changes).
 * **Logged identifiers** are public-by-chain or operational: `link_id`, tx
   `hash`, `sender_id`/`account_id`, client IP (already visible to the edge),
   `rid`/`run_id` (random, contain no user data).
-* **Backstop** (`scrub` in all three files): shape redaction + 240-char cap
+* **Backstop** (`scrub`/`scrubDeep` in all four files): shape redaction + 240-char cap
   applied to *every* string that reaches a line or webhook — so a future
   careless call site still cannot leak a key-sized secret.
 * **No public log exposure**: health endpoints return fixed allowlists of
@@ -263,6 +314,7 @@ Nothing above was done for M-01 (no deploy, no push, no account changes).
 | `node workers/relayer/test/parse.test.mjs` | **173 passed, 0 failed** | envelope + svc/build/level, `X-Request-Id` echo ↔ log `rid` match, `submit_rejected` reason codes, `submit_ok` happy path through an in-process RPC mock (no delegate/key bytes in any line), `rate_limited` layer+retry_after, `volume_anomaly` (fires at threshold, once per window), `error_burst` ×5 with webhook payload assertions, webhook on/off/dead-URL-never-logged plumbing, scrub probe, `GET /` allowlist + stats shape; **L-08**: reads fail over primary → `RPC_URLS` in order (the flow reaches the broadcast only because the fallback answered), the broadcast goes only to the primary exactly once — with a dead primary *and* with a healthy fallback configured — no pointless failover while the primary is healthy, and without `RPC_URLS` a query still retries the same endpoint while the fallback is never contacted |
 | `node workers/keeper/test/sweep.test.mjs` | **178 passed, 0 failed** | `GET /` allowlist + build, `/tick` run_id correlation, tick 500 → `sweep_failed`+`tick_failed`, `cron_heartbeat` ok true/false (exactly one per run), `unsettled_paid` warn, `repeated_claim_failure` 3-strike + webhook + streak reset, `sweep_outage` 3-strike + scrubbed error + recovery reset, sweep_summary shape, scrub probe; **M-06**: live key/value layout fixture, 61-bucket fallback walk (boundaries 4/7/64), transient page retry, unreadable region fail-soft + `scan_partial`/`scan_degraded` streaks + recovery, duplicate key across pages claims once, query ceiling and zero-budget guards, one access-key read per sweep with sequential nonces, nonce re-read after unknown broadcast outcome and `InvalidNonce`; **L-02**: u128 both-limb decode (zero → u128::MAX, the 2^64 boundary, optional paid_amount path), lo-then-hi byte order incl. the live view_state record, settlement unchanged for a >2^64 amount (still 1 yocto), `formatYoctoNEAR` (0/1 yocto/1 NEAR/1.5/10^30/2^64/u128::MAX + malformed strings/Numbers/out-of-range rejected), truncated and garbage records skipped without failing the sweep; **L-03**: status byte 3 decodes `CANCELLED` (never `EXPIRED`), a cancelled record carries no payment fields, and a cancelled link is scanned but never a claim candidate; **L-05**: `/tick` fails closed — wrong secret, missing header and unset `TICK_SECRET` each answer 403 with zero broadcasts; the comparison itself is constant-time (SHA-256 digests, XOR accumulator, no plain-string fallback); **L-08**: reads fail over primary → `RPC_URLS` in order (primary first, the nonce read completes on the fallback), the broadcast is attempted exactly once on the primary and never fails over (dead-primary and healthy-fallback cases), the fallback never receives a broadcast, and without `RPC_URLS` a query still retries the same endpoint |
 | `node workers/parse/test/parse.test.mjs` | **136 passed, 0 failed** | `parse_ok` envelope/no-values/rid, 405 untouched (no rid header), `parse_rejected` reason codes, `rate_limited` (11th request), `upstream_error` kinds + key redacted by value + 240 cap, `upstream_degraded` 5-in-window + webhook delivery, `service_error` generic 500 with no stack, leak sweep over 86 captured bodies; **L-06**: slow-in-budget response still parses (timer cleared — no late abort), stalled success body → 504 `kind=timeout`, stalled **error** body → 504 `kind=timeout` (was 502 `http_status`), upstream 429/400 → 502 status-only with no key/detail leak, network failure → 502 `kind=unreachable`, invalid JSON → 502 `kind=unreadable` (never a timeout) |
+| `node --test 'workers/tidepool/test/*.test.mjs'` | **984 passed, 0 failed** (5 files) | M-01 alerting: the three money-safety events (`invoice_conflict`, `payout_conflict`, `record_invalid`) at `level:"alert"` from all five call sites with `env` threaded, webhook plumbing — missing secret → zero fetches (and the old two-argument `logEvent` shape stays safe), success → exactly one JSON POST whose payload is byte-identical to the logged line with the URL never logged, warn/info never POSTed, failure → swallowed `false` with the console line intact — **persist-before-notify** proven by observing the Durable Object store *at delivery time* (quarantine already on disk), and a dead webhook leaving response, persisted state, re-log and upstream-read behaviour identical to the no-webhook run; the eight severity assertions updated `error` → `alert` |
 
 ---
 
@@ -347,7 +399,7 @@ Durable Object record is the only thing the Worker acts on, and a record
 it cannot read is held — never guessed, never silently repaired.** This
 section is the operator side of that rule. Everything marked *implemented*
 below is in code and proven by `node workers/tidepool/test/records.test.mjs`
-(199 assertions) alongside the existing networks/quote/status/payout suites;
+(210 assertions) alongside the existing networks/quote/status/payout suites;
 items marked *recommended* need Cloudflare dashboard setup and say so.
 There is deliberately **no admin endpoint**: hold reasons, integrity stamps
 and history are never exposed on a public route — visibility is log lines

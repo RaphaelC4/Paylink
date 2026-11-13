@@ -28,6 +28,15 @@
 # this file:
 #   - TIDEPOOL_X_API_KEY is a non-secret fee-tier selector.
 #   - TIDEPOOL_MAKER_KEY is Tidepool's PUBLIC verification key.
+# The ONE optional secret is set per-deployment (a URL is a credential,
+# so it never lives in this file):
+#   npx wrangler secret put ALERT_WEBHOOK_URL    # run in workers/tidepool
+# Level-alert events (invoice_conflict, payout_conflict, record_invalid)
+# are POSTed there as JSON — best-effort, 3 s budget, failures swallowed,
+# the record persisted first, the URL never logged; unset = log-only.
+# Use a PRIVATE destination: the payload carries linkId + intentId, which
+# together are the GET /status read capability for that payment.
+# Details: workers/OPERATIONS.md sections 4 and 5.
 name = "paylink-tidepool"
 main = "src/index.js"
 compatibility_date = "2026-10-01"

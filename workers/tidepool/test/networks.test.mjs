@@ -16,7 +16,7 @@
  * cache tests opt in explicitly and reset through clearDiscoveryCache().
  */
 
-import worker, { clearDiscoveryCache, discoveryTtlMs, tidepoolTimeoutMs } from "../src/index.js";
+import worker, { clearDiscoveryCache, discoveryTtlMs, logEvent, tidepoolTimeoutMs } from "../src/index.js";
 
 let pass = 0;
 let fail = 0;
@@ -539,7 +539,93 @@ try {
     ok(!txt.includes("index.js") && !txt.includes("at Object"), "the response carries no stack trace");
   }
 
-  /* ── 12. leak sweep across every captured response ── */
+  /* ── 12. M-01: alert webhook delivery (logEvent's optional env) ── */
+  {
+    const HOOK = "https://hooks.alert.example.test/services/TOPSECRET-DESTINATION";
+
+    /* Raw console capture: keeps unparseable lines too, so a URL leak of
+       ANY shape would be visible here. */
+    const capture = async (fn) => {
+      const lines = [];
+      const base = console.log;
+      console.log = (...a) => lines.push(a.join(" "));
+      try {
+        const value = await fn();
+        return { value, lines };
+      } finally {
+        console.log = base;
+      }
+    };
+    const parsed = (lines) =>
+      lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+
+    /* a. missing secret: delivery off, log-only, not one fetch */
+    const attempts = [];
+    globalThis.fetch = (url, init = {}) => {
+      attempts.push({ url: String(url), init });
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    };
+    const a = await capture(() => logEvent("record_invalid", {
+      level: "alert", rid: "a1b2c3d4", linkId: "inv-0001",
+      intentId: "pi_0123456789abcdef", reason: "status_invalid",
+    }, baseEnv()));
+    ok(a.value === false, "no ALERT_WEBHOOK_URL: delivery reports false (alerts degrade to log-only)");
+    ok(attempts.length === 0, "no ALERT_WEBHOOK_URL: NOT ONE fetch is attempted");
+    ok(parsed(a.lines).some((e) => e.event === "record_invalid" && e.level === "alert"),
+      "the console JSON line is still emitted (Tier 0 log-only intact)");
+    const a2 = await capture(() =>
+      logEvent("record_invalid", { level: "alert", rid: "a1b2c3d4", reason: "status_invalid" }));
+    ok(a2.value === false && attempts.length === 0,
+      "the old two-argument call shape (no env) stays safe: no fetch, no throw");
+
+    /* b. successful delivery: one JSON POST, payload = the logged line */
+    const posts = [];
+    globalThis.fetch = (url, init = {}) => {
+      posts.push({ url: String(url), init });
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    };
+    const hookEnv = baseEnv({ ALERT_WEBHOOK_URL: HOOK });
+    const b = await capture(() => logEvent("invoice_conflict", {
+      level: "alert", rid: "a1b2c3d4", linkId: "inv-0001",
+      intentId: "pi_0123456789abcdef", previous: "OPEN", onChainStatus: "PAID",
+    }, hookEnv));
+    ok(b.value === true, "delivery resolves true");
+    ok(posts.length === 1, "exactly ONE POST per alert event");
+    ok(posts[0].url === HOOK && posts[0].init.method === "POST",
+      "the POST goes to ALERT_WEBHOOK_URL");
+    ok((posts[0].init.headers || {})["content-type"] === "application/json",
+      "sent as application/json");
+    const sent = JSON.parse(posts[0].init.body);
+    const logged = parsed(b.lines).filter((e) => e.event === "invoice_conflict")[0];
+    ok(sent.event === "invoice_conflict" && sent.level === "alert" && sent.svc === "paylink-tidepool",
+      "payload is the structured alert record");
+    ok(logged && JSON.stringify(sent) === JSON.stringify(logged),
+      "payload is EXACTLY the logged line — no extra fields, nothing hidden");
+    ok(!b.lines.join("\n").includes(HOOK), "the webhook URL is never logged on success");
+    const w = await capture(() => logEvent("networks_ok", { level: "warn", rid: "a1b2c3d4", tokens: 0 }, hookEnv));
+    ok(w.value === null && posts.length === 1,
+      "warn/info events are never POSTed — only level=alert is webhook-eligible");
+
+    /* c. failed delivery: swallowed, console line intact, URL never logged */
+    const tries = [];
+    globalThis.fetch = (url) => {
+      tries.push(String(url));
+      return Promise.reject(new TypeError("connect ECONNREFUSED 10.0.0.1:443"));
+    };
+    const c = await capture(() => logEvent("payout_conflict", {
+      level: "alert", rid: "a1b2c3d4", linkId: "inv-0001",
+      intentId: "pi_0123456789abcdef", kind: "double_payout",
+    }, hookEnv));
+    ok(c.value === false, "failed delivery resolves false — the failure is swallowed, never thrown");
+    ok(tries.length === 1, "the delivery was attempted exactly once (no retry loop)");
+    ok(parsed(c.lines).some((e) => e.event === "payout_conflict" && e.level === "alert"),
+      "the console JSON line is still emitted when delivery fails");
+    ok(!c.lines.join("\n").includes(HOOK), "the webhook URL is never logged on failure");
+    ok(!c.lines.join("\n").includes("ALERT_WEBHOOK_URL"),
+      "the secret's NAME never appears in any line either");
+  }
+
+  /* ── 13. leak sweep across every captured response ── */
   {
     const all = bodies.join("\n");
     ok(!all.includes("UPSTREAM-DETAIL-MARKER"), "sweep: no upstream detail appears in any response");

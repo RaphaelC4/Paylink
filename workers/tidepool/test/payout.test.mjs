@@ -788,9 +788,9 @@ try {
       "two payouts of the invoice amount: double_payout conflict, never VERIFIED");
     ok(getRecord(dbl.env).conflict.kind === "double_payout", "conflict persisted on the record");
     const pcLog = logs.filter((e) => e.event === "payout_conflict").slice(-1)[0];
-    ok(eventCount("payout_conflict", dm) === 1 && pcLog && pcLog.level === "error" &&
+    ok(eventCount("payout_conflict", dm) === 1 && pcLog && pcLog.level === "alert" &&
       pcLog.kind === "double_payout",
-      "payout_conflict logged once at level error with its kind");
+      "payout_conflict logged once at level alert with its kind");
     const dm2 = logMark();
     const before = dbl.state.calls.tx.length;
     advance(2000);
@@ -931,9 +931,9 @@ try {
       "PAID discovered by the fresh read: hold with invoice_paid, never VERIFIED");
     ok(eventCount("invoice_conflict", mark) === 1, "invoice_conflict logged in the Phase 4 shape");
     const ic = logs.filter((e) => e.event === "invoice_conflict").slice(-1)[0];
-    ok(ic && ic.level === "error" && ic.previous === "OPEN" && ic.onChainStatus === "PAID" &&
+    ok(ic && ic.level === "alert" && ic.previous === "OPEN" && ic.onChainStatus === "PAID" &&
       ic.intentId === race.intent.intentId,
-      "conflict log carries previous + new state + ids at level error");
+      "conflict log carries previous + new state + ids at level alert");
     ok(getRecord(race.env).conflict.kind === "invoice_paid", "conflict persisted for manual reconciliation");
     const before = race.state.calls.tx.length + race.state.calls.rpc.length;
     race.state.link = openLink();     // even if the contract flips back: stored conflict stands
@@ -1220,10 +1220,10 @@ try {
       "every verification log line carries the M-01 envelope");
     ok(logs.filter((e) => e.event === "payout_verify_hold").every((e) => e.level === "warn" && e.reason),
       "payout_verify_hold: level warn + machine reason on every line");
-    ok(logs.filter((e) => e.event === "payout_conflict").every((e) => e.level === "error" && e.kind),
-      "payout_conflict: level error + conflict kind on every line");
-    ok(logs.filter((e) => e.event === "invoice_conflict").every((e) => e.level === "error"),
-      "the Phase 4 invoice_conflict shape is preserved");
+    ok(logs.filter((e) => e.event === "payout_conflict").every((e) => e.level === "alert" && e.kind),
+      "payout_conflict: level alert + conflict kind on every line");
+    ok(logs.filter((e) => e.event === "invoice_conflict").every((e) => e.level === "alert"),
+      "the Phase 4 invoice_conflict shape is preserved (level alert)");
     ok(!bodies.join("\n").includes("REPLACE_WITH"), "no config placeholder leaked anywhere");
   }
 } catch (e) {

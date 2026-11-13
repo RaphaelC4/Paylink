@@ -968,8 +968,8 @@ try {
     ok(r2.out.intent.status === "SETTLING", "the Tidepool leg is still tracked");
     ok(eventCount("invoice_conflict", conflictBefore) === 1, "invoice_conflict logged exactly once");
     const conflictLog = logs.filter((e) => e.event === "invoice_conflict")[0];
-    ok(conflictLog && conflictLog.level === "error" && conflictLog.onChainStatus === "PAID" &&
-      conflictLog.previous === "OPEN", "conflict log carries previous + new state at level error");
+    ok(conflictLog && conflictLog.level === "alert" && conflictLog.onChainStatus === "PAID" &&
+      conflictLog.previous === "OPEN", "conflict log carries previous + new state at level alert");
     const rec = getRecord(env);
     ok(rec.conflict && rec.conflict.kind === "invoice_paid" && rec.conflict.onChainStatus === "PAID",
       "conflict persisted on the record");

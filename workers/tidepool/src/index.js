@@ -133,7 +133,8 @@
  * Cross-provider race (Phase 4 §5): every non-terminal cycle re-reads
  * the authoritative contract. OPEN -> PAID/CLAIMED while an intent is in
  * flight is recorded as record.conflict {kind:"invoice_paid", …}, logged
- * once as invoice_conflict (level error), and returned as conflict on
+ * once as invoice_conflict (level alert — webhook-eligible), and returned
+ * as conflict on
  * every subsequent response — while polling CONTINUES, because only
  * observing the Tidepool leg tells us whether the merchant was actually
  * paid twice. Nothing in this Worker can stop that leg (quote-based
@@ -205,17 +206,25 @@
  * (contract / status read failures), invoice_conflict (contract
  * PAID/CLAIMED while a Tidepool intent is in flight), record_invalid
  * (Phase 6: a malformed persisted record — logged ONCE per distinct
- * reason, reason codes only), upstream_error, service_error. GET
+ * reason, reason codes only), upstream_error, service_error. The three
+ * money-safety findings — invoice_conflict, payout_conflict and
+ * record_invalid — are logged at level alert: with the optional
+ * ALERT_WEBHOOK_URL secret set, each record is ALSO POSTed there
+ * (best-effort, 3 s, failures swallowed, never fatal), after the record
+ * itself is persisted; unset, they are log-only. GET
  * /networks, POST /quote and GET /status responses
  * carry X-Request-Id; the OPTIONS/405/404 responses stay untouched, so
  * the 405 + Allow: GET line remains the deploy signal. Never logged or
  * returned: a raw upstream body, token prices, stack traces, quote
  * signatures, deposit addresses.
  *
- * Secrets:  none — the Tidepool API is keyless. TIDEPOOL_X_API_KEY is a
- *           non-secret fee-tier selector (any value is accepted; it only
- *           picks the keyed tier), deliberately NOT a wrangler secret.
- *           TIDEPOOL_MAKER_KEY is a public verification key.
+ * Secrets:  none are REQUIRED — the Tidepool API is keyless.
+ *           TIDEPOOL_X_API_KEY is a non-secret fee-tier selector (any
+ *           value is accepted; it only picks the keyed tier), deliberately
+ *           NOT a wrangler secret. TIDEPOOL_MAKER_KEY is a public
+ *           verification key. Optional: wrangler secret put
+ *           ALERT_WEBHOOK_URL — where level=alert events go (unset =
+ *           alerts are log-only).
  * Vars:     ALLOWED_ORIGIN (default *), TIDEPOOL_ORIGIN (default
  *           https://www.usetidepool.tech), TIDEPOOL_TIMEOUT_MS (default
  *           5000 — one budget per upstream leg: discovery, tokens, quote,
@@ -292,10 +301,47 @@ const scrubDeep = (o) => {
   return o;
 };
 
-/* One event = one JSON line. Exported for test/networks.test.mjs. */
-export function logEvent(event, detail = {}) {
+/* Optional alert delivery: POST level=alert events to ALERT_WEBHOOK_URL.
+   Off unless the secret is set; best-effort with a short timeout; failures
+   are swallowed (a dead webhook must never break a request, a payment
+   record or a conflict) and the URL is never logged — it may embed the
+   destination's token. Identical to the M-01 pattern in workers/relayer,
+   workers/keeper and workers/parse. */
+async function notifyAlert(env, payload) {
+  const url = env && env.ALERT_WEBHOOK_URL;
+  if (!url || typeof url !== "string") return false;
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 3_000);
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: ctl.signal,
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/* One event = one JSON line. level: info | warn | error | alert. Only
+   level=alert is webhook-eligible (so warnings never spam a channel); the
+   console line is ALWAYS written first (Tier 0 log-only stays intact even
+   if delivery is off or broken), and the returned promise is the delivery —
+   callers that must persist first may await it afterwards. Exported for
+   test/networks.test.mjs. */
+export function logEvent(event, detail = {}, env) {
   const level = detail.level || "info";
-  console.log(JSON.stringify(scrubDeep({ ts: new Date().toISOString(), svc: SVC, build: BUILD, level, event, ...detail })));
+  const record = scrubDeep({ ts: new Date().toISOString(), svc: SVC, build: BUILD, level, event, ...detail });
+  console.log(JSON.stringify(record));
+  if (level === "alert") {
+    const delivered = notifyAlert(env, record);
+    return delivered;
+  }
+  return null;
 }
 
 export default {
@@ -1664,16 +1710,18 @@ export function recordLevelProblem(record) {
 
 /* Persist an integrity finding ONCE per distinct reason: the stamp is
    forensic (record.invalid never clears), the log line never floods, and
-   a repeat finding costs no write and no line. */
-async function stampInvalid(storage, record, intentId, reason, rid) {
+   a repeat finding costs no write and no line. The record is persisted
+   BEFORE the alert delivery is awaited (persist-before-notify): a dead or
+   slow ALERT_WEBHOOK_URL can never cost us the finding. */
+async function stampInvalid(env, storage, record, intentId, reason, rid) {
   const fresh = !record.invalid || record.invalid.reason !== reason;
   if (!fresh) return false;
   const now = Date.now();
   record.invalid = { reason, at: now };
-  logEvent("record_invalid", {
-    level: "error", rid, linkId: record.linkId, intentId: intentId ?? null, reason,
-  });
   await save(storage, record, now);
+  await logEvent("record_invalid", {
+    level: "alert", rid, linkId: record.linkId, intentId: intentId ?? null, reason,
+  }, env);
   return true;
 }
 
@@ -1682,7 +1730,7 @@ async function stampInvalid(storage, record, intentId, reason, rid) {
    Retry-After. Such a record does NOT self-heal (an operator inspects
    it), so repeats answer identically: no re-log, no re-write. */
 async function holdInvalid(env, storage, record, intentId, reason, rid) {
-  await stampInvalid(storage, record, intentId, reason, rid);
+  await stampInvalid(env, storage, record, intentId, reason, rid);
   return respond(503, {
     error: "Payment record needs operator reconciliation; retry later",
     code: "record_invalid",
@@ -1712,14 +1760,16 @@ async function quarantineStatus(env, storage, record, intent, problem, rid) {
   });
   const fresh = !record.invalid || record.invalid.reason !== problem;
   record.invalid = { reason: problem, at: now };
-  if (fresh) {
-    logEvent("record_invalid", {
-      level: "error", rid, linkId: record.linkId, intentId: intent.intentId, reason: problem,
-    });
-  }
   /* The state changed: persist unconditionally (even if this reason was
-     already stamped — the quarantine itself must survive). */
+     already stamped — the quarantine itself must survive). The save runs
+     BEFORE the alert delivery is awaited (persist-before-notify): a dead
+     or slow webhook can never cost us the quarantine. */
   await save(storage, record, now);
+  if (fresh) {
+    await logEvent("record_invalid", {
+      level: "alert", rid, linkId: record.linkId, intentId: intent.intentId, reason: problem,
+    }, env);
+  }
   return respond(503, {
     error: "Payment record needs operator reconciliation; retry later",
     code: "record_invalid",
@@ -2314,14 +2364,17 @@ async function verifyPayout(env, storage, record, intent, rid) {
   if (!ev.v) return persistHold("invoice_mismatch", true);
 
   /* Proven conflicts first: a fact read from ANY hash outranks a read
-     problem on another one (it would still be true after a retry). */
+     problem on another one (it would still be true after a retry). The
+     conflict is persisted (persistHold saves it) BEFORE the alert
+     delivery is awaited — persist-before-notify. */
   if (ev.v.reversal > 0 || ev.v.payouts >= 2) {
     const kind = ev.v.reversal > 0 ? "payout_reversed" : "double_payout";
     record.conflict = {
       kind, onChainStatus: record.onChainStatus, detectedAt: Date.now(),
     };
-    logEvent("payout_conflict", { level: "error", rid, linkId, intentId, kind });
-    return persistHold(kind, true);
+    const held = await persistHold(kind, true);
+    await logEvent("payout_conflict", { level: "alert", rid, linkId, intentId, kind }, env);
+    return held;
   }
   /* Read-quality gates, proven-problems first. */
   if (ev.v.mismatch > 0) return persistHold("evidence_mismatch", true);
@@ -2359,16 +2412,21 @@ async function verifyPayout(env, storage, record, intent, rid) {
   if (link.status === "PAID" || link.status === "CLAIMED") {
     /* The cross-provider race, closed: the invoice settled on the NEAR
        rail after the last Phase 4 poll — or between that poll and this
-       fresh read. Record/preserve the conflict, log it once in the
-       Phase 4 shape, hold for manual reconciliation: never verify. */
-    if (!record.conflict) {
+       fresh read. Record/preserve the conflict, hold for manual
+       reconciliation: never verify. Persist first (persistHold saves it),
+       then await the alert — persist-before-notify. */
+    const freshConflict = !record.conflict;
+    if (freshConflict) {
       record.conflict = { kind: "invoice_paid", onChainStatus: link.status, detectedAt: checkedAt };
-      logEvent("invoice_conflict", {
-        level: "error", rid, linkId, intentId,
-        previous, onChainStatus: link.status,
-      });
     }
-    return persistHold("invoice_paid", true);
+    const held = await persistHold("invoice_paid", true);
+    if (freshConflict) {
+      await logEvent("invoice_conflict", {
+        level: "alert", rid, linkId, intentId,
+        previous, onChainStatus: link.status,
+      }, env);
+    }
+    return held;
   }
 
   /* Stored facts vs fresh contract: merchant, amount (BigInt), token —
@@ -2434,19 +2492,20 @@ async function refreshInvoice(env, storage, record, intent, rid) {
   if ((link.status === "PAID" || link.status === "CLAIMED") && !record.conflict) {
     /* OPEN -> PAID/CLAIMED while a Tidepool intent is in flight: both
        rails may be paying the merchant. Detected once, logged once at
-       level error, persisted right here, surfaced as conflict on EVERY
-       response from now on — and NEVER cleared (an earlier conflict is
-       evidence, not state to overwrite). Observation continues, because
-       only observing the Tidepool leg tells us whether the double pay
-       actually happened; nothing in this Worker can stop that leg
-       (quote swaps have no cancel API — probed live; only the deadline
-       refund exists). */
+       level alert (webhook-eligible), persisted right here BEFORE the
+       alert delivery is awaited (persist-before-notify), surfaced as
+       conflict on EVERY response from now on — and NEVER cleared (an
+       earlier conflict is evidence, not state to overwrite). Observation
+       continues, because only observing the Tidepool leg tells us whether
+       the double pay actually happened; nothing in this Worker can stop
+       that leg (quote swaps have no cancel API — probed live; only the
+       deadline refund exists). */
     record.conflict = { kind: "invoice_paid", onChainStatus: link.status, detectedAt: checkedAt };
-    logEvent("invoice_conflict", {
-      level: "error", rid, linkId: record.linkId, intentId: intent.intentId,
-      previous, onChainStatus: link.status,
-    });
     await save(storage, record, checkedAt);
+    await logEvent("invoice_conflict", {
+      level: "alert", rid, linkId: record.linkId, intentId: intent.intentId,
+      previous, onChainStatus: link.status,
+    }, env);
   }
   return link.status;
 }
@@ -2481,7 +2540,7 @@ async function handleStatus(env, storage, payload) {
      state — verifyPayout's truthy-conflict hold keeps a malformed
      conflict blocking, so nothing here can slip toward VERIFIED. */
   const recProblem = recordLevelProblem(record);
-  if (recProblem) await stampInvalid(storage, record, intent.intentId, recProblem, rid);
+  if (recProblem) await stampInvalid(env, storage, record, intent.intentId, recProblem, rid);
   const itProblem = intentRecordProblem(intent);
   if (itProblem === "status_invalid") {
     return quarantineStatus(env, storage, record, intent, itProblem, rid);
@@ -2851,7 +2910,7 @@ async function handleCreate(env, storage, payload) {
     return holdInvalid(env, storage, record, null, "intents_invalid", rid);
   }
   const recProblem = recordLevelProblem(record);
-  if (recProblem) await stampInvalid(storage, record, null, recProblem, rid);
+  if (recProblem) await stampInvalid(env, storage, record, null, recProblem, rid);
   if (!Array.isArray(record.history)) record.history = [];
   if (record.activeIntentId !== null && record.activeIntentId !== undefined) {
     if (typeof record.activeIntentId !== "string" ||
