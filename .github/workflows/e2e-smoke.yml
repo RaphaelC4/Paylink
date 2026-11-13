@@ -1,0 +1,87 @@
+# Paylink browser E2E smoke — the deterministic PR layer of the E2E plan.
+#
+# What runs here: Playwright's `smoke` project (e2e/playwright.config.mjs) —
+# six spec areas (homepage/app loading, create interface, invoice rendering,
+# validation & error states, receipt rendering, mobile viewport) driven
+# against the COMMITTED frontend with every external dependency mocked
+# in-process: chain RPC, FX rates, the wallet-registry manifest, all four
+# Worker endpoints and the faucet origin. The suite therefore needs no
+# repository secrets, prints nothing that could contain one, performs no
+# wallet action, signs nothing, and deploys nothing. A catch-all route
+# aborts and records any request beyond that allowlist, and the specs
+# assert the list stays empty.
+#
+# The live-testnet layer is deliberately NOT here: e2e-testnet.yml runs
+# only via workflow_dispatch (a human pressing Run), and the steps that
+# need a human approving in a wallet are documented in e2e/TESTNET.md —
+# never automated, never faked.
+#
+# Conventions mirror ci.yml: actions pinned to full commit SHAs (release
+# tag in a trailing comment), Node 24, read-only permissions, no install
+# steps outside e2e/ (the JS suites themselves stay dependency-free —
+# this workflow adds a browser, not a build step).
+
+name: E2E smoke
+
+on:
+  pull_request:
+    branches:
+      - master
+      - staging
+  push:
+    branches:
+      - staging
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+# One run per branch; a newer push cancels the in-flight run of the same ref.
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Playwright smoke (mocked, no secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # nothing after checkout runs git; keep the token off disk
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: Install @playwright/test (exact pin, e2e/ owns its manifest)
+        # The repo has no root package.json by convention (workers/ keep
+        # their own); e2e/ is the second scoped manifest. package-lock.json
+        # is gitignored repo-wide, so this is npm install against an exact
+        # version pin (1.65.0) rather than npm ci — no dependency drift
+        # beyond what the pin already excludes.
+        working-directory: e2e
+        run: npm install --no-audit --no-fund
+
+      - name: Install Chromium (Playwright's own browser, nothing global)
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run the deterministic smoke suite (all network mocked)
+        working-directory: e2e
+        run: npx playwright test --project=smoke
+
+      # Test output only: HTML report, traces and failure screenshots from
+      # e2e/test-results. The suite has no secrets to leak by construction —
+      # every request it records is a fixture URL it wrote itself.
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: playwright-report-smoke
+          path: e2e/test-results
+          retention-days: 7
+          if-no-files-found: ignore

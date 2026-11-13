@@ -1,0 +1,14 @@
+{
+  "name": "paylink-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Paylink browser E2E layer: deterministic mocked PR smoke + manually dispatched read-only testnet checks. No production code, no secrets, no deployments.",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test --project=smoke",
+    "test:testnet": "playwright test --project=testnet"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.0"
+  }
+}

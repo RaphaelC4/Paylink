@@ -1,0 +1,110 @@
+# Paylink testnet E2E — MANUAL ONLY. There is no pull_request trigger, no
+# schedule and no push trigger: this workflow runs when, and only when, a
+# human dispatches it and types the acknowledgement exactly.
+#
+# What runs when dispatched: Playwright's `testnet` project — the
+# READ-ONLY slice of e2e/specs/testnet/. The committed frontend is served
+# locally and reads live NEAR testnet over public JSON-RPC view calls
+# (`status`, optionally `get_link` for a link you supply). It never
+# connects a wallet, never signs, never POSTs a transaction, reads no
+# repository secrets and prints none.
+#
+# What deliberately stays human (never automated here, documented step by
+# step in e2e/TESTNET.md):
+#   - creating a payment link with a DEDICATED, TESTNET-ONLY wallet —
+#     the approval happens in the wallet app, in a human's hand;
+#   - the payer's ONE wallet approval for an actual payment;
+#   - watching the keeper's PAID → CLAIMED settlement and the receipt;
+#   - the Tidepool quote → deposit → polling journey, whose ONLY success
+#     is status VERIFIED — SETTLED and every other provider claim are
+#     "still pending", never a pass.
+# Automating any of those would mean bypassing wallet security, which this
+# repository does not do. No cross-provider double-payment or reverse-order
+# race is ever attempted either — the Worker suites cover those logic paths
+# against mocks (workers/tidepool/test/).
+#
+# Actions are pinned to full commit SHAs, mirroring ci.yml; the release
+# tag stays in a trailing comment.
+
+name: E2E testnet (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      acknowledge:
+        description: "Type exactly: testnet-only (confirms a dedicated testnet wallet and read-only intent)"
+        required: true
+      link_id:
+        description: "Optional: a testnet payment link id to render read-only (no signing)"
+        required: false
+        default: ""
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+jobs:
+  read-only:
+    name: Read-only testnet checks (manual dispatch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Require the testnet-only acknowledgement
+        # Inputs arrive through env, never interpolated into the script, so
+        # an odd value can only fail the comparison — it cannot run code.
+        env:
+          ACK: ${{ inputs.acknowledge }}
+        run: |
+          set -euo pipefail
+          if [ "$ACK" != "testnet-only" ]; then
+            echo "::error::Dispatch refused: pass acknowledge = 'testnet-only'. This workflow never runs automatically, never connects a wallet and never signs."
+            exit 1
+          fi
+          echo "Acknowledged: read-only testnet checks, dedicated testnet wallet, no signing."
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # nothing after checkout runs git; keep the token off disk
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: Install @playwright/test (exact pin, e2e/ owns its manifest)
+        working-directory: e2e
+        run: npm install --no-audit --no-fund
+
+      - name: Install Chromium (Playwright's own browser, nothing global)
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run the read-only testnet checks (live view calls, no signing)
+        working-directory: e2e
+        run: npx playwright test --project=testnet
+        env:
+          TESTNET_LINK_ID: ${{ inputs.link_id }}
+
+      - name: Print the manual checklist (human-in-the-loop steps)
+        # The real payment journeys stay manual by design — this prints the
+        # pointer, it does not pretend they ran. Full procedure: e2e/TESTNET.md
+        run: |
+          cat <<'EOF'
+          ────────────────────────────────────────────────────────────────
+          CI ran only the READ-ONLY checks above. The payment journeys are
+          manual, by design — complete them against testnet yourself:
+            1. Dedicated testnet-only wallet (never a real-funds account);
+               fund it from the faucet. Never paste a seed, key or secret
+               into any terminal, log, issue or artifact.
+            2. Create a link in the UI and approve the creation in your
+               wallet (one human approval — never automated).
+            3. Pay it from a second testnet wallet: ONE wallet approval.
+               Watch the page flip to PAID, then the keeper's automatic
+               PAID → CLAIMED settlement, then the receipt + PDF.
+            4. Tidepool: quote → deposit → polling. Success means VERIFIED
+               only; SETTLED/other states are still pending — do not pay
+               again, especially on any conflict notice.
+            Full runbook: e2e/TESTNET.md
+          ────────────────────────────────────────────────────────────────
+          EOF
