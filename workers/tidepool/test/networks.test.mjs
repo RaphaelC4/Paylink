@@ -448,6 +448,49 @@ try {
     ok(pre.res.headers.get("x-request-id") === null, "preflight carries no correlation id");
   }
 
+  /* ── 9b. two-origin allowlist (production + stable staging alias) ── */
+  {
+    stub();
+    const STAGING = "https://paylink-git-staging-raphael-c4.vercel.app";
+    const env = baseEnv({ ALLOWED_ORIGIN: `${ORIGIN},${STAGING}` });
+
+    let r = await get("/networks", env, { Origin: ORIGIN });
+    ok(r.res.status === 200 && r.res.headers.get("access-control-allow-origin") === ORIGIN,
+      "two origins: production Origin -> 200, ACAO echoes it");
+    r = await get("/networks", env, { Origin: STAGING });
+    ok(r.res.status === 200 && r.res.headers.get("access-control-allow-origin") === STAGING,
+      "two origins: staging Origin -> 200, ACAO echoes it");
+    r = await get("/networks", env, { Origin: "https://evil.example" });
+    ok(r.res.status === 403 && r.out.error === "Origin not allowed",
+      "unapproved Origin -> 403 (server-side gate preserved)");
+    ok(r.res.headers.get("access-control-allow-origin") === ORIGIN,
+      "unapproved Origin: ACAO never matches it");
+    r = await get("/networks", env, { Origin: `${ORIGIN}.evil.example` });
+    ok(r.res.status === 403, "a superstring of an allowed origin does not match (exact match only)");
+    r = await get("/networks", env);
+    ok(r.res.status === 200 && r.res.headers.get("access-control-allow-origin") === ORIGIN,
+      "no Origin header -> 200, ACAO falls back to the first configured origin");
+    r = await get("/networks", baseEnv({ ALLOWED_ORIGIN: ` ${STAGING} , ${ORIGIN} ` }), { Origin: STAGING });
+    ok(r.res.status === 200, "allowlist entries are trimmed (whitespace around commas)");
+
+    /* Preflight mirrors actual requests exactly. */
+    let p = await method("OPTIONS", "/networks", env, { Origin: STAGING });
+    ok(p.res.status === 204 && p.res.headers.get("access-control-allow-origin") === STAGING,
+      "preflight: staging Origin -> 204, ACAO echoes it");
+    p = await method("OPTIONS", "/networks", env, { Origin: ORIGIN });
+    ok(p.res.status === 204 && p.res.headers.get("access-control-allow-origin") === ORIGIN,
+      "preflight: production Origin -> 204, ACAO echoes it");
+    p = await method("OPTIONS", "/networks", env, { Origin: "https://evil.example" });
+    ok(p.res.status === 204 && p.res.headers.get("access-control-allow-origin") === ORIGIN,
+      "preflight: unapproved Origin -> 204, ACAO never matches it");
+    p = await method("OPTIONS", "/networks", env);
+    ok(p.res.status === 204 && p.res.headers.get("access-control-allow-origin") === ORIGIN,
+      "preflight: no Origin -> 204, ACAO = first configured origin");
+    p = await method("OPTIONS", "/networks", baseEnv({ ALLOWED_ORIGIN: "*" }), { Origin: STAGING });
+    ok(p.res.status === 204 && p.res.headers.get("access-control-allow-origin") === "*",
+      "preflight: explicit * still echoes * (local-testing escape hatch preserved)");
+  }
+
   /* ── 10. invalid requests ── */
   {
     stub();

@@ -209,13 +209,13 @@ export default {
           error: scrub(String((err && err.message) || err), env),
         }, env);
       } catch { /* logging must never mask the original failure */ }
-      return json({ error: "internal error" }, 500, corsHeaders(env));
+      return json({ error: "internal error" }, 500, corsHeaders(request, env));
     }
   },
 };
 
 async function handle(request, env, ctx) {
-    const cors = corsHeaders(env);
+    const cors = corsHeaders(request, env);
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: cors });
     }
@@ -252,12 +252,13 @@ async function handle(request, env, ctx) {
        is charged to its IP before any real work happens. ──────────────── */
 
     /* 1. Origin — browsers always attach Origin to this cross-origin POST,
-          so the hosted frontend is gated; curl and the README examples send
-          none and pass. A "*" configuration (local testing) disables the
-          gate on purpose. */
-    const allowedOrigin = env.ALLOWED_ORIGIN || "*";
+          so the hosted frontend is gated against the ALLOWED_ORIGIN list
+          (comma-separated, exact match per entry); curl and the README
+          examples send none and pass. A "*" configuration (local testing)
+          disables the gate on purpose. */
+    const origins = allowedOrigins(env);
     const origin = request.headers.get("Origin");
-    if (allowedOrigin !== "*" && origin && origin !== allowedOrigin) {
+    if (!origins.includes("*") && origin && !origins.includes(origin)) {
       return reject(403, "Origin not allowed", "origin_not_allowed");
     }
 
@@ -476,9 +477,34 @@ const num = (v) => {
   return Number.isFinite(n) && n > 0 ? n : 0;
 };
 
-function corsHeaders(env) {
+/* Exact-match origin allowlist: ALLOWED_ORIGIN is a comma-separated list of
+   origins (production first). A request's Origin must equal one entry
+   exactly — never a substring, never a pattern. Unset or the literal "*"
+   keeps the documented local-testing behaviour: gate off, CORS echoes "*". */
+function allowedOrigins(env) {
+  const list = String((env && env.ALLOWED_ORIGIN) || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return list.length ? list : ["*"];
+}
+
+function corsHeaders(request, env) {
+  const origins = allowedOrigins(env);
+  const origin = request && request.headers ? request.headers.get("Origin") : null;
+  /* Echo the REQUESTING origin only when it is allowlisted — a foreign
+     origin never receives a matching ACAO, and "*" only ever comes from an
+     explicit "*" configuration. With no Origin header (curl, server-to-
+     server) the first configured origin is returned: no browser acts on an
+     ACAO it did not ask for, and single-origin deployments keep their exact
+     previous bytes. */
+  const acao = origins.includes("*")
+    ? "*"
+    : origin && origins.includes(origin)
+      ? origin
+      : origins[0];
   return {
-    "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN || "*",
+    "Access-Control-Allow-Origin": acao,
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Max-Age": "86400",

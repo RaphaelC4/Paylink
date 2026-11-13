@@ -2,10 +2,11 @@ name = "paylink-parse"
 main = "src/index.js"
 compatibility_date = "2026-10-01"
 
-# The browser origin allowed to call this Worker. Must match the hosted demo.
+# The browser origins allowed to call this Worker: production first, then the
+# stable staging Preview alias. Comma-separated, exact match per entry.
 # "*" works for local testing but lets any page spend your Gemini quota.
 [vars]
-ALLOWED_ORIGIN = "https://paylink-near.vercel.app"
+ALLOWED_ORIGIN = "https://paylink-near.vercel.app,https://paylink-git-staging-raphael-c4.vercel.app"
 # gemini-2.5-flash is deprecated and API access is limited to existing users.
 # 3.5 Flash-Lite is Google's own migration target and is free-tier eligible.
 GEMINI_MODEL = "gemini-3.5-flash-lite"

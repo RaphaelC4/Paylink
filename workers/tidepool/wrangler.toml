@@ -42,9 +42,10 @@ main = "src/index.js"
 compatibility_date = "2026-10-01"
 
 [vars]
-# The browser origin allowed to call this Worker. Must match the hosted demo.
+# The browser origins allowed to call this Worker: production first, then the
+# stable staging Preview alias. Comma-separated, exact match per entry.
 # "*" works for local testing but disables the origin gate entirely.
-ALLOWED_ORIGIN = "https://paylink-near.vercel.app"
+ALLOWED_ORIGIN = "https://paylink-near.vercel.app,https://paylink-git-staging-raphael-c4.vercel.app"
 # Tidepool's verified base URL (community testnet sandbox of the NEAR 1Click
 # API). The code defaults to the same value; set here so pointing at a
 # mirror is a config change, not a code change.

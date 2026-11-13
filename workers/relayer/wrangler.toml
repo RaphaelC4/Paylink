@@ -18,7 +18,7 @@ RPC_URLS = "https://near-testnet.drpc.org, https://testnet-rpc.intea.rs"
 CONTRACT_ID = "paylink-v2.testnet"
 TOKEN_ID = "usdc.tidepool-sandbox.testnet"
 RELAYER_ACCOUNT = "paylink-relay.testnet"
-ALLOWED_ORIGIN = "https://paylink-near.vercel.app"
+ALLOWED_ORIGIN = "https://paylink-near.vercel.app,https://paylink-git-staging-raphael-c4.vercel.app"
 
 # M-07 layer 2 — durable cross-isolate burst cap. namespace_id "2002" is
 # unique per account policy: workers sharing a namespace share one counter.

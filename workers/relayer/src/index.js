@@ -904,10 +904,34 @@ const json = (obj, status = 200, headers = {}) =>
     headers: { "content-type": "application/json", ...headers },
   });
 
-function corsHeaders(env) {
-  const origin = env.ALLOWED_ORIGIN || "*";
+/* Exact-match origin allowlist: ALLOWED_ORIGIN is a comma-separated list of
+   origins (production first). A request's Origin must equal one entry
+   exactly — never a substring, never a pattern. Unset or the literal "*"
+   keeps the documented behaviour: CORS echoes "*". This Worker stays
+   CORS-only (no 403 gate) by design — a script ignores the header. */
+function allowedOrigins(env) {
+  const list = String((env && env.ALLOWED_ORIGIN) || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return list.length ? list : ["*"];
+}
+
+function corsHeaders(request, env) {
+  const origins = allowedOrigins(env);
+  const origin = request && request.headers ? request.headers.get("Origin") : null;
+  /* Echo the REQUESTING origin only when it is allowlisted — a foreign
+     origin never receives a matching ACAO, and "*" only ever comes from an
+     explicit "*" configuration. With no Origin header the first configured
+     origin is returned (no browser acts on an ACAO it did not ask for, and
+     single-origin deployments keep their exact previous bytes). */
+  const acao = origins.includes("*")
+    ? "*"
+    : origin && origins.includes(origin)
+      ? origin
+      : origins[0];
   return {
-    "access-control-allow-origin": origin,
+    "access-control-allow-origin": acao,
     "access-control-allow-methods": "GET, POST, OPTIONS",
     "access-control-allow-headers": "content-type",
   };
@@ -927,7 +951,7 @@ const track = (ctx, p) => {
 
 export default {
   async fetch(request, env, ctx) {
-    const cors = corsHeaders(env);
+    const cors = corsHeaders(request, env);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
     const url = new URL(request.url);
 

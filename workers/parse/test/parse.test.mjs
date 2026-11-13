@@ -275,6 +275,48 @@ try {
     ok(r.res.status === 200, "ALLOWED_ORIGIN=* disables the gate (local testing)");
   }
 
+  /* ── 7b. two-origin allowlist (production + stable staging alias) ── */
+  {
+    const STAGING = "https://paylink-git-staging-raphael-c4.vercel.app";
+    const env = baseEnv({ ALLOWED_ORIGIN: `${ORIGIN},${STAGING}` });
+
+    let r = await post({ text: "hi" }, env, { Origin: ORIGIN });
+    ok(r.res.status === 200 && r.res.headers.get("access-control-allow-origin") === ORIGIN,
+      "two origins: production Origin -> 200, ACAO echoes it");
+    r = await post({ text: "hi" }, env, { Origin: STAGING });
+    ok(r.res.status === 200 && r.res.headers.get("access-control-allow-origin") === STAGING,
+      "two origins: staging Origin -> 200, ACAO echoes it");
+    r = await post({ text: "hi" }, env, { Origin: "https://evil.example" });
+    ok(r.res.status === 403 && r.res.headers.get("access-control-allow-origin") === ORIGIN,
+      "unapproved Origin -> 403, ACAO never matches it");
+    r = await post({ text: "hi" }, env, { Origin: `${ORIGIN}.evil.example` });
+    ok(r.res.status === 403, "a superstring of an allowed origin does not match (exact match only)");
+    r = await post({ text: "hi" }, env);
+    ok(r.res.status === 200 && r.res.headers.get("access-control-allow-origin") === ORIGIN,
+      "no Origin header -> 200, ACAO falls back to the first configured origin");
+    r = await post({ text: "hi" }, baseEnv({ ALLOWED_ORIGIN: ` ${STAGING} , ${ORIGIN} ` }), { Origin: STAGING });
+    ok(r.res.status === 200, "allowlist entries are trimmed (whitespace around commas)");
+
+    /* Preflight mirrors actual requests exactly. */
+    const pre = (headers, e = env) =>
+      worker.fetch(new Request("https://parse.test/", { method: "OPTIONS", headers }), e);
+    let p = await pre({ Origin: ORIGIN });
+    ok(p.status === 204 && p.headers.get("access-control-allow-origin") === ORIGIN,
+      "preflight: production Origin -> 204, ACAO echoes it");
+    p = await pre({ Origin: STAGING });
+    ok(p.status === 204 && p.headers.get("access-control-allow-origin") === STAGING,
+      "preflight: staging Origin -> 204, ACAO echoes it");
+    p = await pre({ Origin: "https://evil.example" });
+    ok(p.status === 204 && p.headers.get("access-control-allow-origin") === ORIGIN,
+      "preflight: unapproved Origin -> 204, ACAO never matches it");
+    p = await pre({});
+    ok(p.status === 204 && p.headers.get("access-control-allow-origin") === ORIGIN,
+      "preflight: no Origin -> 204, ACAO = first configured origin");
+    p = await pre({ Origin: STAGING }, baseEnv({ ALLOWED_ORIGIN: "*" }));
+    ok(p.status === 204 && p.headers.get("access-control-allow-origin") === "*",
+      "preflight: explicit * still echoes * (local-testing escape hatch preserved)");
+  }
+
   /* ── 8. rate limit: per-isolate fallback (no binding provisioned) ── */
   {
     const env = baseEnv();
