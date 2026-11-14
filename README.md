@@ -55,6 +55,8 @@ A real run on `https://paylink-near.vercel.app` (testnet): payee `tstst.testnet`
 | 6. Payee sees the same link as CLAIMED, straight from contract state | ![Payee evidence](docs/screenshots/06-payee-evidence-paid.png) |
 | 7. Payee's activity tab: "Payment received" / "Released to you" | ![Payee activity](docs/screenshots/07-payee-activity-released.png) |
 
+The link in these screenshots is `lnk-sn3hrey6`: open `https://paylink-near.vercel.app/#pay/lnk-sn3hrey6` to see it CLAIMED, read from contract state. On-chain proof: the create, pay and claim transactions in the table below, and the live `cancel_link` transaction [`BFfwkup8JuSBWKKR3GkcgcfFufLdUJT8ibuWF3BDfD1U`](https://testnet.nearblocks.io/txns/BFfwkup8JuSBWKKR3GkcgcfFufLdUJT8ibuWF3BDfD1U).
+
 ## The problem
 
 Getting paid across borders still costs money and time.
