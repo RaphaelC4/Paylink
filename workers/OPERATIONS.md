@@ -122,6 +122,19 @@ plus `rid` on every request-scoped line). **Deployed** as
 migration `v1` / SQLite-backed `PaymentIntent`); these rows describe the
 code running in `workers/tidepool/`. Routes are `GET /networks`,
 `POST /quote`, `GET /status` (there is no health route in this scope).
+`GET /status` has two forms: `?id=<intentId>&linkId=<linkId>` — the full
+capability read — and `?linkId=<linkId>` alone — the public **settlement
+summary** `{ok, settlement:{intentId, status, depositSeenAt, verifiedAt,
+payoutTx[]}, onChainStatus, onChainStatusCheckedAt}` (404
+`settlement_not_found` when the invoice has no record or no intents).
+The summary exists because a cross-chain payout pays `link.creator`
+directly and leaves the invoice `OPEN` by design (only `ft_on_transfer`
+writes it): it is a record read with **zero upstream calls**, keyed by
+the public invoice id, silent on success, and never carries deposit
+address, memo, refund, signature, correlation id, swapDetails or
+history. `payoutTx` is served only once the intent is `VERIFIED` — each
+entry re-validated as a 32-byte base58 NEAR hash — because before that
+the captured candidates are not proof.
 
 | Event | Level | Meaning / key fields |
 |-------|-------|----------------------|
@@ -134,7 +147,7 @@ code running in `workers/tidepool/`. Routes are `GET /networks`,
 | `quote_upstream_error` | error (`warn` for `unmapped_status`) | A read failed on the quote path — `rid`, `linkId`, `target` (`contract`\|`tokens`\|`quote`\|`status`), `kind`, `status`, `detail` (scrubbed, bounded). `status` here is the reconcile path (POST /quote re-reading `/v0/status`), not GET /status. |
 | `intent_transition` | info | State machine moved — `rid`, `linkId`, `intentId`, `from`, `to`, `reason` (e.g. `creation_started`, `quote_verified`, `awaiting_deposit`, `tidepool_SUCCESS`, `no_deposit_past_deadline`, `status_resolved`). One line per accepted transition; duplicates are refused silently. |
 | `status_ok` | info | A `GET /status` poll that **changed** something — `rid`, `ip`, `linkId`, `intentId`, `status`, `tidepoolStatus`, `conflict`, `ms`. Unchanged polls are silent by design: a 2-second watcher can never burn the log budget (the transition itself already logged `intent_transition`). |
-| `status_rejected` | info | `GET /status` request rejected — `rid`, `ip`, `status`, `linkId`, `code`, `reason`. Fires only for 400/403/404 (`invalid_link_id`, `invalid_intent_id`, `origin_not_allowed`, `intent_not_found`); cooldown 503s never log here (their cause already logged `status_upstream_error`). |
+| `status_rejected` | info | `GET /status` request rejected — `rid`, `ip`, `status`, `linkId`, `code`, `reason`. Fires only for 400/403/404 (`invalid_link_id`, `invalid_intent_id`, `origin_not_allowed`, `intent_not_found`, `settlement_not_found`); cooldown 503s never log here (their cause already logged `status_upstream_error`). Settlement-summary reads (linkId-only, no `id`) that succeed are silent, same log-budget rule as `status_ok`. |
 | `status_upstream_error` | error (`warn` for the contract leg, `unmapped_status`, `transition_refused`) | A read failed inside a status cycle — `rid`, `linkId`, `intentId`, `target` (`status`\|`contract`), `kind`, `status`. The contract leg failing never fails the response (last known state kept, `onChainCheckedAt` not advanced); the status leg failing parks the intent in RECONCILE with a persisted cooldown. Never logs a raw upstream body on this path. |
 | `invoice_conflict` | **alert** | Cross-provider double-pay risk detected: the NEAR invoice went `PAID`/`CLAIMED` while a Tidepool intent was still in flight — `rid`, `linkId`, `intentId`, `previous`, `onChainStatus`. Logged **once** per record; the `conflict` flag then rides on every `/status` response and polling continues (only observation reveals whether the double pay actually happened). During Phase 5 verification the same line fires from the fresh pre-transition contract read (same shape, same once-per-record rule). Alert delivery: see the note below the table. |
 | `payout_verify_ok` | info | Phase 5: `SETTLED → VERIFIED` — authoritative NEAR tx evidence proved exactly one successful `ft_transfer` of the invoice amount to the merchant on the configured USDC token, and the fresh `get_link` immediately before the move still authorized it — `rid`, `linkId`, `intentId`, `attempts` (prior held attempts). One line per verification; `intent_transition` also fires for the move itself. |
@@ -246,8 +259,12 @@ endpoint, no vendor lock-in, no cost.
 * Use a **private** destination (DM, private channel, tokened ntfy topic) —
   the Tidepool alert payload includes `linkId` + `intentId`, which together
   are the `GET /status` **read capability** for that payment. The response
-  is read-only and response-minimised (no address, amount or hash), but it
+  is read-only and response-minimised (no address or amount; hashes only
+  in the linkId-only settlement summary, and only post-`VERIFIED`), but it
   exposes the payment's conflict/hold state to anyone holding the ids.
+  `linkId` alone — what any invoice viewer may hold — yields only the
+  settlement summary (deposit date, intent id, on-chain status), never
+  the full status body.
 * Nothing else sensitive travels: the payload is the scrubbed log line
   itself (machine reason codes only), and the webhook URL — which may embed
   the destination's token — is a secret value that is never logged.

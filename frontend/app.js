@@ -16,7 +16,9 @@ import {
   tpToggleHtml,
   tpToggle,
   tpReceiptFacts,
-} from "./tidepool.js?v=20261112b";
+  tpParseSettlement,
+  tpStateView,
+} from "./tidepool.js?v=20261114a";
 /* Verifiable receipt — pure module: the PDF bytes behind the one-click
    download, plus the one sentence every completed payment carries. */
 import { buildReceiptPdf, receiptFilename, RECEIPT_SENTENCE } from "./receipt.js?v=20261112b";
@@ -1053,6 +1055,8 @@ async function renderReady(id) {
       <span class="${STATUS_PILL[st]}">${st === "OPEN" ? "UNPAID" : st}</span>
     </div>
 
+    <div id="settleBox" data-link="${esc(link.link_id)}" hidden></div>
+
     <div class="share-grid">
       <div class="share-main">
         ${shareUrlField(payUrl)}
@@ -1081,6 +1085,118 @@ async function renderReady(id) {
       <button class="btn btn-sm ghost" type="button" data-go="create"><span>Create another</span></button>
       <button class="btn btn-sm ghost" type="button" data-go="ledger"><span>My links</span></button>
     </div>`;
+  paintSettlement(card, link, !!accountId && accountId === link.creator);
+}
+
+/* ─────────────────────── cross-chain settlement visibility ─────────────
+   A verified cross-chain payment pays link.creator DIRECTLY (the quote's
+   recipient — Phase 5 proves that payout on NEAR), and only
+   ft_on_transfer ever writes the contract, so the invoice stays OPEN by
+   design: invoice surfaces read the chain only and would otherwise keep
+   calling a satisfied invoice UNPAID. GET /status?linkId=… (no
+   capability id) answers a minimal, read-only settlement summary with
+   zero upstream calls; tpParseSettlement allowlists the fields, and
+   capability-only data (deposit address, memo, refund, signature,
+   upstream bodies) never reaches this code. */
+
+const SETTLE_TTL_MS = 30_000;
+const settlementCache = new Map(); // linkId -> { at, data }
+
+async function getSettlement(linkId) {
+  const ep = (CONFIG.tidepoolWorker && CONFIG.tidepoolWorker.endpoint) || "";
+  if (!ep || !linkId) return null;
+  const hit = settlementCache.get(linkId);
+  if (hit && Date.now() - hit.at < SETTLE_TTL_MS) return hit.data;
+  let data = null;
+  try {
+    const res = await fetch(`${ep}/status?linkId=${encodeURIComponent(linkId)}`, {
+      headers: { accept: "application/json" },
+    });
+    if (res.ok) data = tpParseSettlement(await res.json().catch(() => null));
+  } catch { /* offline / blocked: the invoice renders exactly as before */ }
+  settlementCache.set(linkId, { at: Date.now(), data });
+  return data;
+}
+
+/* The block itself: pure markup over the three facts the Worker serves
+   — deposit date, intent id, verified payout tx hashes. The on-chain
+   pill stays untouched and honest; this sits BESIDE it, never instead
+   of it. Three cases: paid on both rails (double-pay warning), paid via
+   cross-chain, or an attempt still in flight. */
+function settlementHtml(s, link, mine) {
+  const verified = s.status === "VERIFIED";
+  const onChain = s.onChainStatus || statusOf(link);
+  const bothRails = verified && (onChain === "PAID" || onChain === "CLAIMED");
+  const view = tpStateView(s.status);
+  const headline = bothRails
+    ? "Paid on both rails — reconcile this invoice"
+    : verified
+      ? "Paid via cross-chain"
+      : "Cross-chain payment";
+  const right = verified ? "verified" : esc(view ? view.label : "Status unavailable");
+  const rows = [
+    `<div class="row"><span>deposit</span><strong>${
+      s.depositSeenAt ? esc(new Date(s.depositSeenAt).toLocaleString()) : "not seen yet"
+    }</strong></div>`,
+    `<div class="row"><span>attempt</span><strong><code>${esc(s.intentId)}</code></strong></div>`,
+  ];
+  if (s.payoutTx.length) {
+    rows.push(`<div class="row"><span>payout tx</span><strong>${s.payoutTx
+      .map((h) => `<a href="${esc(CONFIG.explorer)}/transactions/${esc(h)}" target="_blank" rel="noopener">${esc(truncate(h, 10, 6))}</a>`)
+      .join(" &middot; ")}</strong></div>`);
+  }
+  let note = "";
+  if (bothRails) {
+    note = `<p class="pay-fee">This invoice was also paid through the NEAR rail — treat it as a double payment and reconcile before anything else.</p>`;
+  } else if (verified && onChain === "OPEN") {
+    note = mine
+      ? `<p class="pay-fee">You're the payee: the invoice is still <strong>OPEN</strong> on chain — cancel it or let it expire so nobody can pay it twice.</p>`
+      : `<p class="pay-fee">The invoice is still <strong>OPEN</strong> on chain: cross-chain payments settle directly to the payee, so only NEAR-rail payments flip it.</p>`;
+  }
+  return `<div class="tx-line ${verified ? "ok" : "pending"}" role="status">
+    <div class="row"><span>${esc(headline)}</span><strong>${right}</strong></div>
+    ${rows.join("\n    ")}
+  </div>${note}`;
+}
+
+/* Paint the block into the card's #settleBox once the lookup lands.
+   Scoped to the owning card (ready and pay both carry one, and both sit
+   in the DOM), and the dataset link guard makes a stale response from an
+   earlier render a no-op — cards repaint often (wallet events, the
+   status timer), and a settlement belongs to exactly one invoice. */
+async function paintSettlement(card, link, mine) {
+  const box = card.querySelector("#settleBox");
+  if (!box || box.dataset.link !== link.link_id) return;
+  const s = await getSettlement(link.link_id);
+  const box2 = card.querySelector("#settleBox");
+  if (!box2 || box2.dataset.link !== link.link_id) return;
+  if (!s) return;
+  box2.hidden = false;
+  box2.innerHTML = settlementHtml(s, link, mine);
+}
+
+/* Dashboard rows: the discrepancy only exists on invoices the chain
+   still calls unpaid (OPEN / EXPIRED / CANCELLED), so those — and only
+   those — get a chip; a paid row already shows its money. Bounded and
+   cached, so a large ledger never becomes a request storm. */
+async function paintLedgerSettlements(rows, list) {
+  const targets = rows
+    .filter((l) => { const st = statusOf(l); return st !== "PAID" && st !== "CLAIMED"; })
+    .slice(0, 12);
+  await Promise.all(targets.map(async (l) => {
+    const s = await getSettlement(l.link_id);
+    if (!s) return;
+    const row = Array.from(list.querySelectorAll(".row-main")).find((r) => r.dataset.link === l.link_id);
+    if (!row) return; // re-rendered (filter/sort) under us
+    const cell = row.querySelector(".c-status");
+    if (!cell || cell.querySelector(".xchain")) return;
+    const view = tpStateView(s.status);
+    const title = s.status === "VERIFIED"
+      ? `paid via cross-chain${s.depositSeenAt ? ` — deposit ${new Date(s.depositSeenAt).toLocaleString()}` : ""} — ${s.intentId}`
+      : `cross-chain attempt: ${view ? view.label : s.status} — ${s.intentId}`;
+    cell.insertAdjacentHTML("beforeend",
+      ` <span class="pill xchain${s.status === "VERIFIED" ? "" : " pending"}" title="${esc(title)}">cross-chain</span>`);
+  }));
 }
 
 /* ────────────────────────────────────────────────────────── AI parsing ── */
@@ -1345,6 +1461,7 @@ function renderLedger() {
     return;
   }
   list.innerHTML = visible.map(ledgerRow).join("");
+  paintLedgerSettlements(visible, list);
 }
 
 function ledgerRow(link) {
@@ -1652,6 +1769,8 @@ async function renderPay(id) {
 
     ${timeline(st)}
 
+    <div id="settleBox" data-link="${esc(link.link_id)}" hidden></div>
+
     <div class="pay-actions" id="payActions"></div>
 
     <div id="tpWrap"></div>
@@ -1677,6 +1796,7 @@ async function renderPay(id) {
      part of syncTidepool runs synchronously to this line. */
   syncTidepool(link, { st, mine, accountId, amountLabel: `${amount} ${CONFIG.token.symbol}` });
   renderPayActions(link, st);
+  paintSettlement(card, link, mine);
   if (st === "OPEN" && !mine) wireFundRail(link);
 }
 

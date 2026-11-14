@@ -495,9 +495,12 @@ try {
     ok(noParams.res.status === 400 && noParams.out.code === "invalid_link_id",
       "missing linkId -> 400 invalid_link_id");
 
+    /* linkId WITHOUT the capability id is the settlement summary (form b):
+       no record exists in this env, so the honest answer is its own 404 —
+       never the full status body, never an upstream call. */
     const noId = await send("GET", `/status?linkId=${LINK_ID}`, undefined, env);
-    ok(noId.res.status === 400 && noId.out.code === "invalid_intent_id",
-      "missing id -> 400 invalid_intent_id");
+    ok(noId.res.status === 404 && noId.out.code === "settlement_not_found",
+      "missing id -> settlement lookup: 404 settlement_not_found (no record)");
 
     const badId = await send("GET", `/status?id=not-an-id&linkId=${LINK_ID}`, undefined, env);
     ok(badId.res.status === 400 && badId.out.code === "invalid_intent_id",
@@ -1098,6 +1101,87 @@ try {
     const r2 = await getStatus(env2, SEED_ID);
     ok(r2.res.status === 200 && state2.calls.status.length === 1,
       "inside the 24 h window a read still happens");
+  }
+
+  /* ── 17b. settlement summary: GET /status?linkId=… (no capability id) ── */
+  {
+    const state = stubNet();
+    const env = makeEnv();
+    const depositTs = clock - 300_000;
+    const settleTs = clock - 240_000;
+    const verifiedTs = clock - 60_000;
+    const payoutTx = b58encode(new Uint8Array(32).fill(9));
+    env.INTENT_DO.seed(LINK_ID, seedRecord([seedIntent({
+      status: "VERIFIED",
+      depositObserved: true,
+      payoutHashes: [payoutTx, "not-a-hash", 42], // non-hashes must be filtered on the way out
+      updatedAt: verifiedTs,
+    })], {
+      history: [
+        { ts: clock - 400_000, intentId: SEED_ID, from: "QUOTE_ISSUED", to: "AWAITING_DEPOSIT", reason: "awaiting_deposit" },
+        { ts: depositTs, intentId: SEED_ID, from: "AWAITING_DEPOSIT", to: "DEPOSIT_SEEN", reason: "deposit_seen" },
+        { ts: settleTs, intentId: SEED_ID, from: "DEPOSIT_SEEN", to: "SETTLING", reason: "settlement_detected" },
+        { ts: verifiedTs, intentId: SEED_ID, from: "SETTLED", to: "VERIFIED", reason: "payout_verified" },
+      ],
+    }));
+
+    const before = logMark();
+    const r = await send("GET", `/status?linkId=${LINK_ID}`, undefined, env);
+    ok(r.res.status === 200 && r.out.ok === true, "linkId-only GET /status -> 200 settlement summary");
+    ok(JSON.stringify(Object.keys(r.out)) ===
+      JSON.stringify(["ok", "settlement", "onChainStatus", "onChainStatusCheckedAt"]),
+      "settlement response keys are exactly the allowlist");
+    ok(r.out.settlement && JSON.stringify(Object.keys(r.out.settlement)) ===
+      JSON.stringify(["intentId", "status", "depositSeenAt", "verifiedAt", "payoutTx"]),
+      "settlement keys are exactly the allowlist");
+    ok(r.out.settlement.intentId === SEED_ID && r.out.settlement.status === "VERIFIED",
+      "intent id + status echo the settled record");
+    ok(r.out.settlement.depositSeenAt === new Date(depositTs).toISOString(),
+      "deposit date = the earliest deposit-family transition");
+    ok(r.out.settlement.verifiedAt === new Date(verifiedTs).toISOString(),
+      "verified date = the VERIFIED transition");
+    ok(JSON.stringify(r.out.settlement.payoutTx) === JSON.stringify([payoutTx]),
+      "payout hash served once VERIFIED; non-hash junk filtered out");
+    ok(r.out.onChainStatus === "OPEN" && typeof r.out.onChainStatusCheckedAt === "string",
+      "on-chain status rides along (still honestly OPEN)");
+    ok(state.calls.status.length === 0 && state.calls.rpc.length === 0,
+      "the settlement lookup makes ZERO upstream calls");
+    ok(eventCount("status_ok", before) === 0, "settlement reads stay silent (log budget)");
+    ok(!ADDR_RE.test(r.text) && !r.text.includes("depositAddress") && !r.text.includes("correlationId") &&
+       !r.text.includes("swapDetails") && !r.text.includes('"history"') && !r.text.includes("ed25519:"),
+      "the settlement body carries no capability-only field");
+
+    /* An intent that never saw a deposit answers honestly. */
+    const env2 = makeEnv();
+    env2.INTENT_DO.seed(LINK_ID, seedRecord([seedIntent({
+      status: "AWAITING_DEPOSIT",
+      payoutHashes: [payoutTx],
+    })]));
+    const r2 = await send("GET", `/status?linkId=${LINK_ID}`, undefined, env2);
+    ok(r2.res.status === 200 && r2.out.settlement.depositSeenAt === null &&
+      r2.out.settlement.verifiedAt === null && r2.out.settlement.payoutTx.length === 0,
+      "no deposit yet: null dates and empty payoutTx (hashes only after VERIFIED)");
+
+    /* Unknown invoice, and a record holding no intents. */
+    const env3 = makeEnv();
+    const r3 = await send("GET", `/status?linkId=${OTHER_LINK_ID}`, undefined, env3);
+    ok(r3.res.status === 404 && r3.out.code === "settlement_not_found",
+      "unknown linkId -> 404 settlement_not_found");
+
+    const env4 = makeEnv();
+    env4.INTENT_DO.seed(LINK_ID, seedRecord([seedIntent()], { intents: [] }));
+    const r4 = await send("GET", `/status?linkId=${LINK_ID}`, undefined, env4);
+    ok(r4.res.status === 404 && r4.out.code === "settlement_not_found",
+      "record with no intents -> 404 settlement_not_found");
+
+    /* The capability form is untouched: with the id, the FULL body. */
+    const r5 = await getStatus(env, SEED_ID);
+    ok(r5.res.status === 200 && r5.out.intent && r5.out.intent.intentId === SEED_ID &&
+      typeof r5.out.intent.lastReason === "string",
+      "capability form unchanged: full intent body when id is present");
+    ok(JSON.stringify(Object.keys(r5.out)) ===
+      JSON.stringify(["ok", "intent", "onChainStatus", "onChainStatusCheckedAt", "conflict", "changed"]),
+      "capability response keys still the original allowlist");
   }
 
   /* ── 18. sweeps: sensitive data, envelope, logging budget ── */

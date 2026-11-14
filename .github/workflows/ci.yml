@@ -76,6 +76,7 @@ jobs:
             frontend/test/tidepool-deposit.test.mjs \
             frontend/test/tidepool-regression.test.mjs \
             frontend/test/receipt.test.mjs \
+            frontend/test/settlement.test.mjs \
             workers/tidepool/src/index.js \
             workers/tidepool/test/networks.test.mjs \
             workers/tidepool/test/quote.test.mjs \
@@ -232,6 +233,11 @@ jobs:
       # Verifiable receipt — PDF bytes, single success surface, card wiring.
       - name: node frontend/test/receipt.test.mjs
         run: node frontend/test/receipt.test.mjs
+
+      # Settlement visibility — GET /status?linkId=… settlement summary:
+      # parser allowlist, payout-tx gating, card/ledger painting contracts.
+      - name: node frontend/test/settlement.test.mjs
+        run: node frontend/test/settlement.test.mjs
 
   # ── item 9 (parse worker tests) ──────────────────────────────────────────
   parse:

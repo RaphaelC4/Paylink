@@ -932,6 +932,11 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
 .pill.paid{background:var(--bg);border-color:var(--ink);color:var(--ink)}
 .pill.claimed{background:var(--good-bg);border-color:var(--good-line);color:var(--good-ink)}
 .pill.expired{background:var(--warn-bg);border-color:var(--warn-line);color:var(--warn-ink)}
+/* cross-chain settlement chip (ledger rows): green once VERIFIED, accent
+   while the attempt is still in flight — its title carries the deposit
+   date and the intent id, the invoice card carries the full block */
+.pill.xchain{background:var(--good-bg);border-color:var(--good-line);color:var(--good-ink)}
+.pill.xchain.pending{background:var(--accent);border-color:var(--accent-line);color:var(--accent-ink)}
 /* the key inside the pay card's pill: says WHICH status this is (the
    invoice's), so the chip can never be misread as the payment outcome */
 .pill-k{

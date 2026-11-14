@@ -87,7 +87,9 @@
  *
  * ── GET /status ── (Phase 4: deposit tracking + reconciliation)
  *
- *   GET /status?id=<intentId>&linkId=<linkId>
+ * Two forms, distinguished by the presence of the capability id:
+ *
+ * (a) GET /status?id=<intentId>&linkId=<linkId>   — the full capability read
  *   -> 200 { ok:true, intent:{intentId, linkId, status, tidepoolStatus,
  *            quoteDeadline, lastReason, createdAt, updatedAt},
  *            onChainStatus, onChainStatusCheckedAt, conflict, changed }
@@ -99,19 +101,49 @@
  *   -> 404 { code: intent_not_found } / 400 invalid_intent_id |
  *           invalid_link_id
  *
+ * (b) GET /status?linkId=<linkId>   — the settlement summary (NO
+ *     capability id). A cross-chain payout pays link.creator DIRECTLY
+ *     (the quote's recipient — Phase 5 proves that payout on NEAR) and
+ *     the contract only flips via ft_on_transfer, so a VERIFIED
+ *     cross-chain payment leaves the invoice OPEN by design (Phase 5
+ *     treats PAID during an intent as the invoice_conflict double-pay
+ *     alarm). Invoice surfaces read the contract only, so without this
+ *     lookup they would keep calling a satisfied invoice unpaid.
+ *     Read-only, ZERO upstream calls, keyed by the PUBLIC linkId:
+ *   -> 200 { ok:true, settlement:{intentId, status, depositSeenAt,
+ *            verifiedAt, payoutTx[]}, onChainStatus,
+ *            onChainStatusCheckedAt }
+ *          depositSeenAt = earliest deposit-family transition timestamp
+ *          (DEPOSIT_SEEN / SETTLING / SETTLED) for the settled intent;
+ *          verifiedAt   = the VERIFIED transition (intent updatedAt as
+ *                         the bounded-history fallback); both null when
+ *                         no such transition is in history.
+ *          payoutTx     = the captured payout hashes, served ONLY once
+ *                         the intent is VERIFIED — before that they are
+ *                         candidates, not proof — and each one re-checked
+ *                         as a 32-byte base58 NEAR hash on the way out.
+ *          the settled (VERIFIED) intent wins; otherwise the record's
+ *          active intent answers honestly (depositSeenAt null).
+ *   -> 404 { code: settlement_not_found }   no record for this linkId,
+ *          or a record holding no intents
+ *
  * Authority: the browser never supplies a deposit address or any
  * upstream fact — the stored record's own deposit address is the only
- * address ever queried. The capability to read a payment is possession
- * of the intentId (pi_ + 64 random bits, returned only to whoever
- * requested the quote); linkId merely routes to the right Durable Object
- * and must match the record that owns that intent, so an id from another
- * invoice is a 404. Any extra query parameter (e.g. depositAddress=…)
- * is ignored, never believed.
+ * address ever queried. The capability to read a payment's FULL status
+ * is possession of the intentId (pi_ + 64 random bits, returned only to
+ * whoever requested the quote); linkId merely routes to the right
+ * Durable Object and must match the record that owns that intent, so an
+ * id from another invoice is a 404. Form (b) is the deliberate, minimal
+ * extension for invoice viewers that hold only the public invoice id:
+ * it exposes the settlement summary above and NOTHING else. Any extra
+ * query parameter (e.g. depositAddress=…) is ignored, never believed.
  *
- * Response minimisation: no deposit address, no depositMemo, no
- * signature, no correlation id, no swapDetails / tx hashes, no history,
- * no raw upstream body. tidepoolStatus is returned only when it is one
- * of the seven documented Tidepool values. conflict is null or
+ * Response minimisation (both forms): no deposit address, no
+ * depositMemo, no signature, no correlation id, no swapDetails, no
+ * history, no raw upstream body. The capability form (a) additionally
+ * never returns tx hashes — payout hashes exist only in form (b), only
+ * after VERIFIED. tidepoolStatus is returned only when it is one of the
+ * seven documented Tidepool values. conflict is null or
  * "invoice_paid" (see below).
  *
  * Polling (Tidepool documents no webhooks): one GET performs at most ONE
@@ -2795,6 +2827,105 @@ async function handleStatus(env, storage, payload) {
 }
 
 /* ── GET /status worker handler ──────────────────────────────────────── */
+/* ── GET /status WITHOUT the capability id: the settlement summary ──────
+   (form b in the header). Invoice surfaces read the contract, and only
+   ft_on_transfer ever writes it: a cross-chain payout pays link.creator
+   DIRECTLY and Phase 5 verifies that payout on NEAR, so a VERIFIED
+   cross-chain payment leaves the invoice OPEN by design — without this
+   lookup every invoice viewer would keep calling a satisfied invoice
+   UNPAID (the visibility defect this endpoint closes).
+
+   Keyed by the PUBLIC linkId, read-only, ZERO upstream calls (record
+   read only): it exposes exactly the settlement facts an invoice viewer
+   needs — when the deposit was seen, which intent saw it, and (only
+   once VERIFIED) the payout hashes that verification proved — plus the
+   last known on-chain status. Everything capability-gated stays gated:
+   no deposit address, no memo, no refund address, no signature, no
+   correlation id, no swapDetails, no history array, no raw upstream
+   body. Routine reads are silent (same log-budget rule as status_ok). */
+
+/* One stored payout candidate is served only when it is a real NEAR
+   transaction hash (32-byte base58 — the validation the capture path
+   applied), so a corrupt record can never put junk on an invoice
+   surface, and only after VERIFIED — before that the candidates are
+   not proof of anything. */
+function payoutTxList(intent) {
+  if (intent.status !== "VERIFIED" || !Array.isArray(intent.payoutHashes)) return [];
+  const out = [];
+  for (const h of intent.payoutHashes) {
+    if (out.length >= MAX_PAYOUT_HASHES) break;
+    if (typeof h !== "string") continue;
+    try { if (b58decode(h).length === 32) out.push(h); } catch { /* not a hash */ }
+  }
+  return out;
+}
+
+/* The three settlement facts, derived from what Phase 4/5 already
+   stored: the earliest deposit-family transition (the same family that
+   sets depositObserved) and the VERIFIED transition, both from the
+   bounded audit history, with the intent's own updatedAt as the
+   verified-time fallback when history was trimmed. */
+function settlementSummary(record, intent) {
+  const hist = Array.isArray(record.history) ? record.history : [];
+  let depositMs = null;
+  let verifiedMs = null;
+  for (const h of hist) {
+    if (!h || typeof h !== "object" || h.intentId !== intent.intentId) continue;
+    if (typeof h.ts !== "number") continue;
+    if (h.to === "DEPOSIT_SEEN" || h.to === "SETTLING" || h.to === "SETTLED") {
+      if (depositMs === null || h.ts < depositMs) depositMs = h.ts;
+    } else if (h.to === "VERIFIED" && (verifiedMs === null || h.ts < verifiedMs)) {
+      verifiedMs = h.ts;
+    }
+  }
+  return {
+    intentId: intent.intentId,
+    status: intent.status,
+    depositSeenAt: iso(depositMs),
+    verifiedAt: iso(verifiedMs) ||
+      (intent.status === "VERIFIED" ? iso(intent.updatedAt) : null),
+    payoutTx: payoutTxList(intent),
+  };
+}
+
+async function handleSettlement(storage, payload) {
+  let record;
+  try {
+    record = await storage.get(RECORD_KEY);
+  } catch {
+    return respond(500, { error: "Intent store read failed", code: "persistence_failed" });
+  }
+  if (!record || typeof record !== "object" || Array.isArray(record) ||
+      !Array.isArray(record.intents) || record.linkId !== payload.linkId) {
+    return respond(404, { error: "Settlement not found", code: "settlement_not_found" });
+  }
+  /* The settled intent wins outright; otherwise the record's active
+     intent (an abandoned quote still answers honestly — depositSeenAt
+     null, payoutTx empty); otherwise the first readable intent. */
+  let chosen = null;
+  for (const i of record.intents) {
+    if (i && typeof i === "object" && typeof i.intentId === "string" && i.status === "VERIFIED") {
+      chosen = i;
+      break;
+    }
+  }
+  if (!chosen && typeof record.activeIntentId === "string") {
+    chosen = record.intents.find((i) => i && i.intentId === record.activeIntentId) || null;
+  }
+  if (!chosen) {
+    chosen = record.intents.find((i) => i && typeof i === "object" && typeof i.intentId === "string") || null;
+  }
+  if (!chosen) {
+    return respond(404, { error: "Settlement not found", code: "settlement_not_found" });
+  }
+  return respond(200, {
+    ok: true,
+    settlement: settlementSummary(record, chosen),
+    onChainStatus: typeof record.onChainStatus === "string" ? record.onChainStatus : null,
+    onChainStatusCheckedAt: iso(record.onChainCheckedAt),
+  });
+}
+
 async function statusRequest(request, env, ctx) {
   const { rid, rh, ip, t0 } = ctx;
   const reject = (status, code, message, extra = {}) => {
@@ -2804,14 +2935,17 @@ async function statusRequest(request, env, ctx) {
 
   /* Capability + routing validation. Unknown parameters are ignored on
      purpose: a browser-supplied depositAddress= (or any other field) is
-     never read, never believed, never queried. */
+     never read, never believed, never queried. Without the id the
+     request becomes the public settlement summary (linkId-only, form b
+     in the header) instead of the capability read — a PRESENT but
+     malformed id still 400s, so the two forms can never blur. */
   const url = new URL(request.url);
   const linkId = url.searchParams.get("linkId") || "";
   if (linkId.length < MIN_LINK_ID_LEN || linkId.length > MAX_LINK_ID_LEN) {
     return reject(400, "invalid_link_id", "linkId must be 4-64 characters");
   }
   const intentId = url.searchParams.get("id") || "";
-  if (!INTENT_ID_RE.test(intentId)) {
+  if (intentId !== "" && !INTENT_ID_RE.test(intentId)) {
     return reject(400, "invalid_intent_id", "id must be a payment intent id", { linkId });
   }
 
@@ -2821,8 +2955,9 @@ async function statusRequest(request, env, ctx) {
     return json({ error: "Intent store is not configured", code: "intent_store_unconfigured" }, 500, rh);
   }
 
-  /* The DO is addressed by linkId only — the intentId is matched against
-     that invoice's record inside, so an id from another invoice 404s.
+  /* The DO is addressed by linkId only — with an id, it is matched
+     against that invoice's record inside (so an id from another invoice
+     404s); without one, the DO answers the settlement summary (form b).
      Real runtime API: idFromName() returns a DurableObjectId; only
      namespace.get(id) returns the stub whose .fetch reaches the object
      (caught by the workerd run — a Node harness that returns the stub
@@ -3145,11 +3280,19 @@ export class PaymentIntent {
       }
       if (path === "/status") {
         /* Defense in depth, like handleCreate: the worker already
-           validated both ids; the DO re-checks before touching money
-           state, because it is the last gate. */
+           validated the request; the DO re-checks before touching money
+           state, because it is the last gate. Empty id → the public
+           settlement summary (record read only, zero upstream); a
+           PRESENT id must match the capability format, and handleStatus
+           then requires it to belong to this invoice's record. */
         if (typeof payload.linkId !== "string" ||
-            payload.linkId.length < MIN_LINK_ID_LEN || payload.linkId.length > MAX_LINK_ID_LEN ||
-            typeof payload.intentId !== "string" || !INTENT_ID_RE.test(payload.intentId)) {
+            payload.linkId.length < MIN_LINK_ID_LEN || payload.linkId.length > MAX_LINK_ID_LEN) {
+          return respond(400, { error: "Invalid status request", code: "invalid_payload" });
+        }
+        if (payload.intentId === undefined || payload.intentId === null || payload.intentId === "") {
+          return await handleSettlement(this.state.storage, payload);
+        }
+        if (typeof payload.intentId !== "string" || !INTENT_ID_RE.test(payload.intentId)) {
           return respond(400, { error: "Invalid status request", code: "invalid_payload" });
         }
         return await handleStatus(this.env, this.state.storage, payload);

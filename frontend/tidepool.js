@@ -496,6 +496,50 @@ export function tpParseStatus(body) {
   };
 }
 
+/* GET /status?linkId=… WITHOUT the capability id → validated settlement
+   summary, or null. This is the invoice-viewer lookup: a cross-chain
+   payout pays the merchant directly, so the on-chain invoice stays OPEN
+   and its surfaces use this to show deposit date, intent id and the
+   VERIFIED payout hashes instead of pretending nothing arrived. Exact
+   allowlist, fail closed: a malformed field (a non-hash, a non-ISO
+   date, a wrong shape) parses as null and the invoice simply renders
+   without the block — never a half-trusted one. Capability-only fields
+   (deposit address, memo, refund, signature, upstream bodies) are never
+   read, so they cannot leak even if a response carried them. */
+const TP_PAYOUT_HASH_RE = /^[1-9A-HJ-NP-Za-km-z]{43,44}$/;
+const TP_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+
+export function tpParseSettlement(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  if (body.ok !== true) return null;
+  const s = body.settlement;
+  if (!s || typeof s !== "object" || Array.isArray(s)) return null;
+  if (!tpValidIntentId(s.intentId)) return null;
+  if (typeof s.status !== "string" || !s.status) return null;
+  /* null is a legitimate value (history trimmed, deposit never seen);
+     anything else that is not an ISO timestamp fails the whole parse. */
+  const when = (v) => (v === null ? null : typeof v === "string" && TP_ISO_RE.test(v) ? v : undefined);
+  const depositSeenAt = when(s.depositSeenAt);
+  const verifiedAt = when(s.verifiedAt);
+  if (depositSeenAt === undefined || verifiedAt === undefined) return null;
+  if (!Array.isArray(s.payoutTx)) return null;
+  if (s.payoutTx.length > 8 ||
+      s.payoutTx.some((h) => typeof h !== "string" || !TP_PAYOUT_HASH_RE.test(h))) return null;
+  let onChainStatus = null;
+  if (body.onChainStatus != null) {
+    if (typeof body.onChainStatus !== "string") return null;
+    onChainStatus = body.onChainStatus;
+  }
+  return {
+    intentId: s.intentId,
+    status: s.status,
+    depositSeenAt,
+    verifiedAt,
+    payoutTx: s.payoutTx.slice(),
+    onChainStatus,
+  };
+}
+
 /* The exact POST /quote body — the four routing choices plus the idempotency
    key. Deliberately has NO amount field: the Worker derives the invoice
    amount from the contract, never from anything the browser claims. */
