@@ -8,6 +8,11 @@ export const CONFIG = {
      the browser only ever sees "Failed to fetch". FastNEAR is the free testnet
      endpoint NEAR documents as its replacement. */
   rpcUrl: "https://test.rpc.fastnear.com",
+  /* Read failover (Fix D): the same two alternates the Workers carry in
+     wrangler RPC_URLS, so browser and backend fail over onto identical nodes.
+     Both were CORS-checked against this origin and answer NEAR testnet status
+     queries. Used only by the one permitted read retry - never by writes. */
+  rpcUrls: ["https://near-testnet.drpc.org", "https://testnet-rpc.intea.rs"],
   explorer: "https://testnet.nearblocks.io",
 
   /* Paylink payment-link contract (v2: Tidepool sandbox USDC allowlist —

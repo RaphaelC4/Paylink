@@ -608,7 +608,10 @@ serves a folder works. Two that need no install and no repository connection:
 
 - **Vercel** — open <https://vercel.com/new/drop> and drag the `frontend/`
   folder onto the page. It returns an HTTPS URL in a few seconds. (The CLI
-  works too: `npx vercel` inside `frontend/` after `npx vercel login`.)
+  works too: after `npx vercel login`, run `npx vercel deploy --prod` from
+  the repository root, not from inside `frontend/` - the linked project's
+  Root Directory is already `frontend`, so a deploy started there fails
+  with `Root Directory "frontend" does not exist`.)
 - **Cloudflare Pages** — Workers & Pages → Create → Pages → *Upload assets*,
   then upload `frontend/`.
 

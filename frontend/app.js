@@ -3,7 +3,7 @@
    Reads are unsigned JSON-RPC view calls; writes are signed in the wallet. */
 
 import NearConnect from "@hot-labs/near-connect";
-import { CONFIG, ONE_YOCTO, CREATE_STAKE, MAX_DESCRIPTION_BYTES, GAS_DEFAULT, GAS_CLAIM, GAS_FT_CALL } from "./config.js?v=20261110a";
+import { CONFIG, ONE_YOCTO, CREATE_STAKE, MAX_DESCRIPTION_BYTES, GAS_DEFAULT, GAS_CLAIM, GAS_FT_CALL } from "./config.js?v=20261114a";
 /* Phase 7 — the cross-chain payment rail. Self-contained: it renders into
    #tpWrap, gates the pay buttons through tpPayBlockReason/tpPayBlockHtml,
    and never touches the NEAR flow itself. */
@@ -304,6 +304,15 @@ async function copyText(text) {
 
 const RPC_TIMEOUT_MS = 12_000;
 
+/* Endpoints in order: CONFIG.rpcUrl (the primary) then the alternates from
+   CONFIG.rpcUrls - the same set the Workers carry in wrangler RPC_URLS, so
+   browser and backend fail over onto identical nodes. Mirrors the keeper's
+   readEndpoints(): trimmed, empties dropped, and with no alternates
+   configured this is the single primary exactly as before. */
+const RPC_ENDPOINTS = [CONFIG.rpcUrl, ...(Array.isArray(CONFIG.rpcUrls) ? CONFIG.rpcUrls : [])]
+  .map((u) => String(u || "").trim())
+  .filter(Boolean);
+
 /* Methods rpc() is allowed to issue. This is the page's READ client — every
    wallet transaction goes through call()/callViaRelayer() and never through
    here — and the retry below is restricted to this list as defence in depth,
@@ -312,11 +321,14 @@ const RPC_READ_METHODS = new Set([
   "query", "status", "block", "tx", "network_info", "gas_price", "validators",
 ]);
 
-async function rpcOnce(method, params) {
+/* One attempt against url. rpcOnceAt() carries the URL so the retry can be
+   spent on a different node; rpcOnce() below keeps the historical
+   primary-endpoint signature that rpc-retry.test.mjs pins. */
+async function rpcOnceAt(url, method, params) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), RPC_TIMEOUT_MS);
   try {
-    const res = await fetch(CONFIG.rpcUrl, {
+    const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method, params }),
@@ -338,6 +350,13 @@ async function rpcOnce(method, params) {
   }
 }
 
+/* The primary-endpoint attempt, signature unchanged (rpc-retry.test.mjs
+   pins `async function rpcOnce(method, params)` and every single-endpoint
+   scenario below must keep its exact fetch count). */
+async function rpcOnce(method, params) {
+  return rpcOnceAt(RPC_ENDPOINTS[0], method, params);
+}
+
 /* One automatic retry (L-08 P2). Reads only, and only for the two conditions
    a dead or restarting endpoint shows: a rejected fetch (DNS/connection
    failure — the browser reports a CORS-blocked reply the same way, which is
@@ -345,7 +364,16 @@ async function rpcOnce(method, params) {
    4xx/429 (a rate limit must back off, not hammer), never on a timeout (that
    attempt already waited the full 12 s), and never on a JSON-RPC error — the
    chain answered. Two attempts total, each with its own 12 s budget, then
-   the original error reaches friendly(). Mirrors the keeper's query-retry. */
+   the original error reaches friendly(). Mirrors the keeper's query-retry.
+
+   Fix D: when CONFIG.rpcUrls carries an alternate, the one retry is spent on
+   the NEXT endpoint instead of repeating a dead primary (the keeper's rule:
+   "spending the retry on a different node rather than repeating a dead one").
+   With no alternate configured RPC_ENDPOINTS[1] is undefined and the retry
+   repeats the primary — byte-for-byte the historical behaviour, which is what
+   keeps every single-endpoint fetch-count assertion in rpc-retry.test.mjs
+   exact. Still at most two fetches: the failover changes WHICH node the
+   second attempt lands on, never HOW MANY attempts happen. */
 async function rpc(method, params) {
   try {
     return await rpcOnce(method, params);
@@ -355,7 +383,7 @@ async function rpc(method, params) {
       (e.name === "TypeError" ||
         (typeof e.rpcStatus === "number" && e.rpcStatus >= 500));
     if (!retryable) throw e;
-    return rpcOnce(method, params);
+    return rpcOnceAt(RPC_ENDPOINTS[1] ?? RPC_ENDPOINTS[0], method, params);
   }
 }
 
