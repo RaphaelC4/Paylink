@@ -133,6 +133,36 @@ signed by Meteor Wallet) and `spikea03`
 submitted through the Worker's `POST /submit` exactly as the frontend does).
 All four links read `creator: paylink-payee.testnet` on chain.
 
+### E2E testnet run — 14 Nov 2026
+
+Three manual journeys on live testnet, logged in full (with the
+repetition runbook) in [`e2e/TESTNET.md`](e2e/TESTNET.md):
+
+- **Cross-chain (Tidepool) reached `VERIFIED`.** A corrected fresh quote
+  on the same invoice — intent `pi_2f1559538bde442d` — took exactly one
+  valid deposit of 1.010102 watched USDC and reached `VERIFIED`, receipt
+  rendered. The first attempt lost **1.02 USDC** of the wrong token
+  (Circle Base Sepolia `0x036CbD53842c5426634e7929541eC2318f3dCF7e`, not
+  the watched Tidepool testnet USDC
+  `0x38d81431B9f76d9699AF7517040D5221D9dEA252`) at 14:35:13Z to an
+  already-expired deposit address
+  `0xE8E6434d36c02225EE7ecB4ffAEbb054A5e1Ca78` — tx
+  `0xb570b7a291a1b5007c3f100776a64c2763c51371eb0e9cbf54e4c8fe144bb54f`;
+  both attempts on that invoice (`pi_e75c9b14a649e019`,
+  `pi_e84425ea85152f8b`) expired with `conflict: null` and no recorded
+  payment. The 1.02 USDC is stranded at that address — unrecoverable,
+  accepted as a testnet loss. The rule the run paid for: only the
+  watched token, at the quoted amount, inside the quote window.
+- **Creator cancellation (L-03) ran end to end.** Invoice `lnk-6v9rixv5`
+  (creator `tstst.testnet`) already had its Tidepool payment `VERIFIED`,
+  so one 0-yocto `cancel_link` through the relayer closed the NEAR rail
+  before a second payment could reach it — tx
+  [`BFfwkup8JuSBWKKR3GkcgcfFufLdUJT8ibuWF3BDfD1U`](https://testnet.nearblocks.io/txns/BFfwkup8JuSBWKKR3GkcgcfFufLdUJT8ibuWF3BDfD1U)
+  `FINAL` (≈3,025 Ggas, ≈0.000258 NEAR); a fresh `get_link` then read
+  `status: CANCELLED`, `paid_by: null`, and a repeat is refused twice
+  over — relayer pre-check `400 not_open` and contract panic
+  `link is not open`.
+
 ---
 
 ## How it works
@@ -619,6 +649,18 @@ Both keep the hash routing intact (`/#pay/<id>`), so payment links work as
 soon as the folder is uploaded. If you deploy the parser too, set its
 `ALLOWED_ORIGIN` to the new origin and put the Worker URL in
 `frontend/config.js` before uploading.
+
+**Pre-release fixes (14 Nov 2026).** **A** — the CLI command above now
+says *repository root*: the previous `--cwd frontend` invocation fails
+because the linked project's Root Directory is already `frontend`.
+**B** — `config.js` carries a cache-bust ref in `app.js` (currently
+`20261114a`), re-stamped whenever `config.js` changes, so a browser can
+never pair a stale config with a new `app.js`. **D** — the browser read
+client carries `CONFIG.rpcUrls`, byte-identical to the Workers' `RPC_URLS`
+(`near-testnet.drpc.org`, `testnet-rpc.intea.rs`), and spends its single
+permitted retry on the next endpoint instead of repeating a dead primary —
+still max two fetches, reads only, never on 429/404/chain-error/timeout;
+pinned by `frontend/test/rpc-failover.test.mjs`.
 
 ---
 
