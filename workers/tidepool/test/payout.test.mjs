@@ -960,6 +960,29 @@ try {
       "conflict hold logged once with the conflict kind");
   }
 
+  /* ── 9b. the cross-provider race, cancelled: fresh read sees CANCELLED ── */
+  {
+    /* The invoice was cancelled on-chain after landing, while the payout
+       evidence is already proven. A cancelled invoice can never be paid
+       again — no double-payment risk — so verification proceeds, and the
+       authoritative CANCELLED state is recorded without a conflict. */
+    const cx = await settledFlow({
+      txs: { [H1]: payoutTx() },
+      beforeLand: (state) => { state.link = openLink(); },   // landing still sees OPEN
+    });
+    cx.state.link = openLink({ status: "CANCELLED" });
+    const mark = logMark();
+    advance(2000);
+    const r = await getStatus(cx.env, cx.intent.intentId);
+    ok(r.out.intent.status === "VERIFIED",
+      "CANCELLED discovered by the fresh read: payout still verifies (proven evidence, no double-payment risk)");
+    ok(!r.out.conflict, "no conflict recorded for a cancelled invoice");
+    ok(eventCount("invoice_conflict", mark) === 0 && getRecord(cx.env).conflict === null,
+      "no invoice_conflict alert, no stored conflict");
+    ok(getRecord(cx.env).onChainStatus === "CANCELLED",
+      "authoritative on-chain CANCELLED persisted on the record");
+  }
+
   /* ── 10. contract mismatch: stored facts vs fresh get_link ── */
   {
     const amt = await settledFlow({ txs: { [H1]: payoutTx() } });

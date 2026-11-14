@@ -1,13 +1,18 @@
 # Relayer — Cloudflare Worker (NEP-366 meta-transactions)
 
-Makes creating a link free for the payee. The wallet signs a `DelegateAction`
-for `create_link` off-chain — a signature costs nothing — and POSTs it here.
-The Worker validates it before spending a yocto (receiver, method, stake,
-arguments, nonce, expiry, and the NEP-461 signature itself), then wraps the raw
-delegate bytes in a transaction signed by `paylink-relay.testnet`, which pays
-the gas **and** the 0.01 NEAR storage stake. On chain the inner call runs with
+Makes creating a link free for the payee, and lets the creator cancel one
+without a wallet. The wallet signs a `DelegateAction` off-chain — a
+signature costs nothing — for `create_link` or `cancel_link`, and POSTs it
+here. The Worker validates it before spending a yocto (receiver, method,
+deposit, arguments, nonce, expiry, and the NEP-461 signature itself), then
+wraps the raw delegate bytes in a transaction signed by
+`paylink-relay.testnet`, which pays the gas — **and** the 0.01 NEAR storage
+stake for a `create_link`. On chain the inner call runs with
 the payee as `predecessor`, so the link's creator is the payee exactly as with
-a direct transaction — no contract change.
+a direct transaction — no contract change. A `cancel_link` attaches exactly
+0 yocto and must pass an extra `get_link` pre-check (the sender is the
+creator, the link is still cancellable); the contract's own authorization
+remains the final authority.
 
 ```
 GET  https://<worker>/
@@ -85,6 +90,11 @@ near transaction construct-meta-transaction paylink-payee.testnet paylink-v2.tes
 # then POST the printed base64 to /submit
 ```
 
+A `cancel_link` delegate follows the same shape with
+`base64-args {"link_id":"lnk-…"}`, `attached-deposit '0 NEAR'` — the
+Worker refuses any other deposit and pre-checks `get_link` (creator +
+still cancellable) before funding the transaction.
+
 ## Deploy with wrangler (optional)
 
 ```bash
@@ -152,14 +162,18 @@ spread across instances).
 ## Monitoring (M-01)
 
 Every operational event is one structured JSON line
-(`{ts, svc, build, level, event, ...}`, build `20261110d`) on stdout —
+(`{ts, svc, build, level, event, ...}`, build `20261114a`) on stdout —
 readable in Workers → Logs or `wrangler tail`. Each `/submit` response
 carries an `X-Request-Id` echoed in that request's log lines, so a
 "it failed" message maps onto exactly one trace.
 
-- **Events**: `submit_ok`, `submit_rejected` (reason codes such as
-  `bad_signature`, `expired_delegate`, `balance_low`), `rate_limited`,
-  `service_error`, `limiter_backend_error`, plus two alerts:
+- **Events**: `submit_ok` (carries `method`: `create_link` or
+  `cancel_link`), `submit_rejected` (reason codes such as
+  `bad_signature`, `expired_delegate`, `balance_low`, and for a relayed
+  cancel `link_not_found` / `not_creator` / `not_open`), `rate_limited`,
+  `service_error` (`rpc_link_state` = the `get_link` pre-check could not
+  read the invoice and failed closed), `limiter_backend_error`, plus two
+  alerts:
   `volume_anomaly` (≥ 120 requests/60 s) and `error_burst` (5 × 5xx in
   5 min), each once per window.
 - **Never logged**: the delegate bytes, request bodies, or the relayer key

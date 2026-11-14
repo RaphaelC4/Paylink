@@ -18,6 +18,7 @@ import {
   tpReceiptFacts,
   tpParseSettlement,
   tpStateView,
+  TP_TERMINAL,
 } from "./tidepool.js?v=20261114a";
 /* Verifiable receipt — pure module: the PDF bytes behind the one-click
    download, plus the one sentence every completed payment carries. */
@@ -147,6 +148,7 @@ const STATUS_PILL = {
   OPEN: "pill open",
   PAID: "pill paid",
   CLAIMED: "pill claimed",
+  CANCELLED: "pill cancelled",
   EXPIRED: "pill expired",
 };
 
@@ -1004,6 +1006,32 @@ function readyError(title, detail, id = "", qrHtml = "", payUrl = "") {
     </div>`;
 }
 
+/* ─────────────────────────────────────── creator cancellation (L-03) ──
+   Cancel belongs to the creator alone and is irreversible, so every
+   cancel button ARM first: step one swaps the slot into a confirm state
+   (whose copy carries the settlement warning when a cross-chain attempt
+   is still running — cancelled invoices must warn, never block: the
+   attempt either completes or the payer is refunded, so no money can be
+   lost either way), step two is the only thing that signs. The submit
+   path re-reads the chain before it ever asks for a signature: this
+   wallet must still be the creator and the invoice must still hold no
+   money — a stale button can never act on a state the card no longer
+   reflects. The slot keeps its own identity across all three states, so
+   arm → confirm → stand-down is a swap of contents, never a repaint. */
+const cancelButtonHtml = (linkId) => `
+    <button class="btn btn-sm ghost" type="button" data-cancel="${esc(linkId)}"><span>Cancel link</span></button>`;
+
+const cancelSlotHtml = (linkId) => `
+    <div class="cancel-row" data-cancel-slot="${esc(linkId)}">${cancelButtonHtml(linkId)}</div>`;
+
+const cancelConfirmHtml = (linkId, warn) => `
+    <p class="cancel-note">Cancel this link for good? The contract refuses every future payment &mdash; this cannot be undone.</p>
+    ${warn ? `<p class="cancel-note"><strong>Before you confirm:</strong> ${warn}</p>` : ""}
+    <div class="share-btns">
+      <button class="btn btn-sm" type="button" data-cancel-go="${esc(linkId)}"><span>Yes, cancel it</span></button>
+      <button class="btn btn-sm ghost" type="button" data-cancel-back="${esc(linkId)}"><span>Never mind</span></button>
+    </div>`;
+
 async function renderReady(id) {
   const card = $("#readyCard");
   const payUrl = payUrlFor(id);
@@ -1084,7 +1112,8 @@ async function renderReady(id) {
       <button class="btn btn-sm" type="button" data-open-pay="${esc(link.link_id)}"><span>Open payment page</span></button>
       <button class="btn btn-sm ghost" type="button" data-go="create"><span>Create another</span></button>
       <button class="btn btn-sm ghost" type="button" data-go="ledger"><span>My links</span></button>
-    </div>`;
+    </div>
+    ${st === "OPEN" || st === "EXPIRED" ? cancelSlotHtml(link.link_id) : ""}`;
   paintSettlement(card, link, !!accountId && accountId === link.creator);
 }
 
@@ -1152,6 +1181,12 @@ function settlementHtml(s, link, mine) {
     note = mine
       ? `<p class="pay-fee">You're the payee: the invoice is still <strong>OPEN</strong> on chain — cancel it or let it expire so nobody can pay it twice.</p>`
       : `<p class="pay-fee">The invoice is still <strong>OPEN</strong> on chain: cross-chain payments settle directly to the payee, so only NEAR-rail payments flip it.</p>`;
+  } else if (onChain === "CANCELLED") {
+    /* Cancelled is authoritative chain state, not an error: the NEAR rail
+       is closed for good. When the attempt VERIFIED, that also means the
+       money already reached the payee exactly once. */
+    note = `<p class="pay-fee">This invoice is <strong>CANCELLED</strong> on chain — the contract refuses payment${
+      verified ? ", and the cross-chain payment already settled to the payee" : ""}.</p>`;
   }
   return `<div class="tx-line ${verified ? "ok" : "pending"}" role="status">
     <div class="row"><span>${esc(headline)}</span><strong>${right}</strong></div>
@@ -1377,6 +1412,7 @@ const FILTERS = {
   all: { label: "", match: () => true },
   open: { label: "unpaid", match: (l) => statusOf(l) === "OPEN" },
   paid: { label: "paid", match: (l) => { const s = statusOf(l); return s === "PAID" || s === "CLAIMED"; } },
+  cancelled: { label: "cancelled", match: (l) => statusOf(l) === "CANCELLED" },
   expired: { label: "expired", match: (l) => statusOf(l) === "EXPIRED" },
 };
 
@@ -1413,7 +1449,7 @@ async function loadLedger() {
 function renderLedger() {
   const rows = ledgerRows;
   const list = $("#ledgerList");
-  const counts = { all: rows.length, open: 0, paid: 0, expired: 0 };
+  const counts = { all: rows.length, open: 0, paid: 0, cancelled: 0, expired: 0 };
   let received = 0n;
   let awaiting = 0n;
 
@@ -1421,6 +1457,10 @@ function renderLedger() {
     const st = statusOf(l);
     if (st === "OPEN") { counts.open++; awaiting += BigInt(l.amount); }
     else if (st === "EXPIRED") counts.expired++;
+    /* Cancelled is its own bucket, never paid: nothing ever settled on
+       this rail, so it must not inflate the paid count or the received
+       total (which only CLAIMED money reaches anyway). */
+    else if (st === "CANCELLED") counts.cancelled++;
     else {
       counts.paid++;
       /* Only money that actually reached the payee counts as received. */
@@ -1517,6 +1557,15 @@ function exportCsv() {
 /* ───────────────────────────────────────────────────────────────── pay ── */
 
 function timeline(st) {
+  if (st === "CANCELLED") {
+    return `
+      <div class="timeline one">
+        <div class="tl-step now warm">
+          <span class="tl-bar"></span>
+          <span class="tl-label">Cancelled &mdash; the contract refuses payment</span>
+        </div>
+      </div>`;
+  }
   if (st === "EXPIRED") {
     return `
       <div class="timeline one">
@@ -1832,6 +1881,7 @@ function renderPayActions(link, st) {
         ${shareUrlField(payUrl)}
         <div class="share-btns">${shareRow(payUrl, shareText)}</div>
         ${qr ? `<div class="qr-col pay-qr">${qr}</div>` : ""}
+        ${cancelSlotHtml(link.link_id)}
         <p class="pay-fee">Copy or share the link. It flips to <strong>PAID</strong> the moment their payment lands, and this page shows it happen.</p>`;
       return;
     }
@@ -1881,7 +1931,23 @@ function renderPayActions(link, st) {
     return;
   }
 
-  box.innerHTML = `<p class="pay-fee">This link expired. The contract refuses payment on an expired link.</p>`;
+  if (st === "CANCELLED") {
+    /* Cancelled is terminal for the NEAR rail: no Pay button can ever
+       exist here again, and the payer's fund rail goes with it. A
+       cross-chain attempt that is still resolving keeps its own state
+       line ABOVE the note — cancelling never stops that attempt (it
+       either completes or the payer is refunded), so its truth stays
+       visible instead of being replaced. */
+    const rail = $("#fundRail");
+    if (rail) { rail.remove(); clearInterval(fundPollTimer); fundPollTimer = null; }
+    const tpBlock = tpPayBlockReason();
+    box.innerHTML = `${tpBlock ? tpPayBlockHtml() : ""}
+      <p class="pay-fee">This link was cancelled. The contract refuses payment on a cancelled link.</p>`;
+    return;
+  }
+
+  box.innerHTML = `<p class="pay-fee">This link expired. The contract refuses payment on an expired link.</p>${
+    st === "EXPIRED" && mine ? cancelSlotHtml(link.link_id) : ""}`;
 }
 
 async function payLink(linkId) {
@@ -1997,6 +2063,89 @@ async function claimLink(linkId) {
     show("err", esc(msg));
     toast(msg);
   }
+}
+
+/* ── creator cancellation: arm, then submit ──────────────────────────────
+   Two steps, always. Arm reads the settlement record so the confirm step
+   can warn about a cross-chain attempt still in flight — warn, never
+   block: cancelled invoices must not lose a payer or strand an attempt
+   (it completes to the payee or the payer is refunded either way).
+   Submit never trusts the button: it re-reads the chain and re-proves
+   creator + unpaid (OPEN or EXPIRED — an expired link holds no funds and
+   stays cancellable) before a signature is ever requested. Relayer first
+   (an off-chain signature costs nothing and the relayer pays the gas);
+   direct only when there is no relayer or the wallet cannot sign
+   delegates. An unconfirmed relayer reply is resolved against the chain —
+   the chain is the only authority on whether the cancel landed. */
+async function armCancel(btn) {
+  const linkId = btn.dataset.cancel;
+  const slot = btn.closest("[data-cancel-slot]");
+  if (!slot) return;
+  if (!accountId) { toast("Connect a wallet first"); return connectWallet(); }
+  slot.innerHTML = `<div class="tx-line pending" role="status">Checking the invoice&hellip;</div>`;
+  let warn = "";
+  try {
+    const s = await getSettlement(linkId);
+    if (s && s.status && !TP_TERMINAL.has(s.status)) {
+      warn = "a cross-chain payment attempt for this invoice is still in progress — cancelling does not stop it: it either completes to the payee or the payer is refunded, so no money is lost either way.";
+    }
+  } catch { /* no settlement service: arm without the extra warning */ }
+  slot.innerHTML = cancelConfirmHtml(linkId, warn);
+}
+
+async function cancelLink(linkId, slot) {
+  const say = (cls, html) => {
+    if (slot && slot.isConnected) {
+      slot.innerHTML = `<div class="tx-line ${cls}" role="${cls === "err" ? "alert" : "status"}">${html}</div>`;
+    }
+  };
+  const fail = (msg) => { toast(msg); say("err", `${esc(msg)}${cancelButtonHtml(linkId)}`); };
+
+  if (!accountId) { toast("Connect a wallet first"); return connectWallet(); }
+  say("pending", "reading the chain&hellip;");
+
+  /* Fresh facts, never the button's: creator and unpaid, re-proven here. */
+  let link;
+  try { link = await V.getLink(linkId); } catch (err) { return fail(`Could not read the chain — nothing was sent. ${friendly(err)}`); }
+  if (!link) return fail("Link not found — nothing was sent.");
+  if (link.creator !== accountId) return fail("Only the creator of this link can cancel it.");
+  const st = statusOf(link);
+  if (st !== "OPEN" && st !== "EXPIRED") return fail(`This link is ${st} — only an unpaid link can be cancelled.`);
+
+  say("pending", "waiting for your wallet&hellip;");
+  let hash;
+  try {
+    if (CONFIG.relayer.endpoint) {
+      const relayerWallet = await connector.wallet();
+      if (typeof relayerWallet.signDelegateActions === "function") {
+        try {
+          hash = await callViaRelayer("cancel_link", { link_id: linkId }, { deposit: "0" });
+        } catch (relayerErr) {
+          /* A decline is final — nothing was broadcast. Any other failure
+             proves nothing about the broadcast: ask the chain whether the
+             cancel landed before reporting an error at the user. */
+          if (relayerEligibility(relayerErr) === "declined") throw relayerErr;
+          const fresh = await V.getLink(linkId).catch(() => null);
+          if (fresh && statusOf(fresh) === "CANCELLED") hash = null; // landed, reply lost
+          else throw relayerErr;
+        }
+      } else {
+        hash = await call("cancel_link", { link_id: linkId }, { deposit: "0" });
+      }
+    } else {
+      hash = await call("cancel_link", { link_id: linkId }, { deposit: "0" });
+    }
+  } catch (err) { return fail(friendly(err)); }
+
+  toast("Link cancelled — nobody can pay it now");
+  say("ok", hash
+    ? `cancelled &middot; <a class="mono" href="${CONFIG.explorer}/transactions/${esc(hash)}" target="_blank" rel="noopener">${esc(truncate(hash, 12, 8))}</a>`
+    : "cancelled &middot; the contract now refuses payment on this link");
+  const wasReady = !!(slot && slot.closest("#readyCard"));
+  setTimeout(() => {
+    if (wasReady) renderReady(linkId); else renderPay(linkId);
+    if (currentTab === "ledger") loadLedger();
+  }, 2500);
 }
 
 /* ──────────────────────────────────────── faucet + swap (Tidepool) ──
@@ -2751,6 +2900,25 @@ function wire() {
 
     const claimBtn = e.target.closest("[data-claim]");
     if (claimBtn) { claimLink(claimBtn.dataset.claim); return; }
+
+    /* Creator cancellation — arm first (step 1), the submit happens only
+       from the confirm button (step 2), "Never mind" stands down in
+       place. Nothing else in the app carries these attributes. */
+    const cancelArm = e.target.closest("[data-cancel]");
+    if (cancelArm) { armCancel(cancelArm); return; }
+
+    const cancelGo = e.target.closest("[data-cancel-go]");
+    if (cancelGo) {
+      cancelLink(cancelGo.dataset.cancelGo, cancelGo.closest("[data-cancel-slot]"));
+      return;
+    }
+
+    const cancelBack = e.target.closest("[data-cancel-back]");
+    if (cancelBack) {
+      const slot = cancelBack.closest("[data-cancel-slot]");
+      if (slot) slot.innerHTML = cancelButtonHtml(cancelBack.dataset.cancelBack);
+      return;
+    }
 
     const focusBtn = e.target.closest("[data-focus]");
     if (focusBtn) {

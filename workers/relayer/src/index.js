@@ -1,5 +1,5 @@
 /* Paylink relayer — a Cloudflare Worker that submits meta-transactions (NEP-366)
- * so creating a payment link never costs the payee a drop of NEAR.
+ * so creating or cancelling a payment link never costs the payee a drop of NEAR.
  *
  *   POST /submit  { "signedDelegateAction": "<base64>" }
  *        -> validate the SignedDelegateAction (borsh), then wrap it in a
@@ -19,8 +19,12 @@
  *     DelegateActionSenderDoesNotMatchTxReceiver),
  *   - receiver_id must be our contract, the single inner action must be
  *     `create_link` with 0.01-0.02 NEAR attached (MIN_STAKE..MAX_DEPOSIT)
- *     and sane arguments (the same rules the contract enforces, mirrored so
- *     bad input never reaches it),
+ *     or `cancel_link` with exactly 0 yocto, and sane arguments (the same
+ *     rules the contract enforces, mirrored so bad input never reaches it),
+ *     and a cancel must additionally pre-check get_link: the sender is the
+ *     creator and the link is still cancellable — checked here so a doomed
+ *     cancel never burns gas, fail-closed if the contract cannot be read,
+ *     with the contract's own authorization still the final authority,
  *   - the signature must verify under the sender's public key using NEP-461's
  *     preimage (sha256 of the NEP-366 discriminant ++ the delegate bytes) —
  *     proven against two fixtures the chain accepted, see test/parse.test.mjs,
@@ -263,9 +267,9 @@ const concat = (...parts) => {
 
 /**
  * Borsh-read a SignedDelegateAction exactly as NEP-366 defines it and check
- * it is a single `create_link` call this relayer is willing to fund.
- * Returns the pieces the rest of the Worker needs, or throws with a message
- * fit for a 400 response. The raw bytes are returned too: the outer
+ * it is a single `create_link` or `cancel_link` call this relayer is willing
+ * to fund. Returns the pieces the rest of the Worker needs, or throws with a
+ * message fit for a 400 response. The raw bytes are returned too: the outer
  * transaction embeds them verbatim, so this Worker never re-encodes what the
  * payee signed.
  *
@@ -309,9 +313,11 @@ export function parseSignedDelegate(raw, env) {
   const tag = u8();
   if (tag !== 2) fail(`only a FunctionCall inner action is relayable, got action tag ${tag}`);
   const method = rstr();
-  if (method !== "create_link") fail(`this relayer only submits create_link, got "${method}"`);
+  if (method !== "create_link" && method !== "cancel_link") {
+    fail(`this relayer only submits create_link or cancel_link, got "${method}"`);
+  }
   const argsLen = ru32();
-  if (argsLen > MAX_ARGS_BYTES) fail(`create_link args too large (${argsLen} bytes)`);
+  if (argsLen > MAX_ARGS_BYTES) fail(`${method} args too large (${argsLen} bytes)`);
   const argsBytes = rbytes(argsLen);
   const gas = ru64();
   const deposit = ru128();
@@ -326,18 +332,53 @@ export function parseSignedDelegate(raw, env) {
   const signature = rbytes(64);
   if (o !== raw.length) fail(`trailing bytes after SignedDelegateAction (${raw.length - o})`);
 
-  /* Mirror the contract's own create_link checks so a doomed delegate is
-     rejected here instead of on chain at this relayer's expense. */
+  /* Mirror the contract's own checks so a doomed delegate is rejected here
+     instead of on chain at this relayer's expense. The deposit rules are
+     method-specific: create_link stakes storage (bounded window), while
+     cancel_link is documented non-payable — the contract would panic on any
+     attached deposit, so exactly 0 yocto is the only fundable value. */
   if (receiver_id !== env.CONTRACT_ID) fail(`receiver must be ${env.CONTRACT_ID}, got ${receiver_id}`);
-  if (deposit < MIN_STAKE) fail(`create_link needs at least 0.01 NEAR attached, got ${deposit} yocto`);
-  if (deposit > MAX_DEPOSIT) fail(`create_link deposit ${deposit} yocto exceeds the 0.02 NEAR maximum this relayer will fund`);
+  if (method === "create_link") {
+    if (deposit < MIN_STAKE) fail(`create_link needs at least 0.01 NEAR attached, got ${deposit} yocto`);
+    if (deposit > MAX_DEPOSIT) fail(`create_link deposit ${deposit} yocto exceeds the 0.02 NEAR maximum this relayer will fund`);
+  } else {
+    if (deposit !== 0n) fail(`cancel_link must attach 0 yocto, got ${deposit} yocto`);
+  }
   if (gas < GAS_INNER_MIN || gas > GAS_INNER_MAX) fail(`inner gas ${gas} outside ${GAS_INNER_MIN}..${GAS_INNER_MAX}`);
 
   let args;
   try {
     args = JSON.parse(utf8.decode(argsBytes));
   } catch {
-    fail("create_link args are not valid JSON");
+    fail(`${method} args are not valid JSON`);
+  }
+  if (method === "cancel_link") {
+    /* cancel_link takes one argument and nothing else: link_id. The
+       contract reads the creator and status from storage, so any extra
+       field is either meaningless or an attempt to smuggle payment
+       arguments through a cancel — rejected outright. */
+    if (args === null || typeof args !== "object" || Array.isArray(args)) {
+      fail("cancel_link args must be a JSON object");
+    }
+    const keys = Object.keys(args);
+    if (keys.length !== 1 || keys[0] !== "link_id") fail("cancel_link takes exactly one argument: link_id");
+    const linkId = args.link_id;
+    if (typeof linkId !== "string") fail("link_id must be a string");
+    const linkBytes = text.encode(linkId).length;
+    if (linkBytes < LINK_ID_MIN || linkBytes > LINK_ID_MAX) fail(`link_id must be ${LINK_ID_MIN}-${LINK_ID_MAX} bytes`);
+    return {
+      sender_id,
+      receiver_id,
+      method,
+      args,
+      gas,
+      deposit,
+      nonce,
+      max_block_height,
+      publicKey, // 32 raw bytes
+      signature, // 64 raw bytes
+      raw,
+    };
   }
   const linkId = args.link_id;
   if (typeof linkId !== "string") fail("link_id must be a string");
@@ -529,6 +570,22 @@ async function accessKey(env, account, publicKeyB58) {
     public_key: publicKeyB58.replace(/^ed25519:/, ""),
   });
   return { nonce: res.nonce, blockHash: res.block_hash };
+}
+
+/* Read one link straight from the contract (get_link), for the cancel_link
+   pre-check. Returns the parsed JSON — a Link object, or null when the
+   contract has no such link — and throws on anything unreadable so the
+   caller can fail closed. */
+async function viewLink(env, linkId) {
+  const res = await rpc(env, "query", {
+    request_type: "call_function",
+    finality: "final",
+    account_id: env.CONTRACT_ID,
+    method_name: "get_link",
+    args_base64: b64encode(text.encode(JSON.stringify({ link_id: linkId }))),
+  });
+  if (!res || !Array.isArray(res.result)) throw new Error("get_link: unexpected response shape");
+  return JSON.parse(utf8.decode(Uint8Array.from(res.result)));
 }
 
 async function broadcast(env, txB64) {
@@ -804,6 +861,54 @@ export async function submit(env, body, ip, rid = "-") {
     throw err;
   }
 
+  /* cancel_link pre-check: mirror the contract's own guards against a fresh
+     get_link so a doomed cancel is refused here instead of panicking on
+     chain at this relayer's gas expense. The contract reads the creator and
+     stored status from storage at execution time and remains the final
+     authority — this is a fail-closed economy check, not the authorization.
+     get_link derives EXPIRED from a stored OPEN link, so both OPEN and
+     EXPIRED mean "cancellable" here, exactly like cancel_link's own stored
+     status test. Any unreadable answer is 503 (fail closed), never a
+     guess; genuine negatives are 400s naming the contract's own refusal. */
+  if (parsed.method === "cancel_link") {
+    let link;
+    try {
+      link = await viewLink(env, parsed.args.link_id);
+    } catch (e) {
+      const err = new Error("could not verify the invoice state — try again");
+      err.status = 503;
+      err.reason = "rpc_link_state";
+      throw err;
+    }
+    if (link === null) {
+      /* A definitive answer: get_link returned None. The contract would
+         panic "link not found" — a genuine negative, so 400 not 503. */
+      const err = new Error("link not found");
+      err.status = 400;
+      err.reason = "link_not_found";
+      throw err;
+    }
+    if (typeof link !== "object" || Array.isArray(link)
+      || typeof link.creator !== "string" || typeof link.status !== "string") {
+      const err = new Error("could not verify the invoice state — try again");
+      err.status = 503;
+      err.reason = "rpc_link_state";
+      throw err;
+    }
+    if (link.creator !== parsed.sender_id) {
+      const err = new Error("only the creator can cancel");
+      err.status = 400;
+      err.reason = "not_creator";
+      throw err;
+    }
+    if (link.status !== "OPEN" && link.status !== "EXPIRED") {
+      const err = new Error("link is not open");
+      err.status = 400;
+      err.reason = "not_open";
+      throw err;
+    }
+  }
+
   const senderKeyB58 = `ed25519:${b58encode(parsed.publicKey)}`;
 
   /* 1. The payee's key must exist on the payee's account with a nonce the
@@ -887,10 +992,12 @@ export async function submit(env, body, ip, rid = "-") {
     err.reason = "broadcast_failed";
     throw err;
   }
-  /* The creation event: safe identifiers only (link id, tx hash, sender
-     account — all public on chain), never the delegate, args or amounts. */
+  /* The success event: safe identifiers only (method, link id, tx hash,
+     sender account — all public on chain), never the delegate, args or
+     amounts. `method` separates a relayed cancel from a relayed create. */
   logEvent("submit_ok", {
-    rid, ip, link_id: parsed.args.link_id, sender_id: parsed.sender_id, hash: res.hash,
+    rid, ip, method: parsed.method, link_id: parsed.args.link_id,
+    sender_id: parsed.sender_id, hash: res.hash,
     ms: Date.now() - t0,
   }, env);
   return { ok: true, hash: res.hash };
@@ -940,7 +1047,7 @@ function corsHeaders(request, env) {
 /* Build stamp returned by GET / — bump this string on every dashboard paste
    so the deployed code can be identified remotely (the Worker exposes no
    other version signal). Same convention as the frontend's ?v= param. */
-const BUILD = "20261110d";
+const BUILD = "20261114a";
 
 /* Attach an alert delivery to the invocation when a ctx exists (it does in
    production); tests call the handler without ctx and get a floating promise

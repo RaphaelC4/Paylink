@@ -77,6 +77,7 @@ jobs:
             frontend/test/tidepool-regression.test.mjs \
             frontend/test/receipt.test.mjs \
             frontend/test/settlement.test.mjs \
+            frontend/test/cancel.test.mjs \
             workers/tidepool/src/index.js \
             workers/tidepool/test/networks.test.mjs \
             workers/tidepool/test/quote.test.mjs \
@@ -238,6 +239,13 @@ jobs:
       # parser allowlist, payout-tx gating, card/ledger painting contracts.
       - name: node frontend/test/settlement.test.mjs
         run: node frontend/test/settlement.test.mjs
+
+      # Creator cancellation (L-03) — arm-then-submit, creator-only and
+      # unpaid-only guards re-proven on chain, relayer-first with 0 yocto,
+      # cancelled surfaces (pill / timeline / filters / pay actions) and the
+      # in-flight-attempt warn-but-allow rule.
+      - name: node frontend/test/cancel.test.mjs
+        run: node frontend/test/cancel.test.mjs
 
   # ── item 9 (parse worker tests) ──────────────────────────────────────────
   parse:

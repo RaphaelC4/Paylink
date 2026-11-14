@@ -528,12 +528,13 @@ cargo test --lib                            # 56 unit tests, all pure host tests
 
 # the JS suites — no dependencies, plain node (the parse Worker's
 # own suite is documented in workers/parse/README.md):
-node workers/relayer/test/parse.test.mjs    # 173 assertions: parse, signing, rate limits, L-08 failover
+node workers/relayer/test/parse.test.mjs    # 219 assertions: parse, signing, rate limits, L-08 failover, cancel gate
 node workers/keeper/test/sweep.test.mjs     # 178 assertions: settlement, retry, logs, L-08 failover
 node frontend/test/one-approval.test.mjs    # 26 assertions: one payer approval only
 node frontend/test/parse-errors.test.mjs    # 48 assertions: parse errors + L-06 timeout
 node frontend/test/rpc-retry.test.mjs       # 23 assertions: one read retry, never for writes
 node frontend/test/relayer-fallback.test.mjs # 120 assertions: relayer outage → chain check → consent → direct
+node frontend/test/cancel.test.mjs          # 52 assertions: creator-only cancel, arm→confirm, cancelled surfaces
 
 # build the wasm with its NEP-330 ABI embedded
 cargo near build non-reproducible-wasm --abi-features near-sdk/unit-testing

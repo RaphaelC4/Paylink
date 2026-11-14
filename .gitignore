@@ -40,3 +40,5 @@ test-results/
 
 # local submission notes — operator only, never public
 SUBMISSION.local.md
+.vercel
+.env*

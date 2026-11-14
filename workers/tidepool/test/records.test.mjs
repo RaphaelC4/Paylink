@@ -983,6 +983,24 @@ try {
     ok(re2.res.status === 200 && re2.out.conflict === "invoice_paid",
       "recovery after RPC returns: the conflict is found on the next bounded refresh");
     noVerifyTexts.push(re.text, re2.text);
+
+    /* f. the invoice turns CANCELLED while held: state, never conflict. */
+    const st3 = stubNet();
+    const env3 = makeEnv();
+    env3.INTENT_DO.seed(LINK_ID, seedRecord([seedIntent({ status: "SETTLED", tidepoolStatus: "SUCCESS" })]));
+    const mark3 = logMark();
+    advance(60_001);
+    st3.link = openLink({ status: "CANCELLED" });
+    const rf = await getStatus(env3, SEED_ID);
+    ok(rf.res.status === 200 && rf.out.intent.status === "SETTLED" && !rf.out.conflict,
+      "invoice turns CANCELLED while held: surfaced as state, never a conflict");
+    const recF = getRecord(env3);
+    ok(recF.onChainStatus === "CANCELLED" && recF.conflict === null,
+      "authoritative CANCELLED persisted; record otherwise clean");
+    ok(eventCount("invoice_conflict", mark3) === 0 && st3.calls.tx.length === 0 &&
+      st3.calls.status.length === 0,
+      "no alert, no tx/status reads — observation only");
+    noVerifyTexts.push(rf.text);
   }
 
   /* ── 8. interrupted verification: recover without duplicate transitions ── */

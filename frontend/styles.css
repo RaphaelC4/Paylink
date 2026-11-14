@@ -932,6 +932,14 @@ textarea{resize:vertical;min-height:88px;font-size:14px;line-height:1.55}
 .pill.paid{background:var(--bg);border-color:var(--ink);color:var(--ink)}
 .pill.claimed{background:var(--good-bg);border-color:var(--good-line);color:var(--good-ink)}
 .pill.expired{background:var(--warn-bg);border-color:var(--warn-line);color:var(--warn-ink)}
+/* cancelled: a dead invoice reads QUIET, not warm — nothing happened
+   here, nothing can happen here, and it must not be mistaken for the
+   expired chip at a glance */
+.pill.cancelled{background:var(--bg);border-color:var(--muted);color:var(--muted)}
+/* creator cancellation (L-03): arm-then-confirm slot. The wrapper keeps
+   its identity across arm / confirm / stand-down, so only contents move */
+.cancel-row{display:grid;gap:.5rem;margin-top:.75rem}
+.cancel-note{font-size:12px;color:var(--muted)}
 /* cross-chain settlement chip (ledger rows): green once VERIFIED, accent
    while the attempt is still in flight — its title carries the deposit
    date and the intent id, the invoice card carries the full block */

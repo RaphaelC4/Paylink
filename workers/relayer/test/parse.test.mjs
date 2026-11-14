@@ -7,7 +7,7 @@
  * signers, the preimage this Worker checks is the one the chain checks.
  */
 
-import { generateKeyPairSync } from "node:crypto";
+import { generateKeyPairSync, createHash, sign as edSignRaw } from "node:crypto";
 import { readFileSync } from "node:fs";
 import worker, { parseSignedDelegate, signDelegateTx, submit, logEvent, verifyDelegate } from "../src/index.js";
 
@@ -356,7 +356,7 @@ throwsWith(() => parseSignedDelegate(withDeposit(rawCli, 2n ** 128n - 1n), env),
   const res = await worker.fetch(new Request("https://relayer.test/"), env);
   const body = await res.json();
   ok(res.status === 200 && body.ok === true, "GET / still answers ok");
-  ok(body.build === "20261110d", "GET / reports the build stamp (bump with BUILD)");
+  ok(body.build === "20261114a", "GET / reports the build stamp (bump with BUILD)");
 }
 
 /* ═════════════════════════════ M-07: composite rate limiting ═══════
@@ -694,7 +694,7 @@ const evs = (lines) =>
   const rid = a.value.headers.get("x-request-id");
   ok(typeof rid === "string" && rid.length === 8, "response carries an 8-char X-Request-Id");
   ok(ev && ev.rid === rid, "the log line's rid matches the echoed header");
-  ok(ev && ev.svc === "paylink-relayer" && ev.build === "20261110d" && ev.level === "info",
+  ok(ev && ev.svc === "paylink-relayer" && ev.build === "20261114a" && ev.level === "info",
     "every line carries the svc/build/level envelope");
 
   const b = await withLogs(() =>
@@ -1176,6 +1176,302 @@ const evs = (lines) =>
     ok(!mock.hits.some((h) => h.url === FB),
       "the fallback is never contacted when unconfigured");
     ok(res.status >= 500, "and the submit fails cleanly");
+  }
+}
+
+/* ═══════════════════════ cancel_link: Option B relay gate ═══════════════
+   The relayer funds a cancel only when the contract would accept it:
+   a parse gate (exactly 0 yocto, exactly {link_id}, sane gas) plus a fresh
+   get_link pre-check (the sender is the creator, the link is still
+   cancellable) that fails CLOSED on an unreadable answer. The contract's
+   own authorization remains the final authority — this gate only stops
+   doomed cancels from burning relayer gas on chain. Fixtures are built
+   and signed in-process against the NEP-461 preimage (the same scheme
+   verifyDelegate checks, proven by the two chain-accepted fixtures above);
+   no key material is stored in this file. */
+
+const u32le = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
+const u64le = (n) => { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, n, true); return b; };
+const u128le = (n) => {
+  const b = new Uint8Array(16);
+  const dv = new DataView(b.buffer);
+  dv.setBigUint64(0, n & 0xFFFF_FFFF_FFFF_FFFFn, true);
+  dv.setBigUint64(8, n >> 64n, true);
+  return b;
+};
+const bstr = (s) => { const t = new TextEncoder().encode(s); return concat(u32le(t.length), t); };
+
+/* Borsh-encode a SignedDelegateAction for `method` and sign it the way the
+   chain does: sha256(u32 LE discriminant ++ DelegateAction), Ed25519 over
+   that digest, then 0x00 || 64-byte signature appended. */
+function buildDelegate({
+  sender = "paylink-payee.testnet",
+  method = "cancel_link",
+  args = { link_id: "lnk-cancel01" },
+  gas = 50_000_000_000_000n,
+  deposit = 0n,
+  nonce = 7n,
+  maxBlockHeight = 300_000_000n,
+} = {}) {
+  const kp = generateKeyPairSync("ed25519");
+  const spki = kp.publicKey.export({ type: "spki", format: "der" });
+  const pubkeyRaw = new Uint8Array(spki.subarray(spki.length - 32));
+  const argsBytes = new TextEncoder().encode(JSON.stringify(args));
+
+  const delegateAction = concat(
+    bstr(sender),
+    bstr(env.CONTRACT_ID),
+    u32le(1),                          // exactly one inner action
+    Uint8Array.of(2),                  // FunctionCall tag
+    bstr(method),
+    concat(u32le(argsBytes.length), argsBytes),
+    u64le(gas),
+    u128le(deposit),
+    u64le(nonce),
+    u64le(maxBlockHeight),
+    Uint8Array.of(0),                  // ED25519 public key tag
+    pubkeyRaw,
+  );
+
+  const disc = new Uint8Array(4);
+  new DataView(disc.buffer).setUint32(0, (1 << 30) + 366, true);
+  const digest = createHash("sha256").update(concat(disc, delegateAction)).digest();
+  const signature = new Uint8Array(edSignRaw(null, digest, kp.privateKey));
+
+  return concat(delegateAction, Uint8Array.of(0), signature);
+}
+
+/* ── parse gate: a 0-yocto cancel passes, everything the contract would
+      panic on is refused before any relayer funds or RPC are touched ── */
+{
+  const p = parses(buildDelegate(), "cancel_link delegate with 0 yocto accepted");
+  ok(p !== null && p.method === "cancel_link" && p.deposit === 0n,
+    "parsed as cancel_link with exactly 0 yocto");
+  ok(p !== null && p.args.link_id === "lnk-cancel01" && Object.keys(p.args).length === 1,
+    "args round-trip as the single link_id");
+  ok(p !== null && p.gas === 50_000_000_000_000n,
+    "inner gas 50 Tgas (the frontend GAS_DEFAULT) fits the window");
+
+  throwsWith(() => parseSignedDelegate(buildDelegate({ deposit: 1n }), env),
+    "cancel with 1 yocto rejected", "cancel_link must attach 0 yocto");
+  throwsWith(() => parseSignedDelegate(buildDelegate({ deposit: MIN_D }), env),
+    "cancel with a create_link stake rejected", "cancel_link must attach 0 yocto");
+  throwsWith(() => parseSignedDelegate(buildDelegate({ args: { link_id: "lnk-cancel01", amount: "1" } }), env),
+    "cancel carrying a payment argument rejected", "exactly one argument: link_id");
+  throwsWith(() => parseSignedDelegate(buildDelegate({ args: [1, 2] }), env),
+    "cancel with array args rejected", "must be a JSON object");
+  throwsWith(() => parseSignedDelegate(buildDelegate({ args: null }), env),
+    "cancel with null args rejected", "must be a JSON object");
+  throwsWith(() => parseSignedDelegate(buildDelegate({ args: { link_id: 42 } }), env),
+    "non-string link_id rejected", "link_id must be a string");
+  throwsWith(() => parseSignedDelegate(buildDelegate({ args: { link_id: "x".repeat(65) } }), env),
+    "65-byte link_id rejected", "link_id must be 4-64 bytes");
+  throwsWith(() => parseSignedDelegate(buildDelegate({ args: { link_id: "ab" } }), env),
+    "2-byte link_id rejected", "link_id must be 4-64 bytes");
+  throwsWith(() => parseSignedDelegate(buildDelegate({ method: "claim_link" }), env),
+    "unknown method rejected", "only submits create_link or cancel_link");
+  throwsWith(() => parseSignedDelegate(buildDelegate({ gas: 5_000_000_000_000n }), env),
+    "cancel below the gas floor rejected", "outside");
+}
+
+/* ── submit(): the get_link pre-check — fail closed, never a guess ── */
+{
+  const TX_HASH = "9XeKq2RvJ7pLmN4tY6uB8cD0fG1hI3jK5lM7nP9qR0s";
+  const BLOCK_HASH = "75xVe8oDH4VV9uKpcGsx7xTQFWtNsbngukNMC8qsqKTw";
+  const SENDER = "paylink-payee.testnet";
+  const REAL_FETCH = globalThis.fetch;
+
+  /* A fresh relayer secret for this run — parseSecretKey needs a 64-byte
+     ed25519:... value and no real account's key may live in this file. */
+  const mkRelayerKey = () => {
+    const kp = generateKeyPairSync("ed25519");
+    const pkcs8 = kp.privateKey.export({ type: "pkcs8", format: "der" });
+    const spki = kp.publicKey.export({ type: "spki", format: "der" });
+    const secret = new Uint8Array(64);
+    secret.set(pkcs8.subarray(pkcs8.length - 32), 0);
+    secret.set(spki.subarray(spki.length - 32), 32);
+    const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let n = 0n;
+    for (const b of secret) n = (n << 8n) | BigInt(b);
+    let s = "";
+    while (n > 0n) { s = B58[Number(n % 58n)] + s; n /= 58n; }
+    for (const b of secret) { if (b === 0) s = "1" + s; else break; }
+    return `ed25519:${s || "1"}`;
+  };
+
+  const cancelEnv = {
+    ...env,
+    RPC_URL: "https://rpc.mock.testnet",
+    RELAYER_KEY: mkRelayerKey(),
+    RELAYER_ACCOUNT: "paylink-relayer.testnet",
+  };
+
+  /* Scripted chain: answers get_link with `link` (null = no such link),
+     everything the happy path needs after the pre-check, and records every
+     request. `rpcDown` refuses all reads at the network level. */
+  const makeChain = ({ link = null, rpcDown = false } = {}) => {
+    const hits = [];
+    return {
+      hits,
+      broadcasts: () => hits.filter((h) => h.method === "broadcast_tx_commit"),
+      fn: async (_url, init) => {
+        const req = JSON.parse(init.body);
+        hits.push(req);
+        if (rpcDown) throw new TypeError("Failed to fetch");
+        let result = null;
+        if (req.method === "query" && req.params.request_type === "call_function") {
+          result = { result: Array.from(new TextEncoder().encode(JSON.stringify(link))) };
+        } else if (req.method === "query" && req.params.request_type === "view_access_key") {
+          result = { nonce: req.params.account_id === SENDER ? 0 : 50, block_hash: BLOCK_HASH };
+        } else if (req.method === "status") {
+          result = { latest_block_height: 200_000_000 };
+        } else if (req.method === "query" && req.params.request_type === "view_account") {
+          result = { amount: "10000000000000000000000000" };
+        } else if (req.method === "broadcast_tx_commit") {
+          result = { status: "SuccessValue", transaction: { hash: TX_HASH } };
+        }
+        return { json: async () => ({ jsonrpc: "2.0", id: "1", result }) };
+      },
+    };
+  };
+
+  const runCancel = async (chain, ip, fixture) => {
+    globalThis.fetch = chain.fn;
+    try {
+      return await capture(() => submit(cancelEnv,
+        { signedDelegateAction: b64encode(fixture ?? buildDelegate()) }, ip));
+    } finally {
+      globalThis.fetch = REAL_FETCH;
+    }
+  };
+
+  /* creator mismatch: the contract would panic — refused here, 400 */
+  {
+    const chain = makeChain({ link: { creator: "someone-else.testnet", status: "OPEN" } });
+    const r = await runCancel(chain, "198.51.100.110");
+    ok(r.err && r.err.status === 400 && r.err.reason === "not_creator",
+      "a non-creator's cancel -> 400 not_creator");
+    ok(r.err && String(r.err.message).includes("only the creator can cancel"),
+      "the refusal names the contract's own rule");
+    ok(chain.broadcasts().length === 0, "nothing was broadcast");
+    ok(chain.hits.length === 1 && chain.hits[0].params.method_name === "get_link",
+      "exactly one read — get_link, before any key/balance/broadcast call");
+  }
+
+  /* paid / claimed / cancelled: not cancellable, one read each, no broadcast */
+  let ipn = 111;
+  for (const status of ["PAID", "CLAIMED", "CANCELLED"]) {
+    const chain = makeChain({ link: { creator: SENDER, status } });
+    const r = await runCancel(chain, `198.51.100.${ipn++}`);
+    ok(r.err && r.err.status === 400 && r.err.reason === "not_open",
+      `${status}: cancel refused with 400 not_open`);
+    ok(r.err && String(r.err.message).includes("link is not open"),
+      `${status}: the refusal message is the contract's own words`);
+    ok(chain.broadcasts().length === 0 && chain.hits.length === 1,
+      `${status}: one get_link read, zero broadcasts`);
+  }
+
+  /* definitive negative: get_link answers null -> the contract would panic
+     "link not found", so a genuine 400, not a retryable 503 */
+  {
+    const chain = makeChain({ link: null });
+    const r = await runCancel(chain, `198.51.100.${ipn++}`);
+    ok(r.err && r.err.status === 400 && r.err.reason === "link_not_found",
+      "unknown link -> 400 link_not_found");
+    ok(chain.broadcasts().length === 0, "unknown link: nothing broadcast");
+  }
+
+  /* unreadable state: fail CLOSED — 503, retryable, never a guess */
+  {
+    const chain = makeChain({ rpcDown: true });
+    const r = await runCancel(chain, `198.51.100.${ipn++}`);
+    ok(r.err && r.err.status === 503 && r.err.reason === "rpc_link_state",
+      "RPC down -> 503 rpc_link_state (fail closed, never relay on a guess)");
+    ok(r.err && String(r.err.message).includes("could not verify the invoice state"),
+      "the 503 message tells the client to retry");
+    ok(chain.broadcasts().length === 0
+      && chain.hits.every((h) => h.params.request_type === "call_function"),
+      "only get_link was attempted (same endpoint, its one retry) — no broadcast");
+  }
+
+  /* unparseable answer: the contract would never say this — 503 too */
+  {
+    const chain = makeChain({ link: { status: "OPEN" } }); // creator missing
+    const r = await runCancel(chain, `198.51.100.${ipn++}`);
+    ok(r.err && r.err.status === 503 && r.err.reason === "rpc_link_state",
+      "link object without a creator -> 503 rpc_link_state (bad shape is not a yes)");
+    ok(chain.broadcasts().length === 0, "bad shape: nothing broadcast");
+  }
+
+  /* a forged signature dies before ANY RPC — no get_link, no broadcast */
+  {
+    const forged = buildDelegate();
+    forged[forged.length - 1] ^= 0x01;
+    const chain = makeChain({ link: { creator: SENDER, status: "OPEN" } });
+    const r = await runCancel(chain, `198.51.100.${ipn++}`, forged);
+    ok(r.err && r.err.status === 400 && r.err.reason === "bad_signature",
+      "forged cancel -> 400 bad_signature");
+    ok(chain.hits.length === 0, "signature checked locally: zero RPC calls");
+  }
+
+  /* OPEN: the happy path reaches the broadcast exactly once */
+  {
+    const chain = makeChain({ link: { creator: SENDER, status: "OPEN", amount: "1000000", token: env.TOKEN_ID } });
+    let r;
+    const { lines } = await withLogs(async () => {
+      globalThis.fetch = chain.fn;
+      try {
+        r = await submit(cancelEnv, { signedDelegateAction: b64encode(buildDelegate()) },
+          `198.51.100.${ipn++}`);
+      } finally {
+        globalThis.fetch = REAL_FETCH;
+      }
+    });
+    ok(r && r.ok === true && r.hash === TX_HASH,
+      "OPEN: the cancel reaches the broadcast and returns the tx hash");
+    const [ev] = evs(lines).filter((e) => e.event === "submit_ok");
+    ok(ev && ev.method === "cancel_link" && ev.link_id === "lnk-cancel01",
+      "submit_ok carries method cancel_link and the link id");
+    ok(chain.hits[0].params.method_name === "get_link", "get_link was consulted first");
+    ok(chain.broadcasts().length === 1, "exactly one broadcast");
+  }
+
+  /* EXPIRED: cancellable too (get_link derives it, the contract allows it) */
+  {
+    const chain = makeChain({ link: { creator: SENDER, status: "EXPIRED" } });
+    let r;
+    globalThis.fetch = chain.fn;
+    try {
+      r = await submit(cancelEnv, { signedDelegateAction: b64encode(buildDelegate()) },
+        `198.51.100.${ipn++}`);
+    } finally {
+      globalThis.fetch = REAL_FETCH;
+    }
+    ok(r && r.ok === true && r.hash === TX_HASH, "EXPIRED: also relayed to broadcast");
+    ok(chain.broadcasts().length === 1, "EXPIRED: exactly one broadcast");
+  }
+
+  /* through the HTTP handler: the refusal surfaces as a safe 400 body and
+     a submit_rejected reason code (the OPERATIONS.md catalog) */
+  {
+    const chain = makeChain({ link: { creator: SENDER, status: "PAID" } });
+    let res;
+    const { lines } = await withLogs(async () => {
+      globalThis.fetch = chain.fn;
+      try {
+        res = await postSubmit({ signedDelegateAction: b64encode(buildDelegate()) }, cancelEnv,
+          { "cf-connecting-ip": `198.51.100.${ipn++}` });
+      } finally {
+        globalThis.fetch = REAL_FETCH;
+      }
+    });
+    ok(res.status === 400, "handler surfaces the pre-check refusal as HTTP 400");
+    const b = await res.json();
+    ok(b.error === "link is not open", "the 400 body is the safe refusal message");
+    const [ev] = evs(lines).filter((e) => e.event === "submit_rejected");
+    ok(ev && ev.reason === "not_open" && ev.status === 400,
+      "submit_rejected logs reason not_open with the status");
+    ok(chain.broadcasts().length === 0, "handler path: still nothing broadcast");
   }
 }
 

@@ -1184,6 +1184,32 @@ try {
       "capability response keys still the original allowlist");
   }
 
+  /* ── 17c. settlement summary with an authoritative CANCELLED ── */
+  {
+    const state = stubNet();
+    const env = makeEnv();
+    env.INTENT_DO.seed(LINK_ID, seedRecord([seedIntent({
+      status: "SETTLED",
+      depositObserved: true,
+      tidepoolStatus: "SUCCESS",
+      updatedAt: clock - 60_000,
+    })], { onChainStatus: "CANCELLED" }));
+
+    const before = logMark();
+    const r = await send("GET", `/status?linkId=${LINK_ID}`, undefined, env);
+    ok(r.res.status === 200 && r.out.ok === true,
+      "cancelled invoice: the settlement summary still answers");
+    ok(r.out.onChainStatus === "CANCELLED",
+      "authoritative on-chain CANCELLED rides along");
+    ok(r.out.settlement && r.out.settlement.intentId === SEED_ID &&
+      r.out.settlement.status === "SETTLED",
+      "settlement status echoes the held record (chain state is separate)");
+    ok(state.calls.status.length === 0 && state.calls.rpc.length === 0,
+      "still ZERO upstream calls");
+    ok(eventCount("status_ok", before) === 0 && eventCount("invoice_conflict", before) === 0,
+      "silent: no status_ok, no conflict alert for a cancelled invoice");
+  }
+
   /* ── 18. sweeps: sensitive data, envelope, logging budget ── */
   {
     const allStatus = statusTexts.join("\n");
