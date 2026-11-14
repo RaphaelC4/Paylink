@@ -41,6 +41,20 @@ accurate as recorded. [DEMO.md](DEMO.md) carries the re-record script.*
 
 ---
 
+## Screenshots (live testnet run)
+
+A real run on `https://paylink-near.vercel.app` (testnet): payee `tstst.testnet` creates a 10 USDC link, a payer pays it with one wallet approval, and the contract releases 9.95 USDC after the 0.5% fee.
+
+| Step | Screen |
+|---|---|
+| 1. Payee creates a link (paste a request or fill the form) | ![Create link](docs/screenshots/01-create-link.png) |
+| 2. Link ready to send: copy, WhatsApp, Telegram, email, QR | ![Link ready](docs/screenshots/02-link-ready-qr.png) |
+| 3. Payer opens the link: OPEN, amount, naira estimate, fee shown | ![Payer view](docs/screenshots/03-payer-sees-link.png) |
+| 4. Payer pays: CLAIMED, 9.95 USDC released to the payee | ![Paid](docs/screenshots/04-payer-pays-claimed.png) |
+| 5. Payer's activity tab: "You paid" / "Payment released" | ![Payer activity](docs/screenshots/05-payer-activity.png) |
+| 6. Payee sees the same link as CLAIMED, straight from contract state | ![Payee evidence](docs/screenshots/06-payee-evidence-paid.png) |
+| 7. Payee's activity tab: "Payment received" / "Released to you" | ![Payee activity](docs/screenshots/07-payee-activity-released.png) |
+
 ## The problem
 
 Getting paid across borders still costs money and time.
@@ -79,7 +93,7 @@ cross-contract steps that host tests cannot reach is
 | **Overpayment is never lost.** What arrived is what's credited, and the fee applies to the credited amount rather than the invoiced one. | `an_overpayment_is_credited_in_full`, `claim_applies_the_fee_to_an_overpayment` |
 | **Paying twice never double-credits.** A link leaves `OPEN` once; a second payment is returned. | `paying_twice_does_not_double_credit` |
 | **Expiry needs no background job.** `Expired` is derived on read from `expires_at`, never stored, so an aged link reports itself honestly and refuses payment. The same timestamp is also the due date: after it, payment is refused and the tokens return to the payer in the same transaction — a hard cutoff, rather than a late payment accepted and marked late. | `an_expired_invoice_cannot_be_paid`, `an_expired_invoice_is_reported_as_expired_even_unpaid` |
-| **A creator can kill their own link before it is paid — and never after.** **Future deployment requirement — not yet available on the live contract:** the method and its tests exist in the source, but the deployed `paylink-v2.testnet` predates it and a read-only `cancel_link` call answers `MethodNotFound` — cancellation becomes callable only after the contract is redeployed. `cancel_link` is callable only by the stored creator (no payer, keeper, relayer or admin path) and only while the stored status is `OPEN`, so an expired-but-unpaid link can be cancelled but `PAID` and `CLAIMED` never can — a paid link is unreachable for cancellation even before the keeper settles it. Cancellation writes one status and moves nothing: no promise, no transfer, no deposit, no stake refund. A cancelled link refuses every later payment with a full refund, can never be claimed, and is kept (not deleted), so cancellation and the keeper's `PAID`-only settlement live in disjoint states. | `the_creator_cancels_an_unpaid_link`, `a_paid_link_cannot_be_cancelled_before_settlement`, `a_cancelled_link_cannot_be_claimed`, `cancellation_moves_no_money_and_schedules_no_promises`, `cancel_and_pay_settle_exactly_one_winner_in_either_order` |
+| **A creator can kill their own link before it is paid — and never after.** **Live on testnet:** `cancel_link` is deployed on `paylink-v2.testnet` and was exercised end to end through the relayer (see `e2e/TESTNET.md`, tx `BFfwkup8JuSBWKKR3GkcgcfFufLdUJT8ibuWF3BDfD1U`). `cancel_link` is callable only by the stored creator (no payer, keeper, relayer or admin path) and only while the stored status is `OPEN`, so an expired-but-unpaid link can be cancelled but `PAID` and `CLAIMED` never can — a paid link is unreachable for cancellation even before the keeper settles it. Cancellation writes one status and moves nothing: no promise, no transfer, no deposit, no stake refund. A cancelled link refuses every later payment with a full refund, can never be claimed, and is kept (not deleted), so cancellation and the keeper's `PAID`-only settlement live in disjoint states. | `the_creator_cancels_an_unpaid_link`, `a_paid_link_cannot_be_cancelled_before_settlement`, `a_cancelled_link_cannot_be_claimed`, `cancellation_moves_no_money_and_schedules_no_promises`, `cancel_and_pay_settle_exactly_one_winner_in_either_order` |
 | **Sharing survives a dead RPC.** The QR code and Copy button are built from the link id alone — a vendored MIT encoder, no image request, no chain round trip. | `frontend/vendor/qrcode.js`, `qrMarkup()` in `frontend/app.js` |
 | **The keeper needs no registry.** One `view_state` call with prefix `l` lists every link — and if that response ever gets too large or times out, it re-reads the same state as disjoint sub-prefix pages, keeps what it could read and claims it, so discovery scales without an indexer; it signs with the runtime's Ed25519 WebCrypto, so it is a single file with no dependencies. | `workers/keeper/src/index.js` |
 | **Storage is funded up front.** `create_link` requires a 0.01 NEAR stake that covers its own storage and registers the payee on the token — on a delegated creation the relayer attaches it. | `create_link_requires_a_storage_stake`, `the_stake_really_is_ten_millinear` |
