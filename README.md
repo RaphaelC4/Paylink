@@ -32,6 +32,16 @@ Built for **NEAR HACKATHON**, track **`realworld` — Real-World Money**.
 **Contract:** [`paylink-v2.testnet`](https://testnet.nearblocks.io/address/paylink-v2.testnet)
 on NEAR testnet explorer
 
+**What it does, in one list**
+
+- **Gasless link creation:** the payee signs a free NEP-366 delegate action and the relayer pays gas and the 0.01 NEAR stake.
+- **One-approval payment, automatic release:** the payer signs once; the keeper settles to the payee, minus the 0.5% fee.
+- **Pay from another chain:** the swap row quotes a cross-chain deposit through Tidepool / NEAR Intents (testnet sandbox) that settles into the link's USDC. A real run is recorded in `e2e/TESTNET.md`.
+- **Creator-only `cancel_link`:** live on testnet. It works only before payment and moves no money.
+- **AI invoice parsing:** paste a message or attach a PDF or image and the form fills itself, and you still confirm.
+- **Naira estimate, QR and share buttons:** the payment page shows an indicative NGN value, and the link can be shared by WhatsApp, Telegram or email.
+- **Activity feed read from contract state:** nothing moves in the UI until the chain says so.
+
 *Video drift note (M-05): the walkthrough was recorded 7 Nov 2026, before
 the one-approval change of 9 Nov — its release beat (~1:45–1:55) shows the
 payer's wallet signing `claim`, a second approval that no longer exists.
