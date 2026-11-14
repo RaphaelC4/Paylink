@@ -136,6 +136,23 @@ history. `payoutTx` is served only once the intent is `VERIFIED` — each
 entry re-validated as a 32-byte base58 NEAR hash — because before that
 the captured candidates are not proof.
 
+**Snapshot vs. authoritative state.** `onChainStatus` /
+`onChainStatusCheckedAt` is a **frozen snapshot** of the last contract
+read — normally Phase 5's fresh pre-`VERIFIED` read — and, because a
+`VERIFIED` intent is terminal (zero upstream calls thereafter), it is
+never refreshed for the life of the record. It can therefore lag
+reality: observed on testnet 2026-11-14, the summary for
+`lnk-6v9rixv5` kept reporting `onChainStatus: "OPEN"` (checked
+2026-11-13T18:50:04.749Z) after the creator had cancelled the invoice
+on chain (`CANCELLED`, tx `BFfwkup8JuSBWKKR3GkcgcfFufLdUJT8ibuWF3BDfD1U`).
+**The authoritative current contract state is always a direct
+`get_link` read** against `paylink-v2.testnet`: read the summary's
+`onChainStatus` as *"as of `onChainStatusCheckedAt`"*, never as live
+chain state, and never infer live state from the summary alone in
+either direction. `settlement.status` (`VERIFIED`) is unaffected by
+later contract changes — `VERIFIED` has no exits — so a cancelled
+invoice keeps its verified settlement record exactly as served.
+
 | Event | Level | Meaning / key fields |
 |-------|-------|----------------------|
 | `networks_ok` | info (`warn` when `dropped` > 0) | `GET /networks` served — `rid`, `ip`, `chains`, `tokens`, `dropped`, `cached`, `ms`. `cached:true` means the isolate cache answered. |
@@ -340,9 +357,8 @@ The gap is purely account-side.
 1. **Nothing is pushed and the frontend is not redeployed.** The M-01
    code sat uncommitted at report time and has since been committed (see
    `git log`), but `origin/staging` and `origin/master` are both behind
-   local. The four Workers are live — relayer `20261110d` (repo now
-   carries `20261114a` with the `cancel_link` relay gate; **pending
-   deploy**), keeper
+   local. The four Workers are live — relayer `20261114a` (the
+   `cancel_link` relay gate, deployed 2026-11-14), keeper
    `20261110f`, parse `405`-signal, Tidepool `98f6e7ab` (deployed
    2026-11-13) — but the **frontend** still serves its previous build
    (`app.js?v=20261110a`, `styles.css?v=20261109a`): the checkout-card

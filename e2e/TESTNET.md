@@ -90,6 +90,63 @@ payment path at a time — never two.
      → **do not send another payment**; it is a reconciliation item for an
      operator, and the UI blocks both payment paths.
 
+**Known loss — the failed first attempt (2026-11-14).** The first
+deposit was wrong on every axis at once: **1.02 USDC of Circle's Base
+Sepolia testnet USDC** (`0x036CbD53842c5426634e7929541eC2318f3dCF7e` — not
+the watched Tidepool testnet USDC `0x38d81431B9f76d9699AF7517040D5221D9dEA252`),
+sent for the wrong amount (the quote asked 1.010102) at 14:35:13Z to an
+already-expired deposit address `0xE8E6434d36c02225EE7ecB4ffAEbb054A5e1Ca78`
+— tx `0xb570b7a291a1b5007c3f100776a64c2763c51371eb0e9cbf54e4c8fe144bb54f`.
+Tidepool's upstream stayed `PENDING_DEPOSIT` (it never saw a transfer it
+recognises), both attempts on this invoice — `pi_e75c9b14a649e019` and
+`pi_e84425ea85152f8b` — expired with `conflict: null` and no recorded
+payment, and **the 1.02 USDC is stranded at that address: unrecoverable,
+accepted as a testnet loss.** The rule this run paid for: check the token
+contract, the exact amount and the quote deadline against the live quote
+before every deposit — only the watched token, at the quoted amount,
+inside the window can ever be matched. A corrected fresh quote on the
+same invoice (`pi_2f1559538bde442d`) then took exactly one valid deposit
+of 1.010102 watched USDC and reached `VERIFIED`; the failed transfer
+never matched any attempt, so the invoice saw only one live payment path.
+
+## Journey C — creator cancellation (L-03)
+
+Run 2026-11-14 on testnet against `lnk-6v9rixv5` (creator
+`tstst.testnet`, 10 USDC) — an invoice whose Tidepool payment was already
+`VERIFIED` (the merchant had been paid directly), so cancellation's
+purpose was to **close the NEAR rail before a second payment**. This run
+signed with the creator's local testnet credential; the product path is
+the same `cancel_link` delegate action through the pay card's
+arm → confirm → **one wallet prompt** (free for the creator; the relayer
+pays the gas).
+
+1. **Pre-checks.** Direct `get_link` = `OPEN`/creator match; Tidepool
+   summary = `VERIFIED` with its three payout txs all `FINAL`; relayer
+   build `20261114a` targeting `paylink-v2.testnet`.
+2. **One transaction.** Exactly one `cancel_link` through the relayer,
+   **0 yocto deposit** — tx `BFfwkup8JuSBWKKR3GkcgcfFufLdUJT8ibuWF3BDfD1U`,
+   `FINAL`, success; total gas burnt ≈ 3,025 Ggas, fee ≈ 0.000258 NEAR on
+   the relayer's account. A failed (never-connected) attempt is not a
+   transaction: re-check the chain before any retry, and never resubmit
+   after a success.
+3. **Verify on chain.** Fresh `get_link` → `status: CANCELLED`,
+   `paid_by: null`. This is the authoritative state; from here
+   `ft_on_transfer` refunds any payer in full (the NEAR rail is closed)
+   and a second `cancel_link` is refused twice over: the relayer's
+   pre-check answers `400 not_open` before any broadcast, and the
+   contract itself panics `link is not open` — the repeat can never
+   produce a second effect.
+4. **Settlement unchanged.** The Tidepool summary still reports
+   `VERIFIED` with all three payout records intact — cancelling never
+   touches the cross-chain leg.
+
+**Snapshot vs. authoritative state.** The settlement summary's
+`onChainStatus` is frozen at its last check (`onChainStatusCheckedAt`)
+and **kept reporting `OPEN` after this cancellation** — by design: a
+`VERIFIED` record is terminal and the summary makes zero upstream calls.
+When the two disagree, the direct `get_link` read wins; cite
+`onChainStatusCheckedAt` whenever quoting the summary's chain field.
+
 ## Hard rules (apply to every manual run)
 
 - **Never bypass wallet security** — no scripted approvals, no injected
@@ -123,3 +180,4 @@ payment path at a time — never two.
 | Paying (one wallet approval) | **manual — Journey A.2** |
 | PAID → CLAIMED keeper settlement + receipt | **manual — Journey A.3–5** (keeper itself: `workers/keeper` tests) |
 | Tidepool quote → deposit → polling → VERIFIED | **manual — Journey B** (Worker logic: `workers/tidepool/test/`) |
+| Creator cancellation (arm → confirm, one wallet approval) | **manual — Journey C** (relayer gate: `workers/relayer/test/parse.test.mjs`) |
