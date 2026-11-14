@@ -21,7 +21,17 @@ import {
   FX_BODY,
 } from "./links.mjs";
 
-const RPC_HOST = "test.rpc.fastnear.com";
+/* The chain-RPC allowlist: the primary plus the two Fix D failover
+   alternates (frontend/config.js rpcUrls — the same nodes the Workers
+   carry in wrangler RPC_URLS). All three are answered by handleRpc below,
+   in-process, so a dead primary followed by a failover retry still never
+   leaves the machine and never lands in scenario.unexpected. Keep in step
+   with frontend/config.js. */
+const RPC_HOSTS = [
+  "test.rpc.fastnear.com",
+  "near-testnet.drpc.org",
+  "testnet-rpc.intea.rs",
+];
 const FX_HOST = "open.er-api.com";
 const TP_HOST = new URL(TP_ENDPOINT).hostname;
 const PARSE_HOST = "paylink-parse.g32772584.workers.dev";
@@ -192,7 +202,7 @@ export async function installMocks(page, scenario = makeScenario()) {
       return route.fulfill({ status: 204, headers: CORS, body: "" });
     }
 
-    if (url.hostname === RPC_HOST) return handleRpc(route, scenario);
+    if (RPC_HOSTS.includes(url.hostname)) return handleRpc(route, scenario);
     if (url.hostname === FX_HOST) return json(route, 200, scenario.fxBody);
     if (url.hostname === TP_HOST) return handleTidepool(route, scenario);
     if (url.hostname === PARSE_HOST || url.hostname === RELAYER_HOST || url.hostname === FAUCET_HOST) {
